@@ -59,30 +59,20 @@ jobs:
 
       - name: 🎬 运行监控脚本
         env:
-          # 从 GitHub Secrets 读取配置
           ZHIPU_API_KEY: ${{ secrets.ZHIPU_API_KEY }}
-          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           SMTP_USER: ${{ secrets.SMTP_USER }}
           SMTP_PASS: ${{ secrets.SMTP_PASS }}
           SMTP_TO: ${{ secrets.SMTP_TO }}
-          BILI_SESSDATA: ${{ secrets.BILI_SESSDATA }}
-          BILI_BILI_JCT: ${{ secrets.BILI_BILI_JCT }}
-          BILI_BUVID3: ${{ secrets.BILI_BUVID3 }}
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
         run: |
           cd bilibili_monitor
-
-          # 初始化 state.json
           if [ ! -f state.json ]; then
             echo '{"processed":{}}' > state.json
           fi
-
-          # 用环境变量覆盖 config.py
           if [ -n "$ZHIPU_API_KEY" ]; then
             sed -i "s|ZHIPU_API_KEY = \".*\"|ZHIPU_API_KEY = \"$ZHIPU_API_KEY\"|" config.py
             echo "✅ 已配置 智谱AI API Key"
           fi
-          if [ -n "$GEMINI_API_KEY" ]; then
             sed -i "s|GEMINI_API_KEY = \".*\"|GEMINI_API_KEY = \"$GEMINI_API_KEY\"|" config.py
             echo "✅ 已配置 Gemini API Key"
           fi
@@ -95,19 +85,9 @@ jobs:
           if [ -n "$SMTP_TO" ]; then
             sed -i "s|SMTP_TO = \".*\"|SMTP_TO = \"$SMTP_TO\"|" config.py
           fi
-          if [ -n "$BILI_SESSDATA" ]; then
-            sed -i "s|BILI_SESSDATA = \".*\"|BILI_SESSDATA = \"$BILI_SESSDATA\"|" config.py
-            echo "✅ 已配置 B站 Cookie"
-          fi
-          if [ -n "$BILI_BILI_JCT" ]; then
-            sed -i "s|BILI_BILI_JCT = \".*\"|BILI_BILI_JCT = \"$BILI_BILI_JCT\"|" config.py
-          fi
-          if [ -n "$BILI_BUVID3" ]; then
-            sed -i "s|BILI_BUVID3 = \".*\"|BILI_BUVID3 = \"$BILI_BUVID3\"|" config.py
-          fi
           if [ -n "$HF_TOKEN" ]; then
             sed -i "s|HF_TOKEN = \".*\"|HF_TOKEN = \"$HF_TOKEN\"|" config.py
-            echo "✅ 已配置 Hugging Face Token (Whisper音频转文字)"
+            echo "✅ 已配置 Hugging Face Token"
           fi
 
           python monitor.py
