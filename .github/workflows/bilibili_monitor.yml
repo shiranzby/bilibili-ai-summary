@@ -15,7 +15,6 @@
 # 首次使用:
 #   1. 推送本仓库到 GitHub
 #   2. Settings → Secrets and variables → Actions 添加:
-#      - ZHIPU_API_KEY: 智谱AI API Key (或 GEMINI_API_KEY)
 #      - SMTP_USER: 发件邮箱
 #      - SMTP_PASS: 邮箱授权码
 #      - SMTP_TO: 收件邮箱
@@ -73,8 +72,6 @@ jobs:
             sed -i "s|ZHIPU_API_KEY = \".*\"|ZHIPU_API_KEY = \"$ZHIPU_API_KEY\"|" config.py
             echo "✅ 已配置 智谱AI API Key"
           fi
-            sed -i "s|GEMINI_API_KEY = \".*\"|GEMINI_API_KEY = \"$GEMINI_API_KEY\"|" config.py
-            echo "✅ 已配置 Gemini API Key"
           fi
           if [ -n "$SMTP_USER" ]; then
             sed -i "s|SMTP_USER = \".*\"|SMTP_USER = \"$SMTP_USER\"|" config.py
