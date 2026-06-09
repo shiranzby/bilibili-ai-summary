@@ -1,12 +1,7 @@
-# 配置通过 GitHub Secrets 注入，勿在此填写实际值
 UP_MIDS = [21131684]
 AI_BACKEND = "zhipu"
 ZHIPU_API_KEY = ""
 GEMINI_API_KEY = ""
-DASHSCOPE_API_KEY = ""
-DASHSCOPE_MODEL = "qwen-turbo"
-OLLAMA_BASE_URL = "http://127.0.0.1:11434"
-OLLAMA_MODEL = "qwen2.5:3b"
 BILI_SESSDATA = ""
 BILI_BILI_JCT = ""
 BILI_BUVID3 = ""
