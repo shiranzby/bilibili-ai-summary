@@ -14,9 +14,8 @@ B站UP主视频监控 → AI总结 → 邮件推送
     8. 更新状态文件
 
 部署方式:
-    - GitHub Actions + 智谱AI (国内直连，完全免费)
-    - GitHub Actions + Gemini (永久免费)
-    - 本地 Task Scheduler + Ollama (离线免费)
+    GitHub Actions + 智谱AI GLM-4-Flash (国内直连，完全免费)
+    备选: Google Gemini (永久免费)
 """
 
 import os
@@ -32,8 +31,6 @@ from config import (
     AI_BACKEND,
     ZHIPU_API_KEY,
     GEMINI_API_KEY,
-    DASHSCOPE_API_KEY, DASHSCOPE_MODEL,
-    OLLAMA_BASE_URL, OLLAMA_MODEL,
     SMTP_SERVER, SMTP_PORT, SMTP_USER, SMTP_PASS, SMTP_TO,
     CHECK_WINDOW_SECONDS, MAX_VIDEOS_PER_RUN,
     EMAIL_SUBJECT_PREFIX, STATE_FILE,
@@ -142,10 +139,6 @@ def process_video(video: dict, up_name: str, bili_cookies: Optional[dict] = None
             backend=AI_BACKEND,
             zhipu_api_key=ZHIPU_API_KEY,
             gemini_api_key=GEMINI_API_KEY,
-            dashscope_api_key=DASHSCOPE_API_KEY,
-            dashscope_model=DASHSCOPE_MODEL,
-            ollama_base_url=OLLAMA_BASE_URL,
-            ollama_model=OLLAMA_MODEL,
         )
     else:
         print(f"  [处理] ⚠ 该视频没有AI字幕，跳过总结")
@@ -187,14 +180,8 @@ def main():
 
     if AI_BACKEND == "zhipu" and (not ZHIPU_API_KEY or ZHIPU_API_KEY == "xxxxxxxxxxxxxxxxxxxxxxxx.xxxxxxxxxxxxxxxx"):
         print(f"\n⚠ 警告: ZHIPU_API_KEY 未配置，AI 总结将不可用")
-        print(f"   AI后端: 智谱AI (国内直连，免费)")
-        print(f"   获取 Key: https://open.bigmodel.cn/ → API Keys\n")
     elif AI_BACKEND == "gemini" and (not GEMINI_API_KEY or GEMINI_API_KEY == "AIzaSyxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"):
-        print(f"\n⚠ 警告: GEMINI_API_KEY 未配置，AI 总结将不可用")
-        print(f"   AI后端: Google Gemini (永久免费)")
-        print(f"   获取 Key: https://aistudio.google.com/apikey\n")
-    elif AI_BACKEND == "dashscope" and (not DASHSCOPE_API_KEY or DASHSCOPE_API_KEY.startswith("sk-")):
-        print(f"\n⚠ 警告: DASHSCOPE_API_KEY 未配置，AI 总结将不可用\n")
+        print(f"\n⚠ 警告: GEMINI_API_KEY 未配置，AI 总结将不可用\n")
 
     if not SMTP_USER or SMTP_USER.startswith("your_email"):
         print("\n❌ 错误: 邮箱未配置 (请修改 config.py 中的邮箱配置)")
