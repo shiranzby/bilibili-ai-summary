@@ -28,14 +28,7 @@ def _get_wbi_keys() -> tuple:
         return _wbi_keys["img_key"], _wbi_keys["sub_key"]
 
     url = "https://api.bilibili.com/x/web-interface/nav"
-    headers = {
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/120.0.0.0 Safari/537.36"
-        ),
-        "Referer": "https://www.bilibili.com/",
-    }
+    headers = _make_headers()
     try:
         resp = requests.get(url, headers=headers, timeout=10)
         data = resp.json()
@@ -67,14 +60,14 @@ def _sign_wbi(params: dict) -> dict:
 
 
 def _make_headers() -> dict:
-    """生成通用请求头"""
+    """生成通用请求头 (使用移动端UA避免风控)"""
     return {
         "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "Mozilla/5.0 (Linux; Android 13; Pixel 7) "
             "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/120.0.0.0 Safari/537.36"
+            "Chrome/120.0.0.0 Mobile Safari/537.36"
         ),
-        "Referer": "https://www.bilibili.com/",
+        "Referer": "https://m.bilibili.com/",
         "Accept": "application/json, text/plain, */*",
         "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
     }
