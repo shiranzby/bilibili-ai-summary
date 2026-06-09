@@ -1,29 +1,3 @@
-# B站UP主视频监控 - GitHub Actions 工作流
-# =========================================
-# 定时运行: 每天 08:00 / 20:00 (北京时间)
-# 支持手动触发
-#
-# 💰 完全免费方案:
-#   方案A: AI_BACKEND=zhipu (默认) — 智谱AI GLM-4-Flash
-#         国内直连，每月100万免费tokens，每月刷新
-#         Key获取: https://open.bigmodel.cn/
-#
-#   方案B: AI_BACKEND=gemini — Google Gemini 2.0 Flash
-#         GitHub Actions runner 在海外，网络无问题
-#         永久免费，Key获取: https://aistudio.google.com/apikey
-#
-# 首次使用:
-#   1. 推送本仓库到 GitHub
-#   2. Settings → Secrets and variables → Actions 添加:
-#      - SMTP_USER: 发件邮箱
-#      - SMTP_PASS: 邮箱授权码
-#      - SMTP_TO: 收件邮箱
-#      - BILI_SESSDATA: (可选) B站登录Cookie，用于获取AI字幕
-#      - BILI_BILI_JCT: (可选) B站CSRF Token
-#      - BILI_BUVID3: (可选) B站设备ID
-#      - HF_TOKEN: (可选) Hugging Face Token，用于Whisper音频转文字
-#   3. 修改 config.py 中的 UP_MIDS 和 AI_BACKEND
-
 name: B站视频监控
 
 on:
@@ -33,30 +7,23 @@ on:
 
 jobs:
   monitor:
-    name: 监控B站UP主最新视频
+    name: B站监控
     runs-on: ubuntu-latest
     timeout-minutes: 30
-
     steps:
-      - name: 📥 检出代码
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: 🐍 设置 Python
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5
         with:
           python-version: '3.10'
           cache: 'pip'
-
-      - name: 📦 安装依赖
+      - name: 安装依赖
         run: |
           pip install -r bilibili_monitor/requirements.txt
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq ffmpeg
+          sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg
           pip install yt-dlp
-
-      - name: 🎬 运行监控脚本
+      - name: 运行监控
         env:
           ZHIPU_API_KEY: ${{ secrets.ZHIPU_API_KEY }}
           SMTP_USER: ${{ secrets.SMTP_USER }}
@@ -65,40 +32,15 @@ jobs:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
         run: |
           cd bilibili_monitor
-          if [ ! -f state.json ]; then
-            echo '{"processed":{}}' > state.json
-          fi
-          if [ -n "$ZHIPU_API_KEY" ]; then
-            sed -i "s|ZHIPU_API_KEY = \".*\"|ZHIPU_API_KEY = \"$ZHIPU_API_KEY\"|" config.py
-            echo "✅ 已配置 智谱AI API Key"
-          fi
-          fi
-          if [ -n "$SMTP_USER" ]; then
-            sed -i "s|SMTP_USER = \".*\"|SMTP_USER = \"$SMTP_USER\"|" config.py
-          fi
-          if [ -n "$SMTP_PASS" ]; then
-            sed -i "s|SMTP_PASS = \".*\"|SMTP_PASS = \"$SMTP_PASS\"|" config.py
-          fi
-          if [ -n "$SMTP_TO" ]; then
-            sed -i "s|SMTP_TO = \".*\"|SMTP_TO = \"$SMTP_TO\"|" config.py
-          fi
-          if [ -n "$HF_TOKEN" ]; then
-            sed -i "s|HF_TOKEN = \".*\"|HF_TOKEN = \"$HF_TOKEN\"|" config.py
-            echo "✅ 已配置 Hugging Face Token"
-          fi
-
+          if [ ! -f state.json ]; then echo '{"processed":{}}' > state.json; fi
+          sed -i "s|ZHIPU_API_KEY = ""|ZHIPU_API_KEY = "$ZHIPU_API_KEY"|" config.py
+          sed -i "s|SMTP_USER = ""|SMTP_USER = "$SMTP_USER"|" config.py
+          sed -i "s|SMTP_PASS = ""|SMTP_PASS = "$SMTP_PASS"|" config.py
+          sed -i "s|SMTP_TO = ""|SMTP_TO = "$SMTP_TO"|" config.py
+          sed -i "s|HF_TOKEN = ""|HF_TOKEN = "$HF_TOKEN"|" config.py
           python monitor.py
-
-      - name: 💾 提交状态更新
+      - name: 保存状态
         run: |
-          git config user.name "Bilibili Monitor Bot"
-          git config user.email "bot@bilibili-monitor"
-
-          if git diff --quiet bilibili_monitor/state.json; then
-            echo "状态无变化，跳过提交"
-          else
-            git add bilibili_monitor/state.json
-            git commit -m "📊 更新视频处理状态 [skip ci]"
-            git push
-            echo "✅ 状态已提交"
-          fi
+          git config user.name bot
+          git config user.email bot@bot
+          git diff --quiet bilibili_monitor/state.json || (git add bilibili_monitor/state.json && git commit -m state && git push)
