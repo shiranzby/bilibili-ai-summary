@@ -25,6 +25,7 @@ CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.p
 # 需要注入的环境变量映射: 环境变量名 → config.py 中的变量名
 VAR_MAP = {
     "ZHIPU_API_KEY":  "ZHIPU_API_KEY",
+    "DEEPSEEK_API_KEY": "DEEPSEEK_API_KEY",
     "GEMINI_API_KEY": "GEMINI_API_KEY",
     "SMTP_USER":      "SMTP_USER",
     "SMTP_PASS":      "SMTP_PASS",

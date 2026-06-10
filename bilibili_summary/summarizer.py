@@ -1,14 +1,22 @@
 """
 AI视频总结模块
 =============
-支持两种免费 AI 后端（只保留 GHA 可用的）:
+支持多种 AI 后端:
 
     zhipu (默认) — 智谱AI GLM-4-Flash
         国内直连，每月100万免费tokens，每月刷新
         Key: https://open.bigmodel.cn/
 
+    deepseek — DeepSeek V3
+        注册送500万tokens
+        Key: https://platform.deepseek.com/
+
+    siliconflow — 硅基流动 (语音转录和AI总结两用)
+        共用同一 Key，总结模型通过 SILICONFLOW_MODEL 配置
+        Key: https://cloud.siliconflow.cn/
+
     gemini — Google Gemini 2.0 Flash
-        永久免费，适合 GitHub Actions
+        永久免费
         Key: https://aistudio.google.com/apikey
 """
 
@@ -93,7 +101,31 @@ def summarize_with_zhipu(subtitle_text: str, video_title: str = "", api_key: str
     )
 
 
-# ---- Google Gemini (备选，永久免费) ----
+# ---- DeepSeek V3 ----
+def summarize_with_deepseek(subtitle_text: str, video_title: str = "", api_key: str = "") -> Optional[str]:
+    return _call_openai_compatible(
+        api_key=api_key,
+        base_url="https://api.deepseek.com/v1",
+        model="deepseek-chat",
+        subtitle_text=subtitle_text,
+        video_title=video_title,
+        label="DeepSeek",
+    )
+
+
+# ---- 硅基流动 (转录和总结两用) ----
+def summarize_with_siliconflow(subtitle_text: str, video_title: str = "", api_key: str = "", model: str = "") -> Optional[str]:
+    return _call_openai_compatible(
+        api_key=api_key,
+        base_url="https://api.siliconflow.cn/v1",
+        model=model or "deepseek-ai/DeepSeek-V3",
+        subtitle_text=subtitle_text,
+        video_title=video_title,
+        label="硅基流动",
+    )
+
+
+# ---- Google Gemini ----
 def summarize_with_gemini(subtitle_text: str, video_title: str = "", api_key: str = "") -> Optional[str]:
     return _call_openai_compatible(
         api_key=api_key,
@@ -111,12 +143,19 @@ def summarize_subtitle(
     video_title: str = "",
     backend: str = "zhipu",
     zhipu_api_key: str = "",
+    deepseek_api_key: str = "",
+    siliconflow_api_key: str = "",
+    siliconflow_model: str = "",
     gemini_api_key: str = "",
 ) -> Optional[str]:
     if backend == "zhipu":
         return summarize_with_zhipu(subtitle_text, video_title, zhipu_api_key)
+    elif backend == "deepseek":
+        return summarize_with_deepseek(subtitle_text, video_title, deepseek_api_key)
+    elif backend == "siliconflow":
+        return summarize_with_siliconflow(subtitle_text, video_title, siliconflow_api_key, siliconflow_model)
     elif backend == "gemini":
         return summarize_with_gemini(subtitle_text, video_title, gemini_api_key)
     else:
-        print(f"    [AI总结] ❌ 未知后端: {backend}，支持: zhipu / gemini")
+        print(f"    [AI总结] ❌ 未知后端: {backend}，支持: zhipu / deepseek / siliconflow / gemini")
         return None

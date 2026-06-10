@@ -30,11 +30,13 @@ from config import (
     UP_MIDS,
     AI_BACKEND,
     ZHIPU_API_KEY,
+    DEEPSEEK_API_KEY,
     GEMINI_API_KEY,
+    SILICONFLOW_API_KEY,
+    SILICONFLOW_MODEL,
     SMTP_SERVER, SMTP_PORT, SMTP_USER, SMTP_PASS, SMTP_TO,
     CHECK_WINDOW_SECONDS, MAX_VIDEOS_PER_RUN,
     EMAIL_SUBJECT_PREFIX, STATE_FILE,
-    SILICONFLOW_API_KEY,
 )
 from bili_api import (
     get_up_video_list, get_video_info, get_up_info,
@@ -143,6 +145,9 @@ def process_video(video: dict, up_name: str) -> dict:
             video_title=title,
             backend=AI_BACKEND,
             zhipu_api_key=ZHIPU_API_KEY,
+            deepseek_api_key=DEEPSEEK_API_KEY,
+            siliconflow_api_key=SILICONFLOW_API_KEY,
+            siliconflow_model=SILICONFLOW_MODEL,
             gemini_api_key=GEMINI_API_KEY,
         )
     else:
