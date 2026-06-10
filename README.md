@@ -123,12 +123,15 @@ cd bilibili-video-monitor
 
 ```python
 UP_MIDS = [
-    21131684,  # 刺客边风
-    12345678,  # 添加其他UP主的UID
+    12345678,  # 替换为你想监控的UP主UID
 ]
 ```
 
-UP 主 UID 获取：打开 UP 主主页 → URL 末尾的数字。
+如何获取 UP 主 UID？
+1. 打开 UP 主的主页（例如在B站搜索UP主名称进入）
+2. 查看浏览器地址栏中的 URL，格式为 `https://space.bilibili.com/数字`
+3. 其中的数字部分就是 UID。例如 `https://space.bilibili.com/12345678` 中的 `12345678`
+4. 将此数字填入上方列表即可
 
 ### 步骤4: 完成
 
@@ -170,13 +173,13 @@ UP 主 UID 获取：打开 UP 主主页 → URL 末尾的数字。
 `BILI_COOKIE` 是推荐方式，在 `inject_config.py` 中会自动解析：
 
 ```
-Cookie 字符串: "buvid3=xxx; SESSDATA=xxx; bili_jct=xxx"
-                           ↓ 自动解析
-                  ┌──────────────┬──────────────┐
-                  │ BILI_SESSDATA │ BILI_BILI_JCT │ BILI_BUVID3 │
-                  └──────────────┴──────────────┘
-                           ↓ 写入 config.py
-                  subtitle.py 使用 → 字幕 API 调用
+BILI_COOKIE = "buvid3=xxx; SESSDATA=xxx; bili_jct=xxx"
+                           ↓ 自动提取三个关键字段
+                    BILI_SESSDATA  → 写入 config.py
+                    BILI_BILI_JCT  → 写入 config.py
+                    BILI_BUVID3    → 写入 config.py
+                           ↓
+                    subtitle.py 使用 → 字幕 API 调用
 ```
 
 如果同时设置了 `BILI_COOKIE` 和独立字段（`BILI_SESSDATA` 等），独立字段的值为准。
