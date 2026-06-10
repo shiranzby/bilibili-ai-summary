@@ -1,66 +1,167 @@
-# bilibili-ai-summary
+# 🎬 Bilibili AI Summary - B站UP主视频 AI 摘要 & 邮件推送
 
-自动监控 B站 UP 主最新视频，AI 语音识别 + 大模型总结，每日推送摘要邮件到你的邮箱。
+📋 **概述**
 
-**一键部署到 GitHub Actions，完全免费。**
+自动监控指定B站UP主的新视频 → 下载音频 → 语音转录 → AI总结 → 发送邮件通知。
 
-## 工作流程
+💰 **全程免费** | 🔄 **全自动** | ☁️ **零服务器** | 🔌 **一键部署**
+
+---
+
+## 💸 费用清单
+
+| 项目 | 方案 | 费用 |
+|------|------|------|
+| 📡 B站 API | 公开接口 | 0元 |
+| 🤖 AI 总结 | 智谱AI / DeepSeek / Gemini (免费层) | 0元 ✅ |
+| 🎙️ 语音识别 | 硅基流动 SenseVoiceSmall | 0元 ✅ (完全免费) |
+| 🕐 定时运行 | GitHub Actions (2000分钟/月免费) | 0元 ✅ |
+| 📧 邮件发送 | QQ邮箱 SMTP | 0元 |
+| **总计** | **永久免费运行** | **0元 🏆** |
+
+---
+
+## 🔄 工作流程
 
 ```
-定时触发 (每天 08:00 / 20:00 北京时间)
-  │
-  ├─ B站 API → 获取 UP 主最新视频
-  ├─ playurl → 下载音频 → ffmpeg 转 WAV
-  ├─ 硅基流动 SenseVoiceSmall → 语音转文字 (完全免费)
-  ├─ AI 大模型 → 生成结构化总结
-  └─ QQ邮箱 SMTP → 推送摘要邮件
+B站 API → 获取UP主最新视频
+    ↓
+playurl API → 下载音频 → ffmpeg 转 WAV
+    ↓
+硅基流动 SenseVoiceSmall → 语音转文字 (完全免费)
+    ↓
+智谱AI / DeepSeek / Gemini → AI 结构化总结
+    ↓
+QQ邮箱 SMTP → 摘要邮件通知
+    ↓
+state.json → 记录已处理视频 (下次不再重复)
 ```
 
-## 部署步骤
+> **注**：无需B站Cookie，无需AI字幕，纯音频转录+AI总结，任何视频都能处理。
 
-### 1. Fork 仓库
+---
+
+## 🚀 一键部署 (GitHub Actions)
+
+### 第1步: 推送代码到 GitHub
+
 ```bash
 git clone https://github.com/shiranzby/bilibili-ai-summary.git
 cd bilibili-ai-summary
+# 修改配置后推送
+git add .
+git commit -m "init"
+git push
 ```
 
-### 2. 添加 GitHub Secrets
+### 第2步: 获取免费 API Key
 
-仓库 `Settings → Secrets and variables → Actions → New repository secret`：
+**方案A: 智谱AI GLM-4-Flash 👑 (推荐，国内直连)**
 
-| Secret | 必填 | 说明 | 获取地址 |
-|--------|------|------|----------|
-| `ZHIPU_API_KEY` | ✅ | 智谱AI (默认) | https://open.bigmodel.cn/ |
-| `DEEPSEEK_API_KEY` | ❌ | DeepSeek 备选 | https://platform.deepseek.com/ |
-| `SMTP_USER` | ✅ | QQ邮箱地址 | QQ邮箱 → 设置 → 账户 |
-| `SMTP_PASS` | ✅ | SMTP授权码 | 同上 |
-| `SMTP_TO` | ✅ | 收件邮箱 | - |
-| `SILICONFLOW_API_KEY` | ✅ | 语音识别 (免费) | https://cloud.siliconflow.cn/ |
+每月100万免费tokens，每月刷新，永不过期。
 
-> **AI 后端选择**：默认使用智谱AI（`AI_BACKEND = "zhipu"`），可改为 `"deepseek"` 或 `"gemini"`。只需填写对应 Key 即可。
+1. 打开 https://open.bigmodel.cn/ 用手机号注册
+2. 进入 API Keys → 创建 API Key
+3. 复制 API Key（格式：`xxx.xxx`）
 
-### 3. 配置监控目标
+**方案B: DeepSeek V3 (可选)**
 
-编辑 `bilibili_monitor/config.py`，修改 `UP_MIDS`：
+性价比极高，注册送500万tokens。
+
+1. 打开 https://platform.deepseek.com/ 注册
+2. 创建 API Key
+
+**语音识别: 硅基流动 SenseVoiceSmall (必选，完全免费)**
+
+1. 打开 https://cloud.siliconflow.cn/ 注册
+2. 创建 API Key
+
+### 第3步: 配置 GitHub Secrets
+
+在仓库 **Settings → Secrets and variables → Actions** 添加：
+
+| Secret 名称 | 说明 | 必填 |
+|-------------|------|------|
+| `ZHIPU_API_KEY` | 智谱AI Key | 选其一 |
+| `DEEPSEEK_API_KEY` | DeepSeek Key | 或 |
+| `SMTP_USER` | 发件邮箱 (如 `123456@qq.com`) | ✅ |
+| `SMTP_PASS` | QQ邮箱SMTP授权码 (16位字母) | ✅ |
+| `SMTP_TO` | 收件邮箱 | ✅ |
+| `SILICONFLOW_API_KEY` | 硅基流动 Key (语音识别) | ✅ |
+
+### 第4步: 修改配置
+
+编辑 `bilibili_summary/config.py`：
 
 ```python
+# 改UP主UID
 UP_MIDS = [
-    12345678,      # UP主 UID
-    23456789,      # 可添加多个
+    12345678,      # 可填单个
+    23456789,      # 也可填多个
 ]
+
+# 改AI后端 (默认 zhipu，改AI_BACKEND即可切换)
+AI_BACKEND = "zhipu"      # 智谱AI (推荐)
+# AI_BACKEND = "deepseek" # DeepSeek
+# AI_BACKEND = "gemini"   # Google Gemini
 ```
 
-UP 主 UID：打开 UP 主主页，URL 末尾的数字。如 `https://space.bilibili.com/12345678`。
+UP主UID获取：打开UP主主页，URL末尾的数字。如 `space.bilibili.com/12345678` → `12345678`。
 
-### 4. 完成
+### 第5步: 完成！
 
-推送代码后自动触发。也可在 Actions 页面手动运行。
+手动触发测试：GitHub仓库 → **Actions** → **B站AI摘要** → **Run workflow**
 
-## 免费额度
+以后每天 **08:00** 和 **20:00** 自动运行，邮件通知自动送达。📧
 
-| 服务 | 额度 | 说明 |
-|------|------|------|
-| GitHub Actions | 2000分钟/月 | 每天2次绰绰有余 |
-| 智谱AI GLM-4-Flash | 100万 tokens/月 | 国内直连 |
-| 硅基流动 SenseVoiceSmall | 完全免费 | 语音识别 |
-| QQ邮箱 SMTP | 免费 | 邮件推送 |
+---
+
+## 📧 邮件效果
+
+精美 HTML 排版，包含：
+
+- 🎬 **标题栏** — UP主 + 视频数量
+- 📺 **视频卡片** — 标题、时长、发布时间
+- 🤖 **AI 总结** — 核心主题 + 要点提炼 + 总结
+- 🔗 **观看链接** — 一键直达B站视频
+
+---
+
+## ❓ 常见问题
+
+**Q: 智谱AI的免费额度真的每月刷新吗？**
+A: 是的。GLM-4-Flash 每月赠送 100 万免费 tokens，每月自动刷新。每个月用不完也不会浪费，下个月又有新的。
+
+**Q: 100万tokens一个月够用吗？**
+A: 完全够。每次总结消耗约500-1500 tokens。每天跑2次，每次5个视频，一个月才约45万tokens，不到额度的一半。
+
+**Q: 视频没有字幕怎么办？**
+A: 我们的方案不依赖B站字幕。**自动下载音频 → 硅基流动语音识别 → 转文字**，任何视频都能处理。
+
+**Q: 需要B站Cookie吗？**
+A: 不需要。完全通过B站公开API + 音频CDN下载，无需登录。
+
+**Q: 可以只监控一个UP主吗？**
+A: 可以。`UP_MIDS = [12345678]` 只填一个就行。也可以监控多个，用逗号分隔。
+
+**Q: 硅基流动收费吗？**
+A: **完全免费**，无需付费。
+
+---
+
+## 📁 项目结构
+
+```
+bilibili_summary/
+├── config.py              # 🔑 配置文件 (改UP主、AI后端在这里)
+├── bili_api.py            # B站API封装
+├── audio_transcriber.py   # 音频下载 + 语音识别 (硅基流动)
+├── summarizer.py          # AI总结 (支持智谱AI/DeepSeek/Gemini)
+├── emailer.py             # 邮件发送 (HTML模板)
+├── monitor.py             # 主流程脚本
+├── inject_config.py       # Secrets注入工具
+├── requirements.txt       # Python依赖
+├── state.json             # 已处理视频记录
+└── .github/workflows/
+    └── summary.yml        # GitHub Actions 工作流
+```
