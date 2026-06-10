@@ -47,7 +47,6 @@ GEMINI_API_KEY = ""
 # ============================================================
 # 用于将B站视频音频转录为文字
 # FunAudioLLM/SenseVoiceSmall 模型，完全免费
-# 注册即送免费额度，无需付费
 # Key: https://cloud.siliconflow.cn/
 # 🔐 通过 GHA Secret SILICONFLOW_API_KEY 注入
 SILICONFLOW_API_KEY = ""

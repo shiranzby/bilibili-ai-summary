@@ -152,10 +152,7 @@ UP_MIDS = [
 
 ### 关于语音识别
 
-使用硅基流动 (SiliconFlow) 的 `FunAudioLLM/SenseVoiceSmall` 模型进行语音转文字。
-
-**完全免费**，注册即送免费额度，按量计费模式下价格极低（千次约几毛钱）。
-国内直连，从 GHA 美国节点也可以正常访问。
+使用硅基流动 (SiliconFlow) 免费提供的 `FunAudioLLM/SenseVoiceSmall` 模型进行语音转文字。**完全免费**，无需付费。国内直连，从 GHA 美国节点也可以正常访问。
 
 ### 核心模块
 
@@ -206,7 +203,7 @@ SILICONFLOW_API_KEY: ${{ secrets.SILICONFLOW_API_KEY }}
 |------|----------|------|
 | **GitHub Actions** | 2000分钟/月 | Linux runner，完全足够每日2次运行 |
 | **智谱AI GLM-4-Flash** | 100万 tokens/月 | 每月自动刷新，国内直连 |
-| **硅基流动 SenseVoiceSmall** | 完全免费 | 注册送额度，按量极低 |
+| **硅基流动 SenseVoiceSmall** | 完全免费 | 无需付费，国内直连 |
 | **B站 API** | 无限制（有频率限制） | 每天2次完全不会触发限制 |
 | **QQ邮箱 SMTP** | 免费 | 每天可发送大量邮件 |
 
@@ -231,7 +228,7 @@ A: 修改 `.github/workflows/bilibili_monitor.yml` 中的 `cron` 表达式。
 A: 移动端 User-Agent 已能有效规避风控。
 
 ### Q: 硅基流动收费吗？
-A: **完全免费**。注册送免费额度，SenseVoiceSmall 模型按量计费模式下价格极低。
+A: **完全免费**，无需付费。
 
 ---
 
