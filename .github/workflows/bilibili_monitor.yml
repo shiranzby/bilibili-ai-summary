@@ -36,12 +36,14 @@ jobs:
           SMTP_PASS: ${{ secrets.SMTP_PASS }}
           SMTP_TO: ${{ secrets.SMTP_TO }}
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
-          # B站Cookie: 提供完整Cookie字符串即可，代码自动解析
+          # B站Cookie: 推荐方式，完整Cookie一键粘贴，代码自动解析
           BILI_COOKIE: ${{ secrets.BILI_COOKIE }}
-          # 以下为传统三个字段方式 (BILI_COOKIE优先级更高)
+          # 传统三字段方式 (如果设置了BILI_COOKIE，这三项可省略)
           BILI_SESSDATA: ${{ secrets.BILI_SESSDATA }}
           BILI_BILI_JCT: ${{ secrets.BILI_BILI_JCT }}
           BILI_BUVID3: ${{ secrets.BILI_BUVID3 }}
+          # 硅基流动语音识别 (SenseVoiceSmall)
+          SILICONFLOW_API_KEY: ${{ secrets.SILICONFLOW_API_KEY }}
         run: python bilibili_monitor/inject_config.py
 
       - name: 运行监控

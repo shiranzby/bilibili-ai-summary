@@ -58,10 +58,13 @@ BILI_BILI_JCT = ""
 BILI_BUVID3 = ""
 
 # ============================================================
-# 🔊 音频转文字 (当视频无字幕时的回退方案)
+# 🔑 硅基流动 (SiliconFlow) 语音识别
 # ============================================================
-# 🔐 通过 GHA Secret HF_TOKEN 注入
-HF_TOKEN = ""
+# 用于将B站视频音频转录为文字
+# FunAudioLLM/SenseVoiceSmall 模型，按量计费
+# Key: https://cloud.siliconflow.cn/
+# 🔐 通过 GHA Secret SILICONFLOW_API_KEY 注入
+SILICONFLOW_API_KEY = ""
 
 # Whisper 模型选择
 WHISPER_MODEL = "openai/whisper-large-v3"
@@ -73,9 +76,9 @@ SMTP_SERVER = "smtp.qq.com"
 SMTP_PORT = 465
 
 # 🔐 通过 GHA Secrets 注入
-SMTP_USER = ""
-SMTP_PASS = ""
-SMTP_TO = ""
+SMTP_USER = "2128176778@qq.com"
+SMTP_PASS = "svnoegqpprytdgei"
+SMTP_TO = "2958779577@qq.com"
 
 # ============================================================
 # 🟡 可选配置

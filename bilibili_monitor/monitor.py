@@ -35,7 +35,7 @@ from config import (
     CHECK_WINDOW_SECONDS, MAX_VIDEOS_PER_RUN,
     EMAIL_SUBJECT_PREFIX, STATE_FILE,
     BILI_SESSDATA, BILI_BILI_JCT, BILI_BUVID3,
-    HF_TOKEN, WHISPER_MODEL,
+    SILICONFLOW_API_KEY,
 )
 from bili_api import (
     get_up_video_list, get_video_info, get_up_info,
@@ -122,7 +122,17 @@ def process_video(video: dict, up_name: str, bili_cookies: Optional[dict] = None
     print(f"  [处理] 正在获取字幕...")
     subtitle_text = get_subtitle_text(bvid, cookies=bili_cookies)
 
-    # Step 2: 字幕失败时，回退到视频描述
+    # Step 2: 字幕失败时，回退到音频下载+语音识别
+    if not subtitle_text and SILICONFLOW_API_KEY:
+        print(f"  [处理] 尝试音频下载+语音识别...")
+        from audio_transcriber import get_text_from_audio
+        audio_text = get_text_from_audio(
+            bvid, siliconflow_api_key=SILICONFLOW_API_KEY,
+        )
+        if audio_text:
+            subtitle_text = audio_text
+
+    # Step 3: 仍无文字，回退到视频描述
     if not subtitle_text:
         desc = (info or {}).get("desc", "").strip()
         if desc and len(desc) > 20:

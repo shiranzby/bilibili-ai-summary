@@ -175,24 +175,59 @@ def transcribe_with_zhipu(audio_path: str, api_key: str = "") -> Optional[str]:
 
 # ==================== 主入口 ====================
 
+def transcribe_with_siliconflow(audio_path: str, api_key: str = "") -> Optional[str]:
+    """
+    使用硅基流动 SiliconFlow FunAudioLLM/SenseVoiceSmall 语音转文字
+    国内直连，GHA正常可用，按量计费 (价格极低)
+
+    API: POST https://api.siliconflow.cn/v1/audio/transcriptions
+    """
+    if not api_key:
+        print("    [SiFlow] ❌ 未配置 SILICONFLOW_API_KEY")
+        return None
+
+    file_size = os.path.getsize(audio_path) / 1024 / 1024
+    print(f"    [SiFlow] 上传音频 ({file_size:.1f} MB)...")
+
+    try:
+        from openai import OpenAI
+        client = OpenAI(api_key=api_key, base_url="https://api.siliconflow.cn/v1")
+
+        with open(audio_path, "rb") as f:
+            resp = client.audio.transcriptions.create(
+                model="FunAudioLLM/SenseVoiceSmall",
+                file=f,
+                language="zh",
+                response_format="text",
+            )
+
+        text = resp if isinstance(resp, str) else getattr(resp, 'text', str(resp))
+        if text and text.strip():
+            print(f"    [SiFlow] ✅ 转录成功 ({len(text)} 字符)")
+            return text
+        print(f"    [SiFlow] ⚠ 返回文本为空")
+        return None
+
+    except Exception as e:
+        print(f"    [SiFlow] ❌ 失败: {e}")
+        return None
+
+
 def get_text_from_audio(
     bvid: str,
     hf_token: str = "",
-    model: str = "openai/whisper-large-v3",
+    model: str = "",
     zhipu_api_key: str = "",
+    siliconflow_api_key: str = "",
 ) -> Optional[str]:
     """
     一站式: B站音频下载 → 智能转写 → 返回文本
 
-    转录方案优先级:
-      1. 智谱AI GLM-4-Audio (国内直连，GHA可用, 推荐)
-      2. HuggingFace Whisper (备选, GHA可能DNS失败)
+    转录方案: 硅基流动 SenseVoiceSmall (稳定可靠)
 
     参数:
         bvid: BV号
-        hf_token: HuggingFace Token
-        model: Whisper模型
-        zhipu_api_key: 智谱AI API Key
+        siliconflow_api_key: 硅基流动 API Key
 
     返回: 转录文本或 None
     """
@@ -222,19 +257,14 @@ def get_text_from_audio(
             print(f"    [音频] ffmpeg转换失败")
             return None
 
-        # 方案1: 智谱AI (国内直连，推荐)
-        if zhipu_api_key:
-            text = transcribe_with_zhipu(wav_audio, api_key=zhipu_api_key)
+        # 转录: 硅基流动 SenseVoiceSmall (稳定可靠)
+        if siliconflow_api_key:
+            text = transcribe_with_siliconflow(wav_audio, api_key=siliconflow_api_key)
             if text:
                 return text
-            print(f"    [音频] 智谱AI转录失败，尝试备选方案...")
+            print(f"    [音频] 硅基流动转录失败")
         else:
-            print(f"    [音频] 未配置ZHIPU_API_KEY，跳过智谱AI")
-
-        # 方案2: HuggingFace Whisper
-        if hf_token:
-            return _transcribe_huggingface(wav_audio, hf_token, model)
-
+            print(f"    [音频] 未配置 SILICONFLOW_API_KEY，跳过转录")
         return None
 
 

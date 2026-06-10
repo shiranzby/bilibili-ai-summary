@@ -18,6 +18,7 @@ GHA workflow 调用: python inject_config.py
     BILI_SESSDATA    → BILI_SESSDATA (单独注入,优先级高于 BILI_COOKIE)
     BILI_BILI_JCT    → BILI_BILI_JCT
     BILI_BUVID3      → BILI_BUVID3
+    SILICONFLOW_API_KEY → SILICONFLOW_API_KEY (语音识别)
 """
 
 import os
@@ -38,6 +39,7 @@ VAR_MAP = {
     "BILI_SESSDATA":  "BILI_SESSDATA",
     "BILI_BILI_JCT":  "BILI_BILI_JCT",
     "BILI_BUVID3":    "BILI_BUVID3",
+    "SILICONFLOW_API_KEY": "SILICONFLOW_API_KEY",
 }
 
 
