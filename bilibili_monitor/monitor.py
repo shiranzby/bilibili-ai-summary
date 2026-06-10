@@ -34,14 +34,12 @@ from config import (
     SMTP_SERVER, SMTP_PORT, SMTP_USER, SMTP_PASS, SMTP_TO,
     CHECK_WINDOW_SECONDS, MAX_VIDEOS_PER_RUN,
     EMAIL_SUBJECT_PREFIX, STATE_FILE,
-    BILI_SESSDATA, BILI_BILI_JCT, BILI_BUVID3,
     SILICONFLOW_API_KEY,
 )
 from bili_api import (
     get_up_video_list, get_video_info, get_up_info,
     format_duration, format_timestamp,
 )
-from subtitle import get_subtitle_text
 from summarizer import summarize_subtitle
 from emailer import send_email, build_digest_email
 from audio_transcriber import get_text_from_audio
@@ -106,8 +104,8 @@ def get_new_videos(mid: int, processed_set: set, window: int) -> list:
     return new_videos
 
 
-def process_video(video: dict, up_name: str, bili_cookies: Optional[dict] = None) -> dict:
-    """处理单个视频: 获取字幕 → AI总结 (字幕失败时回退到音频转录)"""
+def process_video(video: dict, up_name: str) -> dict:
+    """处理单个视频: 音频下载+语音识别 → AI总结"""
     bvid = video["bvid"]
     title = video["title"]
     print(f"\n  [处理] ▶ {title}")
@@ -118,28 +116,23 @@ def process_video(video: dict, up_name: str, bili_cookies: Optional[dict] = None
     duration_display = video.get("duration", "")
     pub_time_display = format_timestamp(video["created"]) if video.get("created") else ""
 
-    # Step 1: 尝试获取字幕 (传Cookie以获取AI字幕)
-    print(f"  [处理] 正在获取字幕...")
-    subtitle_text = get_subtitle_text(bvid, cookies=bili_cookies)
-
-    # Step 2: 字幕失败时，回退到音频下载+语音识别
-    if not subtitle_text and SILICONFLOW_API_KEY:
-        print(f"  [处理] 尝试音频下载+语音识别...")
-        from audio_transcriber import get_text_from_audio
+    # Step 1: 音频下载+硅基流动语音识别
+    audio_text = None
+    if SILICONFLOW_API_KEY:
+        print(f"  [处理] 下载音频并进行语音识别...")
         audio_text = get_text_from_audio(
             bvid, siliconflow_api_key=SILICONFLOW_API_KEY,
         )
-        if audio_text:
-            subtitle_text = audio_text
 
-    # Step 3: 仍无文字，回退到视频描述
+    # Step 2: 语音识别失败时，回退到视频描述
+    subtitle_text = audio_text
     if not subtitle_text:
         desc = (info or {}).get("desc", "").strip()
         if desc and len(desc) > 20:
             print(f"  [处理] ✅ 使用视频描述 ({len(desc)} 字符)")
             subtitle_text = f"[视频描述] {desc[:3000]}"
         else:
-            print(f"  [处理] ⚠ 该视频没有AI字幕，跳过总结")
+            print(f"  [处理] ⚠ 语音识别失败且无视频描述")
 
     # AI总结
     summary = None
@@ -153,30 +146,16 @@ def process_video(video: dict, up_name: str, bili_cookies: Optional[dict] = None
             gemini_api_key=GEMINI_API_KEY,
         )
     else:
-        print(f"  [处理] ⚠ 该视频没有AI字幕，跳过总结")
+        print(f"  [处理] ⚠ 无法获取视频文字内容，跳过总结")
 
     return {
         "bvid": bvid,
         "title": title,
-        "summary": summary or "（该视频无可用AI字幕，无法生成总结）",
+        "summary": summary or "（该视频无法获取文字内容，无法生成总结）",
         "url": f"https://www.bilibili.com/video/{bvid}",
         "pub_time": pub_time_display,
         "duration": duration_display,
     }
-
-
-def _build_bili_cookies() -> Optional[dict]:
-    """构建B站登录Cookie字典"""
-    if BILI_SESSDATA and BILI_BILI_JCT and BILI_BUVID3:
-        cookies = {
-            "SESSDATA": BILI_SESSDATA,
-            "bili_jct": BILI_BILI_JCT,
-            "buvid3": BILI_BUVID3,
-        }
-        print("  [Cookie] 已配置B站登录Cookie，可获取AI字幕")
-        return cookies
-    print("  [Cookie] 未配置B站Cookie，仅能获取上传字幕")
-    return None
 
 
 def main():
@@ -198,9 +177,6 @@ def main():
     if not SMTP_USER or SMTP_USER.startswith("your_email"):
         print("\n❌ 错误: 邮箱未配置 (请修改 config.py 中的邮箱配置)")
         sys.exit(1)
-
-    # ---------- 构建B站Cookie ----------
-    bili_cookies = _build_bili_cookies()
 
     # ---------- 加载状态 ----------
     state = load_state(STATE_FILE)
@@ -226,7 +202,7 @@ def main():
         to_process = new_videos[:MAX_VIDEOS_PER_RUN]
 
         for v in to_process:
-            result = process_video(v, up_name, bili_cookies=bili_cookies)
+            result = process_video(v, up_name)
             result["up_name"] = up_name
             result["mid"] = mid
             all_new_videos.append(result)

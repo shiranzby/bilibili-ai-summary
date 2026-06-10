@@ -1,6 +1,6 @@
 # B站UP主视频监控 - GitHub Actions 工作流
 # 定时: 每天 08:00 / 20:00 (北京时间 = UTC+8, cron 用 UTC)
-# Secrets: ZHIPU_API_KEY, SMTP_USER, SMTP_PASS, SMTP_TO, HF_TOKEN
+# Secrets: ZHIPU_API_KEY, SMTP_USER, SMTP_PASS, SMTP_TO, SILICONFLOW_API_KEY
 name: B站视频监控
 
 on:
@@ -35,14 +35,6 @@ jobs:
           SMTP_USER: ${{ secrets.SMTP_USER }}
           SMTP_PASS: ${{ secrets.SMTP_PASS }}
           SMTP_TO: ${{ secrets.SMTP_TO }}
-          HF_TOKEN: ${{ secrets.HF_TOKEN }}
-          # B站Cookie: 推荐方式，完整Cookie一键粘贴，代码自动解析
-          BILI_COOKIE: ${{ secrets.BILI_COOKIE }}
-          # 传统三字段方式 (如果设置了BILI_COOKIE，这三项可省略)
-          BILI_SESSDATA: ${{ secrets.BILI_SESSDATA }}
-          BILI_BILI_JCT: ${{ secrets.BILI_BILI_JCT }}
-          BILI_BUVID3: ${{ secrets.BILI_BUVID3 }}
-          # 硅基流动语音识别 (SenseVoiceSmall)
           SILICONFLOW_API_KEY: ${{ secrets.SILICONFLOW_API_KEY }}
         run: python bilibili_monitor/inject_config.py
 
