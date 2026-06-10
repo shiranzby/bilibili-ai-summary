@@ -194,6 +194,10 @@ def transcribe_audio(
     """
     使用 Hugging Face 免费 Inference API 将音频转为文字
 
+    尝试多个端点以应对不同网络环境 (GHA上可能DNS解析失败):
+      1. https://api-inference.huggingface.co/models/{model} (主)
+      2. https://router.huggingface.co/hf-inference/models/{model} (备选)
+
     参数:
         audio_path: 音频文件路径 (WAV, 16kHz mono)
         hf_token: Hugging Face API Token
@@ -206,41 +210,63 @@ def transcribe_audio(
         print("    [Whisper] ❌ 未配置 Hugging Face Token")
         return None
 
-    api_url = f"https://api-inference.huggingface.co/models/{model}"
-
     file_size_mb = os.path.getsize(audio_path) / 1024 / 1024
     print(f"    [Whisper] 正在上传音频 ({file_size_mb:.1f} MB)...")
 
-    try:
-        with open(audio_path, "rb") as f:
+    with open(audio_path, "rb") as f:
+        audio_data = f.read()
+
+    # 备选端点列表 (按优先级)
+    endpoints = [
+        f"https://api-inference.huggingface.co/models/{model}",
+        f"https://router.huggingface.co/hf-inference/models/{model}",
+    ]
+
+    for i, api_url in enumerate(endpoints):
+        label = "主端点" if i == 0 else "备选端点"
+        try:
             resp = requests.post(
                 api_url,
                 headers={"Authorization": f"Bearer {hf_token}"},
-                data=f,
+                data=audio_data,
                 timeout=300,
             )
 
-        if resp.status_code == 200:
-            result = resp.json()
-            text = result.get("text", "")
-            if text:
-                print(f"    [Whisper] ✅ 转录成功 ({len(text)} 字符)")
-                return text
-            print(f"    [Whisper] ⚠ 返回文本为空")
+            if resp.status_code == 200:
+                result = resp.json()
+                text = result.get("text", "")
+                if text:
+                    print(f"    [Whisper] ✅ 转录成功 ({len(text)} 字符)")
+                    return text
+                print(f"    [Whisper] ⚠ 返回文本为空")
+                return None
+            elif resp.status_code == 503:
+                print(f"    [Whisper] ⏳ 模型加载中，请稍后重试")
+                return None
+            elif resp.status_code == 403:
+                print(f"    [Whisper] ⚠ {label} 403 无权限，尝试下一个...")
+                continue
+            else:
+                print(f"    [Whisper] ❌ {label} HTTP {resp.status_code}: {resp.text[:150]}")
+                if i < len(endpoints) - 1:
+                    print(f"    [Whisper]    尝试下一个端点...")
+                    continue
+                return None
+
+        except requests.exceptions.ConnectionError as e:
+            print(f"    [Whisper] ❌ {label} 连接失败: {e}")
+            if i < len(endpoints) - 1:
+                print(f"    [Whisper]    尝试下一个端点...")
+                continue
             return None
-        elif resp.status_code == 503:
-            print(f"    [Whisper] ⏳ 模型加载中，请稍后重试")
+        except requests.exceptions.Timeout:
+            print(f"    [Whisper] ❌ 上传超时")
             return None
-        else:
-            print(f"    [Whisper] ❌ HTTP {resp.status_code}: {resp.text[:200]}")
+        except Exception as e:
+            print(f"    [Whisper] ❌ 失败: {e}")
             return None
 
-    except requests.exceptions.Timeout:
-        print(f"    [Whisper] ❌ 上传超时")
-        return None
-    except Exception as e:
-        print(f"    [Whisper] ❌ 失败: {e}")
-        return None
+    return None
 
 
 # ==================== 主入口 ====================
