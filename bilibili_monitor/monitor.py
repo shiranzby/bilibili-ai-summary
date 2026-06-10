@@ -122,15 +122,14 @@ def process_video(video: dict, up_name: str, bili_cookies: Optional[dict] = None
     print(f"  [处理] 正在获取字幕...")
     subtitle_text = get_subtitle_text(bvid, cookies=bili_cookies)
 
-    # Step 2: 字幕失败时，回退到音频转录 (智谱AI → HuggingFace)
+    # Step 2: 字幕失败时，回退到视频描述
     if not subtitle_text:
-        print(f"  [处理] 无字幕，尝试音频转文字...")
-        subtitle_text = get_text_from_audio(
-            bvid, hf_token=HF_TOKEN, model=WHISPER_MODEL,
-            zhipu_api_key=ZHIPU_API_KEY,
-        )
-    if not subtitle_text:
-        print(f"  [处理] ⚠ 语音识别也失败了")
+        desc = (info or {}).get("desc", "").strip()
+        if desc and len(desc) > 20:
+            print(f"  [处理] ✅ 使用视频描述 ({len(desc)} 字符)")
+            subtitle_text = f"[视频描述] {desc[:3000]}"
+        else:
+            print(f"  [处理] ⚠ 该视频没有AI字幕，跳过总结")
 
     # AI总结
     summary = None
