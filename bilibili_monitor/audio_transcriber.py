@@ -103,15 +103,46 @@ def convert_to_wav(input_path: str, output_path: str) -> bool:
         return False
 
 
+def _get_audio_duration(audio_path: str) -> Optional[float]:
+    """用ffprobe获取音频时长(秒)"""
+    try:
+        result = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+             "-of", "default=noprint_wrappers=1:nokey=1", audio_path],
+            capture_output=True, text=True, timeout=15)
+        if result.returncode == 0 and result.stdout.strip():
+            return float(result.stdout.strip())
+        return None
+    except Exception:
+        return None
+
+
 def transcribe_with_zhipu(audio_path: str, api_key: str = "") -> Optional[str]:
     """
     使用智谱AI GLM-4-Audio 语音转文字
     国内直连，GHA上正常可用，免费额度覆盖
+    注: 智谱AI限制音频≤30秒，超长自动截断
+
     API: POST https://open.bigmodel.cn/api/paas/v4/audio/transcriptions
     """
     if not api_key:
         print("    [智谱AI] ❌ 未配置ZHIPU_API_KEY")
         return None
+
+    # 检查音频时长，超30秒则截断
+    duration = _get_audio_duration(audio_path)
+    if duration and duration > 30:
+        print(f"    [智谱AI] 音频 {duration:.0f}秒 >30秒限制，自动截取前30秒...")
+        trimmed_path = audio_path + ".trimmed.wav"
+        try:
+            subprocess.run(
+                ["ffmpeg", "-y", "-i", audio_path, "-t", "30",
+                 "-ac", "1", "-ar", "16000", "-f", "wav",
+                 "-loglevel", "error", trimmed_path],
+                capture_output=True, check=True, timeout=30)
+            audio_path = trimmed_path
+        except Exception as e:
+            print(f"    [智谱AI] ⚠ 截断失败: {e}，仍尝试原文件")
 
     file_size = os.path.getsize(audio_path) / 1024 / 1024
     print(f"    [智谱AI] 上传音频 ({file_size:.1f} MB)...")
