@@ -71,7 +71,6 @@ def download_audio_from_url(audio_url: str, output_path: str, timeout: int = 180
         "Referer": "https://www.bilibili.com/", "Origin": "https://www.bilibili.com",
     }
     try:
-        print(f"    [下载] 正在下载音频...")
         resp = requests.get(audio_url, headers=headers, timeout=timeout, stream=True)
         if resp.status_code not in (200, 206):
             print(f"    [下载] ❌ HTTP {resp.status_code}")
@@ -84,8 +83,11 @@ def download_audio_from_url(audio_url: str, output_path: str, timeout: int = 180
                 if total >= max_size: break
         print(f"    [下载] ✅ 完成 ({total/1024/1024:.1f} MB)")
         return total > 1000
+    except requests.exceptions.Timeout:
+        print(f"    [下载] ❌ 超时")
+        return False
     except Exception as e:
-        print(f"    [下载] ❌ 失败: {e}")
+        print(f"    [下载] ❌ 异常: {e}")
         return False
 
 
@@ -244,13 +246,31 @@ def get_text_from_audio(
         print(f"    [音频] playurl 失败")
         return _fallback_ytdlp(bvid, hf_token, model)
 
-    # 下载并转换
+    # 下载并转换 (带重试)
     with tempfile.TemporaryDirectory() as tmpdir:
         raw_audio = os.path.join(tmpdir, f"{bvid}.m4s")
         wav_audio = os.path.join(tmpdir, f"{bvid}.wav")
 
-        if not download_audio_from_url(audio_url, raw_audio):
-            print(f"    [音频] CDN下载失败")
+        max_retries = 3
+        download_ok = False
+        for attempt in range(1, max_retries + 1):
+            if attempt > 1:
+                # 重试: 重新获取CDN链接 (旧链接可能已过期)
+                print(f"    [音频] 第{attempt}次重试 (获取新CDN链接)...")
+                import time
+                time.sleep(1)
+                audio_url = get_audio_url_from_playurl(bvid, cid)
+                if not audio_url:
+                    print(f"    [音频] 重试获取playurl也失败")
+                    break
+
+            download_ok = download_audio_from_url(audio_url, raw_audio)
+            if download_ok:
+                break
+            print(f"    [音频] 下载失败，准备重试...")
+
+        if not download_ok:
+            print(f"    [音频] CDN下载失败 ({max_retries}次)")
             return _fallback_ytdlp(bvid, hf_token, model)
 
         if not convert_to_wav(raw_audio, wav_audio):
