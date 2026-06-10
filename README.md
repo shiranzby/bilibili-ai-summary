@@ -123,7 +123,8 @@ cd bilibili-video-monitor
 
 ```python
 UP_MIDS = [
-    12345678,  # 替换为你想监控的UP主UID
+    12345678,      # 监控单个UP主
+    23456789,      # 添加多个UID即可监控多个UP主
 ]
 ```
 
@@ -131,7 +132,7 @@ UP_MIDS = [
 1. 打开 UP 主的主页（例如在B站搜索UP主名称进入）
 2. 查看浏览器地址栏中的 URL，格式为 `https://space.bilibili.com/数字`
 3. 其中的数字部分就是 UID。例如 `https://space.bilibili.com/12345678` 中的 `12345678`
-4. 将此数字填入上方列表即可
+4. 将此数字填入上方列表即可。要监控多个 UP 主，用逗号分隔添加多个 UID
 
 ### 步骤4: 完成
 
