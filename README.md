@@ -24,17 +24,17 @@
 ┌─────────────────────────────────────────────────────┐
 │ GitHub Actions (定时任务 08:00 / 20:00)              │
 │                                                     │
-│  1. B站 API (移动端UA) ──→ 获取UP主最新视频列表       │
+│  1. B站 API (移动端UA) → 获取UP主最新视频列表         │
 │                                                     │
-│  2. B站字幕API + Cookie ──→ 获取视频AI字幕文本        │
-│         ↑                                              │
-│     (无需下载音频，无需ffmpeg，无需Whisper)              │
+│  2. B站字幕API + Cookie → 获取视频AI字幕文本          │
+│        ↑                                            │
+│    (无需下载音频，无需ffmpeg，无需Whisper)              │
 │                                                     │
-│  3. 智谱AI GLM-4-Flash ──→ 生成结构化总结             │
-│         ↑                                              │
-│     (每月100万免费tokens，国内直连)                    │
+│  3. 智谱AI GLM-4-Flash → 生成结构化总结               │
+│        ↑                                            │
+│    (每月100万免费tokens，国内直连)                    │
 │                                                     │
-│  4. QQ邮箱 SMTP ──→ 发送总结邮件到你的邮箱             │
+│  4. QQ邮箱 SMTP → 发送总结邮件到你的邮箱              │
 └─────────────────────────────────────────────────────┘
 ```
 
@@ -74,17 +74,16 @@ bilibili-video-monitor/
 | QQ邮箱 | 发件邮箱 (需开启SMTP) | QQ邮箱 → 设置 → 账户 → 开启SMTP |
 | B站Cookie | 获取AI字幕 (需登录) | 浏览器F12 → Application → Cookies |
 
-### 步骤1: Fork 仓库
+### 步骤1: Clone 仓库
 
 ```bash
-# 或者直接 Fork 到你的 GitHub
 git clone https://github.com/shiranzby/bilibili-video-monitor.git
 cd bilibili-video-monitor
 ```
 
 ### 步骤2: 配置 GitHub Secrets
 
-在仓库 Settings → Secrets and variables → Actions → New repository secret 中添加以下 Secrets:
+在仓库 **Settings → Secrets and variables → Actions → New repository secret** 中添加以下 Secrets：
 
 | Secret 名称 | 必填 | 说明 |
 |-------------|------|------|
@@ -92,34 +91,35 @@ cd bilibili-video-monitor
 | `SMTP_USER` | ✅ | QQ邮箱地址 (如 `123456@qq.com`) |
 | `SMTP_PASS` | ✅ | QQ邮箱SMTP授权码 (16位字母) |
 | `SMTP_TO` | ✅ | 收件邮箱地址 |
-| `BILI_SESSDATA` | ✅ | B站登录Cookie `SESSDATA` 的值 |
-| `BILI_BILI_JCT` | ✅ | B站登录Cookie `bili_jct` 的值 |
-| `BILI_BUVID3` | ✅ | B站登录Cookie `buvid3` 的值 |
-| `HF_TOKEN` | ❌ | HuggingFace Token (音频转录备选) |
+| `BILI_COOKIE` | ✅ | **完整B站Cookie** (推荐，一键粘贴) |
+| `HF_TOKEN` | ❌ | HuggingFace Token (音频转录备选，一般不需要) |
+
+> **BILI_COOKIE 兼容旧版**：如果你之前使用的是 `BILI_SESSDATA` / `BILI_BILI_JCT` / `BILI_BUVID3` 三个独立的 Secrets，它们仍然有效。如果同时设置了 `BILI_COOKIE` 和独立的三个字段，独立字段优先。
 
 #### 如何获取 B站 Cookie？
 
 <details>
-<summary>点击展开详细步骤</summary>
+<summary>点击展开详细步骤（30秒搞定）</summary>
 
 1. 打开 Chrome 浏览器，登录 [bilibili.com](https://www.bilibili.com)
 2. 按 `F12` 打开开发者工具
 3. 点击顶部 **Application** (或「应用」) 标签
 4. 左侧展开 **Cookies** → 选择 `https://www.bilibili.com`
-5. 找到以下三个值，复制并添加到 GitHub Secrets：
+5. **用鼠标点中任意一个 Cookie**，按 `Ctrl+A` 全选，再按 `Ctrl+C` 复制
+6. 回到 GitHub，在 **New secret** 页面：
+   - **Name**: `BILI_COOKIE`
+   - **Secret**: 粘贴复制的完整 Cookie 内容
 
-| Cookie 名称 | 在哪 | 示例值 |
-|-------------|------|--------|
-| `SESSDATA` | Cookie 列表 | `2f3eb5ce%2C17960...` |
-| `bili_jct` | Cookie 列表 | `26f501d58073ec64...` |
-| `buvid3` | Cookie 列表 | `CB2289A2-DEBB...` |
+> **注意**：不要手动修改，直接全选复制一整段即可。代码会自动从完整 Cookie 中提取 `SESSDATA`、`bili_jct`、`buvid3` 三个关键字段。
 
 **Cookie 有效期：** 约 6 个月（登录时勾选「记住我」）。到期后按上述步骤重新获取并更新 Secrets。
 </details>
 
+> **你也可以用旧方案**：如果不方便复制完整 Cookie，也可以分别创建 `BILI_SESSDATA`、`BILI_BILI_JCT`、`BILI_BUVID3` 三个 Secrets。代码对两种方式都支持，同时设置时独立字段优先。
+
 ### 步骤3: 配置监控目标
 
-如果需要监控其他 UP 主，修改 `bilibili_monitor/config.py` 中的 `UP_MIDS`：
+打开 `bilibili_monitor/config.py`，修改 `UP_MIDS` 列表来添加要监控的 UP 主：
 
 ```python
 UP_MIDS = [
@@ -130,11 +130,11 @@ UP_MIDS = [
 
 UP 主 UID 获取：打开 UP 主主页 → URL 末尾的数字。
 
-### 步骤4: 配置完成
+### 步骤4: 完成
 
-推送代码后自动触发工作流。也可手动触发：
+将代码推送至你的 GitHub 仓库，工作流会自动触发。也可手动触发：
 
-1. 打开仓库 Actions 页面
+1. 打开仓库 **Actions** 页面
 2. 点击 **B站视频监控** → **Run workflow** → ✅
 
 ---
@@ -165,6 +165,22 @@ UP 主 UID 获取：打开 UP 主主页 → URL 末尾的数字。
     └─ 6. 更新 state.json → 下次不重复处理
 ```
 
+### 关于 Cookie 的处理
+
+`BILI_COOKIE` 是推荐方式，在 `inject_config.py` 中会自动解析：
+
+```
+Cookie 字符串: "buvid3=xxx; SESSDATA=xxx; bili_jct=xxx"
+                           ↓ 自动解析
+                  ┌──────────────┬──────────────┐
+                  │ BILI_SESSDATA │ BILI_BILI_JCT │ BILI_BUVID3 │
+                  └──────────────┴──────────────┘
+                           ↓ 写入 config.py
+                  subtitle.py 使用 → 字幕 API 调用
+```
+
+如果同时设置了 `BILI_COOKIE` 和独立字段（`BILI_SESSDATA` 等），独立字段的值为准。
+
 ### 核心模块
 
 | 模块 | 文件 | 职责 |
@@ -175,6 +191,40 @@ UP 主 UID 获取：打开 UP 主主页 → URL 末尾的数字。
 | **AI总结** | `summarizer.py` | 调用智谱AI/Gemini生成结构化总结 |
 | **邮件** | `emailer.py` | 构建HTML模板并发送邮件 |
 | **配置注入** | `inject_config.py` | 从环境变量注入 Secrets 到 config.py |
+
+---
+
+## 🔧 工作流详解
+
+### `.github/workflows/bilibili_monitor.yml`
+
+工作流包含 5 个步骤：
+
+| 步骤 | 名称 | 说明 |
+|------|------|------|
+| 1 | actions/checkout@v4 | 检出仓库代码 |
+| 2 | actions/setup-python@v5 | 安装 Python 3.10，缓存 pip 依赖 |
+| 3 | 安装依赖 | `pip install -r requirements.txt` + `apt-get install ffmpeg` |
+| 4 | 注入配置 | `python inject_config.py` 从 Secrets 写入 config.py |
+| 5 | 运行监控 | `python monitor.py` 执行完整监控流程 |
+| 6 | 保存状态 | 将 state.json 的变化提交并推送回仓库 |
+
+### 环境变量对照
+
+工作流中的 env 变量与 GitHub Secrets 的对应关系：
+
+```yaml
+# 工作流 (bilibili_monitor.yml)          GitHub Secrets 名称
+ZHIPU_API_KEY: ${{ secrets.ZHIPU_API_KEY }}
+SMTP_USER: ${{ secrets.SMTP_USER }}
+SMTP_PASS: ${{ secrets.SMTP_PASS }}
+SMTP_TO: ${{ secrets.SMTP_TO }}
+HF_TOKEN: ${{ secrets.HF_TOKEN }}
+BILI_COOKIE: ${{ secrets.BILI_COOKIE }}       # 推荐：完整Cookie
+BILI_SESSDATA: ${{ secrets.BILI_SESSDATA }}   # 旧版：单独字段
+BILI_BILI_JCT: ${{ secrets.BILI_BILI_JCT }}   # 旧版
+BILI_BUVID3: ${{ secrets.BILI_BUVID3 }}        # 旧版
+```
 
 ---
 
@@ -198,7 +248,7 @@ A: 检查是否：
 3. 邮件可能被放入垃圾箱
 
 ### Q: B站 Cookie 过期了怎么办？
-A: 重新登录 B站，按上述步骤获取新的 Cookie 值，更新 GitHub Secrets 即可。
+A: 重新登录 B站，按上述步骤复制新的完整 Cookie，更新 `BILI_COOKIE` Secret 即可。
 
 ### Q: 能监控多个 UP 主吗？
 A: 可以！修改 `config.py` 中的 `UP_MIDS` 列表，添加多个 UID。
@@ -209,6 +259,9 @@ A: 修改 `.github/workflows/bilibili_monitor.yml` 中的 `cron` 表达式。
 
 ### Q: 遇到 B站 API 风控怎么办？
 A: 移动端 User-Agent + Cookie 已能有效规避风控。如果仍有问题，请检查 Cookie 是否过期。
+
+### Q: 完整 Cookie 和三个独立字段有冲突吗？
+A: 没有。代码优先使用独立字段的值（`BILI_SESSDATA`、`BILI_BILI_JCT`、`BILI_BUVID3`），如果它们为空则从 `BILI_COOKIE` 自动解析。两种方式可以同时配置，互不干扰。
 
 ---
 
