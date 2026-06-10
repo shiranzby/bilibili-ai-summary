@@ -92,8 +92,8 @@ git push
 | Secret 名称 | 说明 | 必填 |
 |-------------|------|------|
 | `SILICONFLOW_API_KEY` | 硅基流动 Key (语音识别) | ✅ |
-| `ZHIPU_API_KEY` | 智谱AI Key (AI总结) | 选一 |
-| `DEEPSEEK_API_KEY` | DeepSeek Key (AI总结) | 或 |
+| `ZHIPU_API_KEY` | 智谱AI Key (AI总结) | ✅ 推荐 |
+| `DEEPSEEK_API_KEY` | DeepSeek Key (AI总结) | 可选 |
 | `SMTP_USER` | 发件邮箱 (如 `123456@qq.com`) | ✅ |
 | `SMTP_PASS` | QQ邮箱SMTP授权码 (16位字母) | ✅ |
 | `SMTP_TO` | 收件邮箱 | ✅ |
