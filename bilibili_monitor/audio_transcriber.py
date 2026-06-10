@@ -23,8 +23,12 @@ def _get_play_headers() -> dict:
     }
 
 
-def get_audio_url_from_playurl(bvid: str, cid: int) -> Optional[str]:
-    """从B站 playurl API 获取音频直链 (无需Cookie)"""
+def get_audio_urls_from_playurl(bvid: str, cid: int) -> Optional[list]:
+    """
+    从B站 playurl API 获取所有可用音频直链 (baseUrl + backupUrl)
+
+    返回: URL列表 (按优先级排序)，或 None
+    """
     try:
         resp = requests.get(
             "https://api.bilibili.com/x/player/playurl",
@@ -35,16 +39,26 @@ def get_audio_url_from_playurl(bvid: str, cid: int) -> Optional[str]:
         if data.get("code") != 0:
             print(f"    [playurl] API错误: code={data.get('code')} msg={data.get('message')}")
             return None
+
         dash = data.get("data", {}).get("dash")
         if not dash or not dash.get("audio"):
             print(f"    [playurl] 未找到音频流")
             return None
+
         best = dash["audio"][-1]
-        url = best.get("baseUrl", "") or (best.get("backupUrl") or [None])[0]
-        if url:
-            print(f"    [playurl] ✅ 获取音频直链 (codec={best.get('codecs','?')[:20]})")
-            return url
+        urls = []
+        # 主链接
+        if best.get("baseUrl"):
+            urls.append(best["baseUrl"])
+        # 备用链接
+        for bk in (best.get("backupUrl") or []):
+            if bk: urls.append(bk)
+
+        if urls:
+            print(f"    [playurl] ✅ 获取到 {len(urls)} 条音频直链")
+            return urls
         return None
+
     except Exception as e:
         print(f"    [playurl] ❌ 异常: {e}")
         return None
@@ -234,44 +248,50 @@ def get_text_from_audio(
     返回: 转录文本或 None
     """
 
-    # 先下载音频
+    # 获取所有可用音频直链 (baseUrl + backupUrl)
     print(f"    [音频] 使用 playurl API 获取音频...")
     cid = get_cid(bvid)
     if not cid:
         print(f"    [音频] 无法获取 cid")
-        return _fallback_ytdlp(bvid, hf_token, model)
+        return _fallback_ytdlp(bvid, siliconflow_api_key)
 
-    audio_url = get_audio_url_from_playurl(bvid, cid)
-    if not audio_url:
+    all_urls = get_audio_urls_from_playurl(bvid, cid)
+    if not all_urls:
         print(f"    [音频] playurl 失败")
-        return _fallback_ytdlp(bvid, hf_token, model)
+        return _fallback_ytdlp(bvid, siliconflow_api_key)
 
-    # 下载并转换 (带重试)
+    # 下载并转换 (遍历所有链接 + 重试)
     with tempfile.TemporaryDirectory() as tmpdir:
         raw_audio = os.path.join(tmpdir, f"{bvid}.m4s")
         wav_audio = os.path.join(tmpdir, f"{bvid}.wav")
 
-        max_retries = 3
         download_ok = False
-        for attempt in range(1, max_retries + 1):
-            if attempt > 1:
-                # 重试: 重新获取CDN链接 (旧链接可能已过期)
-                print(f"    [音频] 第{attempt}次重试 (获取新CDN链接)...")
-                import time
-                time.sleep(1)
-                audio_url = get_audio_url_from_playurl(bvid, cid)
-                if not audio_url:
-                    print(f"    [音频] 重试获取playurl也失败")
+        # 先试所有已有链接
+        for idx, url in enumerate(all_urls):
+            print(f"    [音频] 尝试下载 #{idx+1}/{len(all_urls)}...")
+            if download_audio_from_url(url, raw_audio):
+                download_ok = True
+                break
+
+        # 如果都失败，重新获取新链接重试 (最多2轮)
+        if not download_ok:
+            for retry in range(1, 3):
+                print(f"    [音频] 第{retry}轮重试 (获取新链接)...")
+                import time; time.sleep(1)
+                new_urls = get_audio_urls_from_playurl(bvid, cid)
+                if not new_urls:
+                    continue
+                for idx, url in enumerate(new_urls):
+                    print(f"    [音频] 重试 #{idx+1}/{len(new_urls)}...")
+                    if download_audio_from_url(url, raw_audio):
+                        download_ok = True
+                        break
+                if download_ok:
                     break
 
-            download_ok = download_audio_from_url(audio_url, raw_audio)
-            if download_ok:
-                break
-            print(f"    [音频] 下载失败，准备重试...")
-
         if not download_ok:
-            print(f"    [音频] CDN下载失败 ({max_retries}次)")
-            return _fallback_ytdlp(bvid, hf_token, model)
+            print(f"    [音频] CDN下载彻底失败，尝试 yt-dlp...")
+            return _fallback_ytdlp(bvid, siliconflow_api_key)
 
         if not convert_to_wav(raw_audio, wav_audio):
             print(f"    [音频] ffmpeg转换失败")
@@ -324,7 +344,7 @@ def _transcribe_huggingface(audio_path: str, hf_token: str, model: str) -> Optio
     return None
 
 
-def _fallback_ytdlp(bvid: str, hf_token: str, model: str) -> Optional[str]:
+def _fallback_ytdlp(bvid: str, siliconflow_api_key: str = "") -> Optional[str]:
     """yt-dlp 备选方案"""
     print(f"    [音频] 尝试 yt-dlp 下载...")
     url = f"https://www.bilibili.com/video/{bvid}"
@@ -339,9 +359,9 @@ def _fallback_ytdlp(bvid: str, hf_token: str, model: str) -> Optional[str]:
                 return None
             for f in os.listdir(tmpdir):
                 path = os.path.join(tmpdir, f)
-                if zhipu_api_key:
-                    return transcribe_with_zhipu(path, api_key=zhipu_api_key)
-                return _transcribe_huggingface(path, hf_token, model) if hf_token else None
+                if siliconflow_api_key:
+                    return transcribe_with_siliconflow(path, api_key=siliconflow_api_key)
+                return None
             return None
         except FileNotFoundError:
             print(f"    [yt-dlp] ❌ 未安装")
