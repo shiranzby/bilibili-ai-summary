@@ -14,7 +14,8 @@ GHA workflow 调用: python inject_config.py
     SMTP_PASS        → SMTP_PASS
     SMTP_TO          → SMTP_TO
     HF_TOKEN         → HF_TOKEN
-    BILI_SESSDATA    → BILI_SESSDATA
+    BILI_COOKIE      → BILI_COOKIE  (完整Cookie字符串,自动解析为三个字段)
+    BILI_SESSDATA    → BILI_SESSDATA (单独注入,优先级高于 BILI_COOKIE)
     BILI_BILI_JCT    → BILI_BILI_JCT
     BILI_BUVID3      → BILI_BUVID3
 """
@@ -33,10 +34,45 @@ VAR_MAP = {
     "SMTP_PASS":      "SMTP_PASS",
     "SMTP_TO":        "SMTP_TO",
     "HF_TOKEN":       "HF_TOKEN",
+    "BILI_COOKIE":    "BILI_COOKIE",
     "BILI_SESSDATA":  "BILI_SESSDATA",
     "BILI_BILI_JCT":  "BILI_BILI_JCT",
     "BILI_BUVID3":    "BILI_BUVID3",
 }
+
+
+def _parse_cookie(cookie_str: str) -> dict:
+    """
+    从完整 Cookie 字符串中解析出 SESSDATA / bili_jct / buvid3
+
+    支持常见格式:
+      - "buvid3=xxx; SESSDATA=xxx; bili_jct=xxx"
+      - 浏览器直接复制粘贴的一整段 Cookie 头
+    """
+    result = {}
+    # 正则匹配: name=value; 支持空格和引号
+    pairs = re.findall(r'(\w[\w.-]*)\s*=\s*([^;]+)', cookie_str)
+    for name, value in pairs:
+        name = name.strip()
+        value = value.strip().strip('"').strip("'")
+        if name == "SESSDATA":
+            result["BILI_SESSDATA"] = value
+        elif name == "bili_jct":
+            result["BILI_BILI_JCT"] = value
+        elif name == "buvid3":
+            result["BILI_BUVID3"] = value
+    return result
+
+
+def _set_config_var(content: str, var_name: str, value: str) -> str:
+    """替换 config.py 中的单个变量值"""
+    pattern = rf'({var_name}\s*=\s*)"[^"]*"'
+    replacement = rf'\1"{value}"'
+    new_content, count = re.subn(pattern, replacement, content)
+    if count > 0:
+        masked = value[:4] + "****" + value[-4:] if len(value) > 8 else "****"
+        print(f"[注入] ✅ {var_name} = {masked} (从完整Cookie解析)")
+    return new_content if count > 0 else content
 
 
 def inject():
@@ -49,6 +85,7 @@ def inject():
         content = f.read()
 
     injected_count = 0
+    had_cookie = False
     skipped = []
 
     for env_name, var_name in VAR_MAP.items():
@@ -65,15 +102,29 @@ def inject():
         if count > 0:
             content = new_content
             injected_count += count
-            # 脱敏显示: 只显示前后各4个字符
-            masked = env_val[:4] + "****" + env_val[-4:] if len(env_val) > 8 else "****"
-            print(f"[注入] ✅ {var_name} = {masked}")
+            if env_name == "BILI_COOKIE":
+                had_cookie = True
+                masked = env_val[:20] + "****" + env_val[-10:] if len(env_val) > 30 else "****"
+                print(f"[注入] ✅ {var_name} = {masked}")
+            else:
+                masked = env_val[:4] + "****" + env_val[-4:] if len(env_val) > 8 else "****"
+                print(f"[注入] ✅ {var_name} = {masked}")
         else:
             print(f"[注入] ⚠ {var_name}: 未找到匹配行，跳过")
 
+    # --- 完整Cookie解析 (如果BILI_COOKIE提供了,但单个字段没提供) ---
+    if had_cookie:
+        raw_cookie = os.environ.get("BILI_COOKIE", "")
+        parsed = _parse_cookie(raw_cookie)
+        for key in ["BILI_SESSDATA", "BILI_BILI_JCT", "BILI_BUVID3"]:
+            # 只有当单个字段还没被注入时才解析
+            if key in parsed and key in skipped:
+                content = _set_config_var(content, key, parsed[key])
+                injected_count += 1
+                skipped.remove(key)
+
     if injected_count == 0:
         print("\n[注入] ⚠ 没有注入任何配置! 请检查 GHA Secrets 是否已设置。")
-        print("  需要的 Secrets: ZHIPU_API_KEY, SMTP_USER, SMTP_PASS, SMTP_TO, HF_TOKEN")
     else:
         print(f"[注入] 📋 共注入 {injected_count} 项配置")
         if skipped:

@@ -45,6 +45,13 @@ GEMINI_API_KEY = ""
 # ============================================================
 # 🔑 B站登录Cookie (获取AI字幕必需，可选)
 # ============================================================
+
+# 方式一 (推荐): 直接从浏览器复制完整Cookie字符串
+# 登录 bilibili.com → F12 → Application → Cookies → 选中一行 → 复制全部
+# 🔐 通过 GHA Secret BILI_COOKIE 注入
+BILI_COOKIE = ""
+
+# 方式二: 分别填写三个关键Cookie值 (由BILI_COOKIE自动解析时可忽略)
 # 🔐 通过 GHA Secrets BILI_SESSDATA / BILI_BILI_JCT / BILI_BUVID3 注入 (可选)
 BILI_SESSDATA = ""
 BILI_BILI_JCT = ""
