@@ -73,7 +73,7 @@ git push
 2. 进入 API Keys → 创建 API Key
 3. 复制 API Key（格式：`xxx.xxx`）
 
-**方案B: DeepSeek V3 (可选)**
+**方案B: DeepSeek V4-Flash (可选)**
 
 注册送500万tokens，性价比极高。
 
