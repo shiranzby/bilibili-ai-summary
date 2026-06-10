@@ -36,6 +36,9 @@ jobs:
           SMTP_PASS: ${{ secrets.SMTP_PASS }}
           SMTP_TO: ${{ secrets.SMTP_TO }}
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          BILI_SESSDATA: ${{ secrets.BILI_SESSDATA }}
+          BILI_BILI_JCT: ${{ secrets.BILI_BILI_JCT }}
+          BILI_BUVID3: ${{ secrets.BILI_BUVID3 }}
         run: python bilibili_monitor/inject_config.py
 
       - name: 运行监控
