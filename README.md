@@ -23,19 +23,9 @@
 
 ## 🔄 工作流程
 
-```
-B站 API → 获取UP主最新视频
-    ↓
-playurl API → 下载音频 → ffmpeg 转 WAV
-    ↓
-硅基流动 SenseVoiceSmall → 语音转文字 (完全免费)
-    ↓
-智谱AI / DeepSeek / Gemini → AI 结构化总结
-    ↓
-QQ邮箱 SMTP → 摘要邮件通知
-    ↓
-state.json → 记录已处理视频 (下次不再重复)
-```
+<p align="center">
+  <img src="images/workflow.jpg" alt="工作流程" width="520">
+</p>
 
 > **注**：无需B站Cookie，无需AI字幕，纯音频转录+AI总结，任何视频都能处理。
 
