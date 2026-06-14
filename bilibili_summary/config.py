@@ -54,7 +54,7 @@ DEEPSEEK_API_KEY = ""
 # ---- 硅基流动 AI总结 (可选，与语音识别共用同一KEY) ----
 # 总结模型: 可在 https://cloud.siliconflow.cn/ 查看可用模型
 # 🔐 通过 GHA Secret SILICONFLOW_MODEL 注入
-SILICONFLOW_MODEL = "deepseek-ai/DeepSeek-V3"
+SILICONFLOW_MODEL = "Qwen/Qwen3-8B"
 
 # ---- Google Gemini (永久免费) ----
 # Key: https://aistudio.google.com/apikey
