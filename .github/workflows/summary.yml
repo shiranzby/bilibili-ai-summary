@@ -37,6 +37,7 @@ jobs:
           SMTP_PASS: ${{ secrets.SMTP_PASS }}
           SMTP_TO: ${{ secrets.SMTP_TO }}
           SILICONFLOW_API_KEY: ${{ secrets.SILICONFLOW_API_KEY }}
+          SILICONFLOW_MODEL: ${{ secrets.SILICONFLOW_MODEL }}
         run: python bilibili_summary/inject_config.py
 
       - name: 运行

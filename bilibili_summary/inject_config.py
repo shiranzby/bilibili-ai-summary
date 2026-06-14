@@ -14,6 +14,7 @@ GHA workflow 调用: python inject_config.py
     SMTP_PASS        → SMTP_PASS
     SMTP_TO          → SMTP_TO
     SILICONFLOW_API_KEY → SILICONFLOW_API_KEY (语音识别)
+    SILICONFLOW_MODEL   → SILICONFLOW_MODEL (总结模型，可选)
 """
 
 import os
@@ -31,6 +32,7 @@ VAR_MAP = {
     "SMTP_PASS":      "SMTP_PASS",
     "SMTP_TO":        "SMTP_TO",
     "SILICONFLOW_API_KEY": "SILICONFLOW_API_KEY",
+    "SILICONFLOW_MODEL":   "SILICONFLOW_MODEL",
 }
 
 
