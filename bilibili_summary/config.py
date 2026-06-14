@@ -38,8 +38,8 @@ SILICONFLOW_API_KEY = ""
 # 🤖 AI总结配置 (选一个后端填写即可)
 # ============================================================
 
-# AI后端选择: "zhipu" (默认) | "deepseek" | "siliconflow" | "gemini"
-AI_BACKEND = "zhipu"
+# AI后端选择: "siliconflow" (推荐) | "zhipu" | "deepseek" | "gemini"
+AI_BACKEND = "siliconflow"
 
 # ---- 智谱AI GLM-4-Flash (国内直连，每月100万免费tokens) ----
 # Key: https://open.bigmodel.cn/
