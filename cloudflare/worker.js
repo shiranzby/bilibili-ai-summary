@@ -2,21 +2,16 @@
  * Bilibili AI Summary — Cloudflare Worker
  * ==========================================
  * API endpoints for manual video URL submission.
- * Stores jobs in R2, triggers GitHub Actions for processing.
  *
- * R2 Bucket structure:
- *   pending/<jobId>.json   → 待处理任务
- *   results/<jobId>.json   → 已完成任务结果
- *
- * Auto-cleanup: keeps at most MAX_RESULTS completed jobs.
- * Oldest results are deleted when new ones complete.
+ * 降级模式: 无 R2 时仍可提交任务（结果通过邮件发送）。
+ * 完整模式: 有 R2 时存储任务数据并支持在线查询。
  */
 
 // ═══════════════════════════════════════════════════════
 // Configuration
 // ═══════════════════════════════════════════════════════
 
-const MAX_RESULTS = 10;   // 保留最近 N 条已完成结果，超出自动删最旧
+const MAX_RESULTS = 10;
 const CORS_HEADERS = {
   'Access-Control-Allow-Origin': '*',
   'Access-Control-Allow-Methods': 'GET, POST, DELETE, OPTIONS',
@@ -27,13 +22,8 @@ const CORS_HEADERS = {
 // Helpers
 // ═══════════════════════════════════════════════════════
 
-function uuid() {
-  return crypto.randomUUID();
-}
-
-function nowISO() {
-  return new Date().toISOString();
-}
+function uuid() { return crypto.randomUUID(); }
+function nowISO() { return new Date().toISOString(); }
 
 function jsonResponse(data, status = 200) {
   return new Response(JSON.stringify(data), {
@@ -54,21 +44,17 @@ function htmlResponse(html, status = 200) {
 }
 
 // ═══════════════════════════════════════════════════════
-// R2 Storage — 按数量清理
+// R2 Storage (only used when configured)
 // ═══════════════════════════════════════════════════════
 
 async function cleanupExcessResults(R2) {
-  // 收集所有已完成结果的上传时间和 key
   const objects = [];
   for await (const obj of R2.list()) {
     if (obj.key.startsWith('results/')) {
       objects.push({ key: obj.key, uploaded: obj.uploaded });
     }
   }
-  // 按上传时间升序排列（最旧的在前）
   objects.sort((a, b) => new Date(a.uploaded) - new Date(b.uploaded));
-
-  // 只保留最新的 MAX_RESULTS 条，删除多余的
   const toDelete = objects.slice(0, Math.max(0, objects.length - MAX_RESULTS));
   let deleted = 0;
   for (const obj of toDelete) {
@@ -78,26 +64,16 @@ async function cleanupExcessResults(R2) {
   return deleted;
 }
 
-function requireBucket(env) {
-  if (!env.BILIBILI_BUCKET) {
-    return errorResponse('R2 存储未配置。请在 Cloudflare Dashboard → Workers & Pages → 本 Worker → Settings → Variables → R2 Bucket Bindings 添加 BILIBILI_BUCKET 绑定到 bilibili-summary 存储桶。', 503);
-  }
-  return null;
-}
-
 // ═══════════════════════════════════════════════════════
 // API Handlers
 // ═══════════════════════════════════════════════════════
 
 async function handleSubmit(request, env) {
-  const missing = requireBucket(env);
-  if (missing) return missing;
   const { url } = await request.json();
   if (!url || typeof url !== 'string') {
     return errorResponse('请提供 B站视频 URL 或 BV 号');
   }
 
-  // Extract BVID from URL or use raw input
   let bvid = url.trim();
   const bvMatch = bvid.match(/BV[a-zA-Z0-9]{10}/);
   if (bvMatch) bvid = bvMatch[0];
@@ -107,295 +83,371 @@ async function handleSubmit(request, env) {
 
   const jobId = uuid();
   const job = {
-    id: jobId,
-    bvid,
-    url: bvid,
-    status: 'pending',
-    created_at: nowISO(),
-    updated_at: nowISO(),
-    summary: null,
-    title: '',
-    error: '',
+    id: jobId, bvid, url: bvid, status: 'pending',
+    created_at: nowISO(), updated_at: nowISO(),
+    summary: null, title: '', error: '',
   };
 
-  // Write to R2
-  await env.BILIBILI_BUCKET.put(
-    `pending/${jobId}.json`,
-    JSON.stringify(job),
-    { httpMetadata: { contentType: 'application/json' } }
-  );
+  // 有 R2 则持久化 (可选，静默失败)
+  if (env.BILIBILI_BUCKET) {
+    env.BILIBILI_BUCKET.put(`pending/${jobId}.json`, JSON.stringify(job),
+      { httpMetadata: { contentType: 'application/json' } }
+    ).catch(() => {});
+  }
 
-  // Trigger GitHub Actions (fire-and-forget)
-  const ghResp = fetch(
-    `https://api.github.com/repos/${env.GH_OWNER}/${env.GH_REPO}/actions/workflows/manual.yml/dispatches`,
-    {
-      method: 'POST',
-      headers: {
-        'Accept': 'application/vnd.github.v3+json',
-        'Authorization': `Bearer ${env.GH_TOKEN}`,
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({
-        ref: env.GH_REF || 'main',
-        inputs: { bvid, job_id: jobId },
-      }),
-    }
-  ).catch(err => console.error('GitHub dispatch failed:', err));
+  // 触发 GitHub Actions
+  fetch(`https://api.github.com/repos/${env.GH_OWNER}/${env.GH_REPO}/actions/workflows/manual.yml/dispatches`, {
+    method: 'POST',
+    headers: {
+      'Accept': 'application/vnd.github.v3+json',
+      'Authorization': `Bearer ${env.GH_TOKEN}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({ ref: env.GH_REF || 'main', inputs: { bvid, job_id: jobId } }),
+  }).catch(err => console.error('GitHub dispatch failed:', err));
 
-  // Cleanup excess results (fire-and-forget)
-  const cleanup = cleanupExcessResults(env.BILIBILI_BUCKET);
-
-  await Promise.allSettled([ghResp, cleanup]);
+  // 有 R2 时清理过期结果
+  if (env.BILIBILI_BUCKET) {
+    cleanupExcessResults(env.BILIBILI_BUCKET).catch(() => {});
+  }
 
   return jsonResponse({ job_id: jobId, bvid, status: 'pending' }, 201);
 }
 
 async function handleListJobs(request, env) {
-  const missing = requireBucket(env);
-  if (missing) return missing;
+  if (!env.BILIBILI_BUCKET) {
+    return jsonResponse({ jobs: [], total: 0, note: 'R2 未配置 — 使用浏览器 LocalStorage 代替' });
+  }
+
   const url = new URL(request.url);
   const status = url.searchParams.get('status') || '';
   const limit = Math.min(parseInt(url.searchParams.get('limit') || '50'), 100);
 
-  // List both pending and results
   const jobs = [];
-  const pendingPrefix = 'pending/';
-  const resultsPrefix = 'results/';
-
   for await (const obj of env.BILIBILI_BUCKET.list()) {
     if (jobs.length >= limit) break;
-    const isPending = obj.key.startsWith(pendingPrefix);
-    const isResult = obj.key.startsWith(resultsPrefix);
+    const isPending = obj.key.startsWith('pending/');
+    const isResult = obj.key.startsWith('results/');
     if (!isPending && !isResult) continue;
-
     const raw = await env.BILIBILI_BUCKET.get(obj.key);
     if (!raw) continue;
     const job = await raw.json();
-
-    // Filter by status
     if (status && job.status !== status) continue;
     jobs.push(job);
   }
-
-  // Sort by created_at descending (newest first)
   jobs.sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
-
   return jsonResponse({ jobs, total: jobs.length });
 }
 
 async function handleGetJob(request, env, jobId) {
-  const missing = requireBucket(env);
-  if (missing) return missing;
-  // Check pending
+  if (!env.BILIBILI_BUCKET) {
+    return errorResponse('R2 未配置 — 结果通过邮件发送，不支持在线查询', 503);
+  }
   let raw = await env.BILIBILI_BUCKET.get(`pending/${jobId}.json`);
-  if (!raw) {
-    // Check results
-    raw = await env.BILIBILI_BUCKET.get(`results/${jobId}.json`);
-  }
-  if (!raw) {
-    return errorResponse('任务不存在', 404);
-  }
-  const job = await raw.json();
-  return jsonResponse(job);
+  if (!raw) raw = await env.BILIBILI_BUCKET.get(`results/${jobId}.json`);
+  if (!raw) return errorResponse('任务不存在', 404);
+  return jsonResponse(await raw.json());
 }
 
 async function handleDeleteJob(request, env, jobId) {
-  const missing = requireBucket(env);
-  if (missing) return missing;
+  if (!env.BILIBILI_BUCKET) {
+    return jsonResponse({ deleted: true, job_id: jobId, note: '无 R2 — 浏览器 LocalStorage 中删除' });
+  }
   let deleted = false;
-  const pendingKey = `pending/${jobId}.json`;
-  const resultKey = `results/${jobId}.json`;
-
-  if (await env.BILIBILI_BUCKET.get(pendingKey)) {
-    await env.BILIBILI_BUCKET.delete(pendingKey);
-    deleted = true;
+  if (await env.BILIBILI_BUCKET.get(`pending/${jobId}.json`)) {
+    await env.BILIBILI_BUCKET.delete(`pending/${jobId}.json`); deleted = true;
   }
-  if (await env.BILIBILI_BUCKET.get(resultKey)) {
-    await env.BILIBILI_BUCKET.delete(resultKey);
-    deleted = true;
+  if (await env.BILIBILI_BUCKET.get(`results/${jobId}.json`)) {
+    await env.BILIBILI_BUCKET.delete(`results/${jobId}.json`); deleted = true;
   }
-
-  if (!deleted) {
-    return errorResponse('任务不存在', 404);
-  }
+  if (!deleted) return errorResponse('任务不存在', 404);
   return jsonResponse({ deleted: true, job_id: jobId });
 }
 
 async function handleStats(request, env) {
-  const missing = requireBucket(env);
-  if (missing) return missing;
-  let pending = 0;
-  let completed = 0;
-
+  if (!env.BILIBILI_BUCKET) {
+    return jsonResponse({ mode: 'localstorage', note: 'R2 未配置 — 使用浏览器 LocalStorage', max_results: MAX_RESULTS });
+  }
+  let pending = 0, completed = 0;
   for await (const obj of env.BILIBILI_BUCKET.list()) {
     if (obj.key.startsWith('pending/')) pending++;
     if (obj.key.startsWith('results/')) completed++;
   }
-
-  return jsonResponse({
-    pending_jobs: pending,
-    completed_jobs: completed,
-    max_results: MAX_RESULTS,
-  });
+  return jsonResponse({ mode: 'r2', pending_jobs: pending, completed_jobs: completed, max_results: MAX_RESULTS });
 }
 
-// Cron handler: cleanup excess results
+// ═══════════════════════════════════════════════════════
+// Cron
+// ═══════════════════════════════════════════════════════
+
 async function handleCron(event, env) {
-  if (!env.BILIBILI_BUCKET) {
-    console.log('[Cron] ⏭ R2 bucket not configured, skipping cleanup');
-    return;
-  }
+  if (!env.BILIBILI_BUCKET) return;
   const deleted = await cleanupExcessResults(env.BILIBILI_BUCKET);
-  console.log(`[Cron] Cleanup: deleted ${deleted} old results, keeping ${MAX_RESULTS}`);
+  console.log(`[Cron] Cleanup: deleted ${deleted} old results`);
 }
 
 // ═══════════════════════════════════════════════════════
-// Status Page (HTML)
+// Status Page
 // ═══════════════════════════════════════════════════════
 
-function generateStatusPage(env) {
-  const r2Status = env.BILIBILI_BUCKET ? '✅ 已连接' : '⏳ 未配置';
-  const r2Link = env.BILIBILI_BUCKET
-    ? ''
-    : '<p>在 <a href="https://dash.cloudflare.com/?to=/:account/r2" target="_blank">Cloudflare Dashboard → R2</a> 启用后，<br>再到 <b>Workers & Pages → bilibili-ai-summary-api → Settings → Variables → R2 Bucket Bindings</b><br>添加变量名 <code>BILIBILI_BUCKET</code>，存储桶 <code>bilibili-summary</code></p>';
-  const ghStatus = env.GH_TOKEN ? '✅ 已配置' : '⏳ 未配置';
 
+// ═══════════════════════════════════════════════════════
+// Frontend HTML (embedded)
+// ═══════════════════════════════════════════════════════
+
+function generateFrontendPage() {
   return `<!DOCTYPE html>
-<html lang="zh-CN">
+<html lang="zh-CN" data-theme="light">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>B站AI摘要 API</title>
+<title>B站AI摘要</title>
 <style>
-  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
-  body {
-    font-family: -apple-system, 'Segoe UI', system-ui, sans-serif;
-    background: #0f172a; color: #e2e8f0;
-    min-height: 100vh; display: flex; align-items: center; justify-content: center;
-    padding: 24px;
-  }
-  .card {
-    background: #1e293b; border: 1px solid #334155; border-radius: 16px;
-    padding: 32px; max-width: 680px; width: 100%;
-    box-shadow: 0 20px 60px rgba(0,0,0,0.4);
-  }
-  h1 {
-    font-size: 1.5rem; font-weight: 800;
-    background: linear-gradient(135deg, #14b8a6, #0ea5e9);
-    -webkit-background-clip: text; -webkit-text-fill-color: transparent;
-    background-clip: text; margin-bottom: 8px;
-  }
-  .subtitle { color: #94a3b8; font-size: 0.9rem; margin-bottom: 24px; }
-  .status-grid { display: grid; gap: 12px; margin-bottom: 24px; }
-  .status-item {
-    display: flex; align-items: center; gap: 10px;
-    padding: 12px 16px; background: #0f172a; border-radius: 10px;
-    font-size: 0.88rem;
-  }
-  .status-item .label { color: #94a3b8; min-width: 80px; }
-  .status-item .value { font-weight: 600; }
-  .hint {
-    border-top: 1px solid #334155; padding-top: 16px; margin-top: 8px;
-    font-size: 0.85rem; color: #94a3b8; line-height: 1.7;
-  }
-  .hint a { color: #38bdf8; }
-  .hint code { background: #0f172a; padding: 2px 6px; border-radius: 4px; font-size: 0.8rem; }
-  .btn {
-    display: inline-block; margin-top: 16px;
-    padding: 10px 20px; background: #14b8a6; color: #fff;
-    border: none; border-radius: 10px; font-size: 0.9rem; font-weight: 700;
-    text-decoration: none; cursor: pointer; transition: background 0.2s;
-  }
-  .btn:hover { background: #0d9488; }
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+:root{--bg:#f8fafc;--surface:rgba(255,255,255,0.85);--surface-border:rgba(203,213,225,0.7);--text:#0f172a;--text-soft:#475569;--text-muted:#94a3b8;--brand:#14b8a6;--accent:#0ea5e9;--danger:#ef4444;--success:#22c55e;--radius:14px;--shadow:0 4px 16px rgba(15,23,42,0.06)}
+[data-theme="dark"]{--bg:#0f172a;--surface:rgba(30,41,59,0.85);--surface-border:rgba(51,65,85,0.7);--text:#f1f5f9;--text-soft:#cbd5e1;--text-muted:#64748b;--shadow:0 4px 16px rgba(0,0,0,0.2)}
+body{font-family:-apple-system,'Segoe UI',system-ui,sans-serif;background:var(--bg);color:var(--text);min-height:100vh;transition:background .3s,color .3s}
+.container{max-width:880px;margin:0 auto;padding:32px 20px}
+header{display:flex;align-items:center;justify-content:space-between;margin-bottom:32px;flex-wrap:wrap;gap:12px}
+h1{font-size:1.6rem;font-weight:800;background:linear-gradient(135deg,var(--brand),var(--accent));-webkit-background-clip:text;-webkit-text-fill-color:transparent;background-clip:text}
+.ht{background:var(--surface);border:1px solid var(--surface-border);border-radius:10px;padding:8px 14px;cursor:pointer;font-size:.85rem;color:var(--text-soft);transition:all .2s}
+.ht:hover{border-color:var(--brand)}
+.card{background:var(--surface);border:1px solid var(--surface-border);border-radius:var(--radius);padding:24px;margin-bottom:20px;backdrop-filter:blur(12px);box-shadow:var(--shadow)}
+.ct{font-size:.85rem;font-weight:700;color:var(--text-muted);text-transform:uppercase;letter-spacing:.04em;margin-bottom:12px}
+.ir{display:flex;gap:10px;flex-wrap:wrap}
+.ir input{flex:1;min-width:200px;padding:12px 16px;border:1px solid var(--surface-border);border-radius:12px;background:rgba(255,255,255,0.7);color:var(--text);font-size:.95rem;outline:0;transition:border-color .2s}
+.ir input:focus{border-color:var(--accent);box-shadow:0 0 0 3px rgba(14,165,233,0.12)}
+.btn{padding:12px 24px;border:none;border-radius:12px;font-size:.9rem;font-weight:700;cursor:pointer;transition:all .2s;white-space:nowrap}
+.btn-p{background:linear-gradient(135deg,var(--brand),var(--accent));color:#fff}
+.btn-p:hover{transform:translateY(-1px);box-shadow:0 4px 12px rgba(20,184,166,0.3)}
+.btn-p:disabled{opacity:.5;cursor:not-allowed;transform:none;box-shadow:none}
+.btn-d{background:transparent;border:1px solid var(--danger);color:var(--danger);padding:6px 12px;font-size:.8rem}
+.btn-d:hover{background:var(--danger);color:#fff}
+.hint{font-size:.82rem;color:var(--text-muted);margin-top:8px}
+.ji{display:flex;align-items:center;gap:12px;padding:12px 0;border-bottom:1px solid var(--surface-border)}
+.ji:last-child{border-bottom:0}
+.js{width:32px;height:32px;border-radius:50%;display:flex;align-items:center;justify-content:center;font-size:.75rem;font-weight:800;flex-shrink:0}
+.js.sub{background:#fef3c7;color:#92400e}
+.js.pending{background:#dbeafe;color:#1e40af}
+.js.done{background:#dcfce7;color:#166534}
+.js.failed{background:#fee2e2;color:#991b1b}
+.ji{flex:1;min-width:0}
+.jb{font-weight:700;font-size:.9rem}
+.jt{font-size:.8rem;color:var(--text-muted)}
+.je{text-align:center;padding:32px 0;color:var(--text-muted);font-size:.9rem}
+.notice{padding:12px 16px;background:#fef3c7;border:1px solid #f59e0b;border-radius:10px;font-size:.85rem;color:#92400e;margin-bottom:16px;line-height:1.6}
+.badge{font-size:.8rem;color:var(--text-muted)}
+@keyframes spin{to{transform:rotate(360deg)}}
+.sp{width:18px;height:18px;border:2px solid var(--surface-border);border-top-color:var(--brand);border-radius:50%;animation:spin .6s linear infinite;display:inline-block;vertical-align:middle;margin-right:6px}
+@media(max-width:640px){.container{padding:20px 14px}.card{padding:16px}.ir{flex-direction:column}.ir input{min-width:0}}
 </style>
 </head>
 <body>
-<div class="card">
-  <h1>🎬 Bilibili AI Summary</h1>
-  <p class="subtitle">Cloudflare Worker API — 状态监控</p>
-  <div class="status-grid">
-    <div class="status-item">
-      <span class="label">Worker</span>
-      <span class="value" style="color:#22c55e">✅ 运行正常</span>
+<div class="container">
+  <header>
+    <h1>🎬 B站AI摘要</h1>
+    <div style="display:flex;gap:8px;align-items:center">
+      <span class="badge" id="countBadge"></span>
+      <button class="ht" onclick="toggleTheme()">🌓 主题</button>
     </div>
-    <div class="status-item">
-      <span class="label">R2 存储</span>
-      <span class="value">${r2Status}</span>
-    </div>
-    <div class="status-item">
-      <span class="label">GitHub</span>
-      <span class="value">${ghStatus}</span>
-    </div>
-    <div class="status-item">
-      <span class="label">版本</span>
-      <span class="value">v1.0</span>
-    </div>
+  </header>
+
+  <div id="noR2Notice" class="notice" style="display:none">
+    💡 <strong>存储提示：</strong>由于未配置 R2，任务结果将通过 <strong>邮件发送</strong>。
+    历史记录保存在浏览器本地，关闭后不会丢失（下次打开仍在）。
   </div>
-  ${env.BILIBILI_BUCKET ? `
-  <div style="text-align:center;margin-bottom:16px">
-    <a class="btn" href="/frontend/">🚀 打开 Web UI</a>
-  </div>` : `
-  <div class="hint">
-    <strong>🚧 R2 存储未配置</strong><br>
-    当前 API 功能不可用，因为缺少 R2 存储。完成后即可：
-    <ul style="margin:8px 0 0 20px">
-      <li>提交 B站视频 URL 进行处理</li>
-      <li>查看历史记录和 AI 总结</li>
-      <li>自动清理过期结果</li>
-    </ul>
-    ${r2Link}
-  </div>`}
-  <div class="hint" style="margin-top:8px">
-    <strong>📡 API 端点</strong><br>
-    <code>POST /api/submit</code> — 提交视频 URL；<br>
-    <code>GET /api/jobs</code> — 查看所有任务；<br>
-    <code>GET /api/jobs/:id</code> — 查看单个任务；<br>
-    <code>DELETE /api/jobs/:id</code> — 删除任务；<br>
-    <code>GET /api/stats</code> — 存储统计
+
+  <!-- Submit -->
+  <div class="card">
+    <div class="ct">新建转录</div>
+    <div class="ir">
+      <input id="urlInput" type="text" placeholder="B站视频链接或 BV 号…" onkeydown="if(event.key==='Enter')submitJob()" />
+      <button class="btn btn-p" id="submitBtn" onclick="submitJob()">开始处理</button>
+    </div>
+    <p class="hint">支持: bilibili.com/video/BVxxx / b23.tv/xxx / 直接输入BV号</p>
+    <div id="submitStatus" style="margin-top:12px;display:none"></div>
+  </div>
+
+  <!-- History -->
+  <div class="card">
+    <div class="ct" style="display:flex;justify-content:space-between;align-items:center">
+      <span>历史记录</span>
+      <div style="display:flex;gap:6px">
+        <button class="btn" style="padding:6px 12px;font-size:.8rem;background:transparent;border:1px solid var(--surface-border);color:var(--text-soft);border-radius:8px;cursor:pointer" onclick="renderList()">🔄</button>
+        <button class="btn" style="padding:6px 12px;font-size:.8rem;background:transparent;border:1px solid var(--danger);color:var(--danger);border-radius:8px;cursor:pointer" onclick="clearAll()">🗑 全部清除</button>
+      </div>
+    </div>
+    <div id="jobList"><div class="je">暂无任务</div></div>
   </div>
 </div>
-</body>
-</html>`;
+<script>
+// ═══════════════════════════════════════════════════════
+// LocalStorage 持久化 (无需 R2)
+// ═══════════════════════════════════════════════════════
+const LS_KEY = 'bilibili_summary_jobs';
+const API = '';
+
+function loadJobs() {
+  try { return JSON.parse(localStorage.getItem(LS_KEY) || '[]'); } catch { return []; }
+}
+function saveJobs(jobs) {
+  localStorage.setItem(LS_KEY, JSON.stringify(jobs));
+  renderList(); updateBadge();
 }
 
 // ═══════════════════════════════════════════════════════
-// Router
+// Theme
 // ═══════════════════════════════════════════════════════
+function toggleTheme() {
+  const html = document.documentElement;
+  const next = html.getAttribute('data-theme') === 'dark' ? 'light' : 'dark';
+  html.setAttribute('data-theme', next);
+  localStorage.setItem('theme', next);
+}
+(function() {
+  const saved = localStorage.getItem('theme');
+  if (saved) document.documentElement.setAttribute('data-theme', saved);
+})();
+
+// ═══════════════════════════════════════════════════════
+// Submit
+// ═══════════════════════════════════════════════════════
+async function submitJob() {
+  const input = document.getElementById('urlInput');
+  const url = input.value.trim();
+  if (!url) { alert('请先输入视频链接'); return; }
+
+  const btn = document.getElementById('submitBtn');
+  const status = document.getElementById('submitStatus');
+  btn.disabled = true; btn.innerHTML = '<span class="sp"></span> 提交中…';
+  status.style.display = 'block'; status.innerHTML = '<span class="sp"></span> 正在提交…';
+
+  try {
+    const data = await (await fetch(API + '/api/submit', {
+      method: 'POST', headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({url}),
+    })).json();
+
+    if (data.error) throw new Error(data.error);
+
+    // 保存到 LocalStorage
+    const jobs = loadJobs();
+    jobs.unshift({
+      id: data.job_id, bvid: data.bvid, status: 'submitted',
+      created_at: new Date().toISOString(),
+      title: '', summary: '',
+    });
+    saveJobs(jobs);
+
+    status.innerHTML = \`<div style="display:flex;align-items:center;gap:8px;font-size:.9rem">
+      <span class="js pending">⏳</span> <b>\${data.bvid}</b> — 已提交，结果将通过邮件发送</div>\`;
+    input.value = '';
+  } catch (err) {
+    status.innerHTML = \`<span style="color:var(--danger)">❌ \${err.message}</span>\`;
+  } finally {
+    btn.disabled = false; btn.textContent = '开始处理';
+    setTimeout(() => { status.style.display = 'none'; }, 5000);
+  }
+}
+
+// ═══════════════════════════════════════════════════════
+// Render history from LocalStorage
+// ═══════════════════════════════════════════════════════
+function renderList() {
+  const jobs = loadJobs();
+  const el = document.getElementById('jobList');
+  updateBadge();
+
+  if (jobs.length === 0) {
+    el.innerHTML = '<div class="je">暂无任务，在上面输入链接提交吧 🚀</div>';
+    return;
+  }
+
+  el.innerHTML = jobs.map(j => {
+    const icon = j.status === 'submitted' ? '⏳' :
+                 j.status === 'done' ? '✅' : '❌';
+    const cls = j.status === 'submitted' ? 'sub' : j.status === 'done' ? 'done' : 'failed';
+    const ago = timeAgo(j.created_at);
+    return \`<div class="ji">
+      <div class="js \${cls}">\${icon}</div>
+      <div style="flex:1;min-width:0">
+        <div class="jb">\${j.bvid}</div>
+        <div class="jt">\${j.title || (j.status === 'submitted' ? '等待处理…' : '')} · \${ago}</div>
+      </div>
+      <button class="btn btn-d" onclick="deleteJob('\${j.id}')">🗑</button>
+    </div>\`;
+  }).join('');
+}
+
+function deleteJob(id) {
+  if (!confirm('确定删除这个任务？')) return;
+  // 也尝试通知 Worker 删除 (No-op if no R2)
+  fetch(API + '/api/jobs/' + id, { method: 'DELETE' }).catch(() => {});
+  const jobs = loadJobs().filter(j => j.id !== id);
+  saveJobs(jobs);
+}
+
+function clearAll() {
+  if (!confirm('确定清除所有历史记录？')) return;
+  saveJobs([]);
+}
+
+function updateBadge() {
+  const jobs = loadJobs();
+  const pending = jobs.filter(j => j.status === 'submitted').length;
+  document.getElementById('countBadge').textContent =
+    \`📋 \${jobs.length} 条\${pending ? ' · ' + pending + ' 处理中' : ''}\`;
+}
+
+// ═══════════════════════════════════════════════════════
+// Detect R2 status
+// ═══════════════════════════════════════════════════════
+async function checkR2() {
+  try {
+    const data = await (await fetch(API + '/api/stats')).json();
+    if (data.mode === 'localstorage') {
+      document.getElementById('noR2Notice').style.display = 'block';
+    } else {
+      document.getElementById('noR2Notice').style.display = 'none';
+    }
+  } catch {}
+}
+
+// ═══════════════════════════════════════════════════════
+// Utils
+// ═══════════════════════════════════════════════════════
+function timeAgo(iso) {
+  if (!iso) return '';
+  const diff = Math.floor((Date.now() - new Date(iso).getTime()) / 1000);
+  if (diff < 60) return '刚刚';
+  if (diff < 3600) return Math.floor(diff/60) + ' 分钟前';
+  if (diff < 86400) return Math.floor(diff/3600) + ' 小时前';
+  return new Date(iso).toLocaleDateString('zh-CN', {month:'short',day:'numeric'});
+}
+
+// Init
+renderList();
+checkR2();
+</script>
+</body>
+</html>
+`;
+}
 
 export default {
   async fetch(request, env, ctx) {
-    // Handle CORS preflight
-    if (request.method === 'OPTIONS') {
-      return new Response(null, { headers: CORS_HEADERS });
-    }
+    if (request.method === 'OPTIONS') return new Response(null, { headers: CORS_HEADERS });
 
     const url = new URL(request.url);
     const path = url.pathname;
 
     try {
-      // API routes
-      if (path === '/api/submit' && request.method === 'POST') {
-        return await handleSubmit(request, env);
-      }
-      if (path === '/api/jobs' && request.method === 'GET') {
-        return await handleListJobs(request, env);
-      }
-      if (path.startsWith('/api/jobs/') && request.method === 'GET') {
-        const jobId = path.replace('/api/jobs/', '');
-        return await handleGetJob(request, env, jobId);
-      }
-      if (path.startsWith('/api/jobs/') && request.method === 'DELETE') {
-        const jobId = path.replace('/api/jobs/', '');
-        return await handleDeleteJob(request, env, jobId);
-      }
-      if (path === '/api/stats' && request.method === 'GET') {
-        return await handleStats(request, env);
-      }
-
-      // Root path: serve a functional status page
-      if (path === '/' || path === '/index.html') {
-        return htmlResponse(generateStatusPage(env));
-      }
+      if (path === '/api/submit' && request.method === 'POST') return await handleSubmit(request, env);
+      if (path === '/api/jobs' && request.method === 'GET') return await handleListJobs(request, env);
+      if (path.startsWith('/api/jobs/') && request.method === 'GET') return await handleGetJob(request, env, path.replace('/api/jobs/', ''));
+      if (path.startsWith('/api/jobs/') && request.method === 'DELETE') return await handleDeleteJob(request, env, path.replace('/api/jobs/', ''));
+      if (path === '/api/stats' && request.method === 'GET') return await handleStats(request, env);
+      if (path === '/' || path === '/index.html') return htmlResponse(generateFrontendPage());
 
       return errorResponse('Not Found', 404);
     } catch (err) {
