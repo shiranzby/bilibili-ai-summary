@@ -1,26 +1,11 @@
 """
 AI视频总结模块
 =============
-支持多种 AI 后端:
 
-    zhipu (默认) — 智谱AI GLM-4-Flash
-        国内直连，每月100万免费tokens，每月刷新
-        Key: https://open.bigmodel.cn/
-
-    deepseek — DeepSeek V3
-        注册送500万tokens
-        Key: https://platform.deepseek.com/
-
-    siliconflow — 硅基流动 (语音转录和AI总结两用)
-        共用同一 Key，总结模型通过 SILICONFLOW_MODEL 配置
-        Key: https://cloud.siliconflow.cn/
-
-    gemini — Google Gemini 2.0 Flash
-        永久免费
-        Key: https://aistudio.google.com/apikey
+使用硅基流动 API 完成视频字幕的 AI 总结。
+Key 与语音识别共用 SILICONFLOW_API_KEY。
 """
 
-import requests
 from typing import Optional
 
 try:
@@ -54,16 +39,14 @@ def _build_summary_prompt(subtitle_text: str, video_title: str = "") -> tuple:
     return system_prompt, user_prompt
 
 
-def _call_openai_compatible(
+def _call_siliconflow(
     api_key: str,
-    base_url: str,
     model: str,
     subtitle_text: str,
     video_title: str = "",
-    label: str = "AI",
 ) -> Optional[str]:
     if not api_key:
-        print(f"    [AI总结] ❌ 未设置 {label} API Key")
+        print("    [AI总结] ❌ 未设置 SILICONFLOW_API_KEY")
         return None
     if not subtitle_text or len(subtitle_text.strip()) < 20:
         print("    [AI总结] 字幕内容太少，跳过")
@@ -74,7 +57,7 @@ def _call_openai_compatible(
 
     system_prompt, user_prompt = _build_summary_prompt(subtitle_text, video_title)
     try:
-        client = OpenAI(api_key=api_key, base_url=base_url)
+        client = OpenAI(api_key=api_key, base_url="https://api.siliconflow.cn/v1")
         response = client.chat.completions.create(
             model=model,
             messages=[{"role": "system", "content": system_prompt}, {"role": "user", "content": user_prompt}],
@@ -82,80 +65,28 @@ def _call_openai_compatible(
             max_tokens=2048,
         )
         summary = response.choices[0].message.content.strip()
-        print(f"    [AI总结] ✅ {label} 生成 {len(summary)} 字符")
+        print(f"    [AI总结] ✅ 硅基流动 生成 {len(summary)} 字符")
         return summary
     except Exception as e:
-        print(f"    [AI总结] ❌ {label} 调用失败: {e}")
+        print(f"    [AI总结] ❌ 硅基流动 调用失败: {e}")
         return None
 
 
-# ---- 智谱AI GLM-4-Flash (推荐) ----
-def summarize_with_zhipu(subtitle_text: str, video_title: str = "", api_key: str = "") -> Optional[str]:
-    return _call_openai_compatible(
-        api_key=api_key,
-        base_url="https://open.bigmodel.cn/api/paas/v4/",
-        model="glm-4-flash",
-        subtitle_text=subtitle_text,
-        video_title=video_title,
-        label="智谱AI",
-    )
-
-
-# ---- DeepSeek V3 ----
-def summarize_with_deepseek(subtitle_text: str, video_title: str = "", api_key: str = "") -> Optional[str]:
-    return _call_openai_compatible(
-        api_key=api_key,
-        base_url="https://api.deepseek.com/v1",
-        model="deepseek-chat",
-        subtitle_text=subtitle_text,
-        video_title=video_title,
-        label="DeepSeek",
-    )
-
-
-# ---- 硅基流动 (转录和总结两用) ----
-def summarize_with_siliconflow(subtitle_text: str, video_title: str = "", api_key: str = "", model: str = "") -> Optional[str]:
-    return _call_openai_compatible(
-        api_key=api_key,
-        base_url="https://api.siliconflow.cn/v1",
-        model=model or "deepseek-ai/DeepSeek-V3",
-        subtitle_text=subtitle_text,
-        video_title=video_title,
-        label="硅基流动",
-    )
-
-
-# ---- Google Gemini ----
-def summarize_with_gemini(subtitle_text: str, video_title: str = "", api_key: str = "") -> Optional[str]:
-    return _call_openai_compatible(
-        api_key=api_key,
-        base_url="https://generativelanguage.googleapis.com/v1beta/openai/",
-        model="gemini-2.0-flash",
-        subtitle_text=subtitle_text,
-        video_title=video_title,
-        label="Gemini",
-    )
-
-
-# ---- 统一入口 ----
 def summarize_subtitle(
     subtitle_text: str,
     video_title: str = "",
-    backend: str = "zhipu",
-    zhipu_api_key: str = "",
-    deepseek_api_key: str = "",
-    siliconflow_api_key: str = "",
-    siliconflow_model: str = "",
-    gemini_api_key: str = "",
+    api_key: str = "",
+    model: str = "Qwen/Qwen3-8B",
 ) -> Optional[str]:
-    if backend == "zhipu":
-        return summarize_with_zhipu(subtitle_text, video_title, zhipu_api_key)
-    elif backend == "deepseek":
-        return summarize_with_deepseek(subtitle_text, video_title, deepseek_api_key)
-    elif backend == "siliconflow":
-        return summarize_with_siliconflow(subtitle_text, video_title, siliconflow_api_key, siliconflow_model)
-    elif backend == "gemini":
-        return summarize_with_gemini(subtitle_text, video_title, gemini_api_key)
-    else:
-        print(f"    [AI总结] ❌ 未知后端: {backend}，支持: zhipu / deepseek / siliconflow / gemini")
-        return None
+    """
+    使用硅基流动对视频字幕进行 AI 总结。
+
+    参数:
+        subtitle_text: 字幕文本
+        video_title: 视频标题 (可选，用于提示)
+        api_key: 硅基流动 API Key
+        model: 模型名 (默认 Qwen/Qwen3-8B)
+
+    返回: 总结文本或 None
+    """
+    return _call_siliconflow(api_key, model, subtitle_text, video_title)

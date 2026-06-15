@@ -7,14 +7,13 @@
 GHA workflow 调用: python inject_config.py
 本地测试调用:   先 export 环境变量，再 python inject_config.py
 
-注入的配置项 (环境变量 → config.py 字段):
-    ZHIPU_API_KEY    → ZHIPU_API_KEY
-    GEMINI_API_KEY   → GEMINI_API_KEY
-    SMTP_USER        → SMTP_USER
-    SMTP_PASS        → SMTP_PASS
-    SMTP_TO          → SMTP_TO
-    SILICONFLOW_API_KEY → SILICONFLOW_API_KEY (语音识别)
-    SILICONFLOW_MODEL   → SILICONFLOW_MODEL (总结模型，可选)
+    注入的配置项 (环境变量 → config.py 字段):
+    SMTP_USER               → SMTP_USER
+    SMTP_PASS               → SMTP_PASS
+    SMTP_TO                 → SMTP_TO
+    SILICONFLOW_API_KEY     → SILICONFLOW_API_KEY (语音识别 + AI总结 Key)
+    SILICONFLOW_STT_MODEL   → SILICONFLOW_STT_MODEL (语音转文字模型，可选)
+    SILICONFLOW_SUMMARY_MODEL → SILICONFLOW_SUMMARY_MODEL (总结模型，可选)
 """
 
 import os
@@ -25,14 +24,12 @@ CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.p
 
 # 需要注入的环境变量映射: 环境变量名 → config.py 中的变量名
 VAR_MAP = {
-    "ZHIPU_API_KEY":  "ZHIPU_API_KEY",
-    "DEEPSEEK_API_KEY": "DEEPSEEK_API_KEY",
-    "GEMINI_API_KEY": "GEMINI_API_KEY",
     "SMTP_USER":      "SMTP_USER",
     "SMTP_PASS":      "SMTP_PASS",
     "SMTP_TO":        "SMTP_TO",
     "SILICONFLOW_API_KEY": "SILICONFLOW_API_KEY",
-    "SILICONFLOW_MODEL":   "SILICONFLOW_MODEL",
+    "SILICONFLOW_STT_MODEL":   "SILICONFLOW_STT_MODEL",
+    "SILICONFLOW_SUMMARY_MODEL":   "SILICONFLOW_SUMMARY_MODEL",
 }
 
 

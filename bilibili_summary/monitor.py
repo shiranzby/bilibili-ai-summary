@@ -8,39 +8,35 @@ B站UP主视频监控 → AI总结 → 邮件推送
     2. 遍历监控的UP主列表
     3. 调用B站API获取最新视频
     4. 对比状态，找出新视频
-    5. 获取视频字幕
-    6. 调用 AI API 生成总结
+    5. 音频下载 + 硅基流动语音识别
+    6. 调用 AI API 生成总结 (默认硅基流动)
     7. 发送邮件通知
     8. 更新状态文件
 
 部署方式:
-    GitHub Actions + 智谱AI GLM-4-Flash (国内直连，完全免费)
-    备选: Google Gemini (永久免费)
+    GitHub Actions + 硅基流动 (语音识别 + AI总结，完全免费)
 """
 
 import os
 import sys
 import json
 import time
-from typing import Optional
+from collections import defaultdict
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from config import (
     UP_MIDS,
-    AI_BACKEND,
-    ZHIPU_API_KEY,
-    DEEPSEEK_API_KEY,
-    GEMINI_API_KEY,
     SILICONFLOW_API_KEY,
-    SILICONFLOW_MODEL,
+    SILICONFLOW_STT_MODEL,
+    SILICONFLOW_SUMMARY_MODEL,
     SMTP_SERVER, SMTP_PORT, SMTP_USER, SMTP_PASS, SMTP_TO,
     CHECK_WINDOW_SECONDS, MAX_VIDEOS_PER_RUN,
     EMAIL_SUBJECT_PREFIX, STATE_FILE,
 )
 from bili_api import (
     get_up_video_list, get_video_info, get_up_info,
-    format_duration, format_timestamp,
+    format_timestamp,
 )
 from summarizer import summarize_subtitle
 from emailer import send_email, build_digest_email
@@ -123,7 +119,9 @@ def process_video(video: dict, up_name: str) -> dict:
     if SILICONFLOW_API_KEY:
         print(f"  [处理] 下载音频并进行语音识别...")
         audio_text = get_text_from_audio(
-            bvid, siliconflow_api_key=SILICONFLOW_API_KEY,
+            bvid,
+            siliconflow_api_key=SILICONFLOW_API_KEY,
+            siliconflow_stt_model=SILICONFLOW_STT_MODEL,
         )
 
     # Step 2: 语音识别失败时，回退到视频描述
@@ -139,16 +137,12 @@ def process_video(video: dict, up_name: str) -> dict:
     # AI总结
     summary = None
     if subtitle_text:
-        print(f"  [处理] 正在生成AI总结 (后端: {AI_BACKEND})...")
+        print(f"  [处理] 正在生成AI总结 (硅基流动)...")
         summary = summarize_subtitle(
             subtitle_text,
             video_title=title,
-            backend=AI_BACKEND,
-            zhipu_api_key=ZHIPU_API_KEY,
-            deepseek_api_key=DEEPSEEK_API_KEY,
-            siliconflow_api_key=SILICONFLOW_API_KEY,
-            siliconflow_model=SILICONFLOW_MODEL,
-            gemini_api_key=GEMINI_API_KEY,
+            api_key=SILICONFLOW_API_KEY,
+            model=SILICONFLOW_SUMMARY_MODEL,
         )
     else:
         print(f"  [处理] ⚠ 无法获取视频文字内容，跳过总结")
@@ -174,10 +168,8 @@ def main():
         print("\n❌ 错误: 未配置任何UP主 (请修改 config.py 中的 UP_MIDS)")
         sys.exit(1)
 
-    if AI_BACKEND == "zhipu" and (not ZHIPU_API_KEY or ZHIPU_API_KEY == "xxxxxxxxxxxxxxxxxxxxxxxx.xxxxxxxxxxxxxxxx"):
-        print(f"\n⚠ 警告: ZHIPU_API_KEY 未配置，AI 总结将不可用")
-    elif AI_BACKEND == "gemini" and (not GEMINI_API_KEY or GEMINI_API_KEY == "AIzaSyxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"):
-        print(f"\n⚠ 警告: GEMINI_API_KEY 未配置，AI 总结将不可用\n")
+    if not SILICONFLOW_API_KEY:
+        print(f"\n⚠ 警告: SILICONFLOW_API_KEY 未配置，语音识别和AI总结将不可用")
 
     if not SMTP_USER or SMTP_USER.startswith("your_email"):
         print("\n❌ 错误: 邮箱未配置 (请修改 config.py 中的邮箱配置)")
@@ -228,7 +220,6 @@ def main():
     print(f"\n{'─' * 50}")
     print(f"  📧 准备发送邮件 (共 {len(all_new_videos)} 个视频)")
 
-    from collections import defaultdict
     by_up = defaultdict(list)
     for v in all_new_videos:
         by_up[v["up_name"]].append(v)

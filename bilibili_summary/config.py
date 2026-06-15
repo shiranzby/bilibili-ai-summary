@@ -5,7 +5,7 @@ Bilibili AI Summary - 配置文件
 
 💡 完全免费方案:
    - 语音识别: 硅基流动 SenseVoiceSmall (完全免费)
-   - AI总结: 智谱AI / DeepSeek / 硅基流动 (免费层)
+   - AI总结: 硅基流动 Qwen/Qwen3-8B (完全免费)
    - 定时运行: GitHub Actions (免费，2000分钟/月)
    - 邮件: QQ邮箱 SMTP (免费)
 
@@ -34,32 +34,16 @@ UP_MIDS = [
 # 🔐 通过 GHA Secret SILICONFLOW_API_KEY 注入
 SILICONFLOW_API_KEY = ""
 
+# 语音转文字模型: 可在 https://cloud.siliconflow.cn/ 查看可用模型
+# 🔐 通过 GHA Secret SILICONFLOW_STT_MODEL 注入 (可选)
+SILICONFLOW_STT_MODEL = "FunAudioLLM/SenseVoiceSmall"
+
 # ============================================================
-# 🤖 AI总结配置 (选一个后端填写即可)
+# 🤖 AI总结配置 (硅基流动，与语音识别共用同一KEY)
 # ============================================================
-
-# AI后端选择: "siliconflow" (推荐) | "zhipu" | "deepseek" | "gemini"
-AI_BACKEND = "siliconflow"
-
-# ---- 智谱AI GLM-4-Flash (国内直连，每月100万免费tokens) ----
-# Key: https://open.bigmodel.cn/
-# 🔐 通过 GHA Secret ZHIPU_API_KEY 注入
-ZHIPU_API_KEY = ""
-
-# ---- DeepSeek V3 (注册送500万tokens) ----
-# Key: https://platform.deepseek.com/
-# 🔐 通过 GHA Secret DEEPSEEK_API_KEY 注入 (可选)
-DEEPSEEK_API_KEY = ""
-
-# ---- 硅基流动 AI总结 (可选，与语音识别共用同一KEY) ----
 # 总结模型: 可在 https://cloud.siliconflow.cn/ 查看可用模型
-# 🔐 通过 GHA Secret SILICONFLOW_MODEL 注入
-SILICONFLOW_MODEL = "Qwen/Qwen3-8B"
-
-# ---- Google Gemini (永久免费) ----
-# Key: https://aistudio.google.com/apikey
-# 🔐 通过 GHA Secret GEMINI_API_KEY 注入 (可选)
-GEMINI_API_KEY = ""
+# 🔐 通过 GHA Secret SILICONFLOW_SUMMARY_MODEL 注入 (可选)
+SILICONFLOW_SUMMARY_MODEL = "Qwen/Qwen3-8B"
 
 # ============================================================
 # 📧 邮箱配置 (QQ邮箱 SMTP)

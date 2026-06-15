@@ -1,6 +1,6 @@
 # B站AI摘要 - GitHub Actions 工作流
 # 定时: 每天 08:00 / 20:00 (北京时间 = UTC+8, cron 用 UTC)
-# Secrets: ZHIPU_API_KEY / DEEPSEEK_API_KEY, SMTP_USER, SMTP_PASS, SMTP_TO, SILICONFLOW_API_KEY
+# Secrets: SILICONFLOW_API_KEY / SMTP_USER / SMTP_PASS / SMTP_TO
 name: B站AI摘要
 
 on:
@@ -31,13 +31,12 @@ jobs:
 
       - name: 注入配置
         env:
-          ZHIPU_API_KEY: ${{ secrets.ZHIPU_API_KEY }}
-          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
           SMTP_USER: ${{ secrets.SMTP_USER }}
           SMTP_PASS: ${{ secrets.SMTP_PASS }}
           SMTP_TO: ${{ secrets.SMTP_TO }}
           SILICONFLOW_API_KEY: ${{ secrets.SILICONFLOW_API_KEY }}
-          SILICONFLOW_MODEL: ${{ secrets.SILICONFLOW_MODEL }}
+          SILICONFLOW_STT_MODEL: ${{ secrets.SILICONFLOW_STT_MODEL }}
+          SILICONFLOW_SUMMARY_MODEL: ${{ secrets.SILICONFLOW_SUMMARY_MODEL }}
         run: python bilibili_summary/inject_config.py
 
       - name: 运行

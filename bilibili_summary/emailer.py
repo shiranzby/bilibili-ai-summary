@@ -73,56 +73,6 @@ def send_email(
         return False
 
 
-def build_video_summary_email(
-    up_name: str,
-    video_title: str,
-    bvid: str,
-    summary: str,
-    video_url: str = "",
-    publish_time: str = "",
-    duration: str = "",
-) -> str:
-    """
-    构建单个视频摘要邮件的HTML正文
-    """
-    if not video_url:
-        video_url = f"https://www.bilibili.com/video/{bvid}"
-
-    # 将summary的Markdown转换为简单HTML
-    summary_html = summary.replace("\n", "<br>") if summary else "（无法获取字幕或无字幕内容）"
-
-    info_parts = [f"<strong>标题:</strong> {video_title}"]
-    if duration:
-        info_parts.append(f"<strong>时长:</strong> {duration}")
-    if publish_time:
-        info_parts.append(f"<strong>发布时间:</strong> {publish_time}")
-
-    html = f"""<!DOCTYPE html>
-<html>
-<head><meta charset="utf-8"></head>
-<body style="font-family: -apple-system, 'Segoe UI', sans-serif; max-width: 700px; margin: 0 auto; padding: 20px; color: #333;">
-    <div style="background: linear-gradient(135deg, #fb7299, #fc8bab); color: white; padding: 24px; border-radius: 12px; margin-bottom: 20px;">
-        <h2 style="margin: 0 0 8px 0;">🎬 B站视频监控</h2>
-        <p style="margin: 0; opacity: 0.9;">UP主: {up_name} 发布了新视频</p>
-    </div>
-    <div style="background: #f5f5f5; padding: 16px; border-radius: 8px; margin-bottom: 20px;">
-        {'<br>'.join(info_parts)}
-        <br><a href="{video_url}" style="color: #fb7299; text-decoration: none; font-weight: bold;" target="_blank">🔗 在B站观看</a>
-    </div>
-    <div style="border-left: 4px solid #fb7299; padding-left: 16px; margin-bottom: 20px;">
-        <h3 style="color: #333; margin: 0 0 12px 0;">🤖 AI 总结</h3>
-        <div style="line-height: 1.7; color: #444;">
-            {summary_html}
-        </div>
-    </div>
-    <div style="border-top: 1px solid #eee; padding-top: 16px; margin-top: 20px; color: #999; font-size: 12px;">
-        <p>本邮件由 Bilibili Monitor 自动生成 · Powered by 通义千问</p>
-    </div>
-</body></html>
-"""
-    return html
-
-
 def build_digest_email(
     up_name: str,
     videos_data: list,

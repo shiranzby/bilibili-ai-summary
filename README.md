@@ -53,8 +53,6 @@ git push
 1. 打开 https://cloud.siliconflow.cn/ 注册
 2. 创建 API Key 并复制
 
-> 系统其他 AI 后端（智谱AI、DeepSeek、Gemini）也支持，如需切换在 `config.py` 中修改 `AI_BACKEND` 并添加对应 Secret 即可。默认无需额外配置。
-
 ### 第3步: 配置 GitHub Secrets
 
 在仓库 **Settings → Secrets and variables → Actions** 添加：
@@ -62,12 +60,11 @@ git push
 | Secret 名称 | 说明 | 必填 |
 |-------------|------|------|
 | `SILICONFLOW_API_KEY` | 硅基流动 Key (语音识别 + AI总结) | ✅ |
-| `ZHIPU_API_KEY` | 智谱AI Key (需切换后端) | 可选 |
-| `DEEPSEEK_API_KEY` | DeepSeek Key (需切换后端) | 可选 |
 | `SMTP_USER` | 发件邮箱 (如 `123456@qq.com`) | ✅ |
 | `SMTP_PASS` | QQ邮箱SMTP授权码 (16位字母) | ✅ |
 | `SMTP_TO` | 收件邮箱 | ✅ |
-| `SILICONFLOW_MODEL` | 硅基流动总结模型 (默认 Qwen/Qwen3-8B) | 可选 |
+| `SILICONFLOW_STT_MODEL` | 语音转文字模型 (默认 FunAudioLLM/SenseVoiceSmall) | 可选 |
+| `SILICONFLOW_SUMMARY_MODEL` | AI总结模型 (默认 Qwen/Qwen3-8B) | 可选 |
 
 ### 第4步: 修改配置
 
@@ -80,14 +77,11 @@ UP_MIDS = [
     23456789,      # 也可填多个
 ]
 
-# AI后端 (默认 siliconflow，一个 Key 搞定所有)
-AI_BACKEND = "siliconflow"        # 默认 (推荐)
-# AI_BACKEND = "zhipu"           # 智谱AI
-# AI_BACKEND = "deepseek"        # DeepSeek
-# AI_BACKEND = "gemini"          # Google Gemini
+# 语音转文字模型 (完全免费，无需修改)
+SILICONFLOW_STT_MODEL = "FunAudioLLM/SenseVoiceSmall"
 
-# 硅基流动总结模型 (可在 https://cloud.siliconflow.cn/ 查看免费模型)
-SILICONFLOW_MODEL = "Qwen/Qwen3-8B"
+# AI总结模型 (完全免费，无需修改)
+SILICONFLOW_SUMMARY_MODEL = "Qwen/Qwen3-8B"
 ```
 
 UP主UID获取：打开UP主主页，URL末尾的数字。如 `space.bilibili.com/12345678` → `12345678`。

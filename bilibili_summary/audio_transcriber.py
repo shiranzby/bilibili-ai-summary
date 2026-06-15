@@ -1,12 +1,12 @@
 """
 音频转文字模块
 =============
-当B站视频没有AI字幕时，下载音频并转录为文字。
+当B站视频需要转录时，下载音频并转为文字。
 
 方案:
   1. playurl API → 获取音频CDN直链 → FFmpeg转WAV
-  2. 智谱AI GLM-4-Audio → 语音转文字 (国内直连，GHA可用)
-  3. yt-dlp (备选，GHA可能被412拦截)
+  2. 硅基流动 SenseVoiceSmall → 语音转文字
+  3. yt-dlp (备选)
 """
 
 import os
@@ -79,7 +79,7 @@ def get_cid(bvid: str) -> Optional[int]:
 
 
 def download_audio_from_url(audio_url: str, output_path: str, timeout: int = 180) -> bool:
-    """从CDN直链下载音频文件 (m4s/AAC格式)"""
+    """从CDN直链下载音频文件 (m4s/AAC格式)，由 timeout 参数控制最大耗时"""
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
         "Referer": "https://www.bilibili.com/", "Origin": "https://www.bilibili.com",
@@ -89,16 +89,19 @@ def download_audio_from_url(audio_url: str, output_path: str, timeout: int = 180
         if resp.status_code not in (200, 206):
             print(f"    [下载] ❌ HTTP {resp.status_code}")
             return False
+
+        content_len = resp.headers.get("Content-Length")
+        if content_len:
+            print(f"    [下载] 文件大小: {int(content_len)/1024/1024:.1f} MB")
+
         total = 0
-        max_size = 10 * 1024 * 1024
         with open(output_path, "wb") as f:
             for chunk in resp.iter_content(chunk_size=8192):
                 if chunk: f.write(chunk); total += len(chunk)
-                if total >= max_size: break
         print(f"    [下载] ✅ 完成 ({total/1024/1024:.1f} MB)")
         return total > 1000
     except requests.exceptions.Timeout:
-        print(f"    [下载] ❌ 超时")
+        print(f"    [下载] ❌ 超时 ({timeout}秒)")
         return False
     except Exception as e:
         print(f"    [下载] ❌ 异常: {e}")
@@ -119,82 +122,12 @@ def convert_to_wav(input_path: str, output_path: str) -> bool:
         return False
 
 
-def _get_audio_duration(audio_path: str) -> Optional[float]:
-    """用ffprobe获取音频时长(秒)"""
-    try:
-        result = subprocess.run(
-            ["ffprobe", "-v", "error", "-show_entries", "format=duration",
-             "-of", "default=noprint_wrappers=1:nokey=1", audio_path],
-            capture_output=True, text=True, timeout=15)
-        if result.returncode == 0 and result.stdout.strip():
-            return float(result.stdout.strip())
-        return None
-    except Exception:
-        return None
-
-
-def transcribe_with_zhipu(audio_path: str, api_key: str = "") -> Optional[str]:
-    """
-    使用智谱AI GLM-4-Audio 语音转文字
-    国内直连，GHA上正常可用，免费额度覆盖
-    注: 智谱AI限制音频≤30秒，超长自动截断
-
-    API: POST https://open.bigmodel.cn/api/paas/v4/audio/transcriptions
-    """
-    if not api_key:
-        print("    [智谱AI] ❌ 未配置ZHIPU_API_KEY")
-        return None
-
-    # 检查音频时长，超30秒则截断
-    duration = _get_audio_duration(audio_path)
-    if duration and duration > 30:
-        print(f"    [智谱AI] 音频 {duration:.0f}秒 >30秒限制，自动截取前30秒...")
-        trimmed_path = audio_path + ".trimmed.wav"
-        try:
-            subprocess.run(
-                ["ffmpeg", "-y", "-i", audio_path, "-t", "30",
-                 "-ac", "1", "-ar", "16000", "-f", "wav",
-                 "-loglevel", "error", trimmed_path],
-                capture_output=True, check=True, timeout=30)
-            audio_path = trimmed_path
-        except Exception as e:
-            print(f"    [智谱AI] ⚠ 截断失败: {e}，仍尝试原文件")
-
-    file_size = os.path.getsize(audio_path) / 1024 / 1024
-    print(f"    [智谱AI] 上传音频 ({file_size:.1f} MB)...")
-
-    try:
-        from openai import OpenAI
-        client = OpenAI(api_key=api_key, base_url="https://open.bigmodel.cn/api/paas/v4/")
-
-        with open(audio_path, "rb") as f:
-            resp = client.audio.transcriptions.create(
-                model="glm-4-audio",
-                file=f,
-                language="zh",
-            )
-
-        text = resp.text if hasattr(resp, 'text') else str(resp)
-        if text and text.strip():
-            print(f"    [智谱AI] ✅ 转录成功 ({len(text)} 字符)")
-            return text
-        print(f"    [智谱AI] ⚠ 返回文本为空")
-        return None
-
-    except ImportError:
-        print(f"    [智谱AI] ❌ 缺少 openai 库")
-        return None
-    except Exception as e:
-        print(f"    [智谱AI] ❌ 失败: {e}")
-        return None
-
-
 # ==================== 主入口 ====================
 
-def transcribe_with_siliconflow(audio_path: str, api_key: str = "") -> Optional[str]:
+def transcribe_with_siliconflow(audio_path: str, api_key: str = "", model: str = "") -> Optional[str]:
     """
-    使用硅基流动 SiliconFlow FunAudioLLM/SenseVoiceSmall 语音转文字
-    国内直连，GHA正常可用，按量计费 (价格极低)
+    使用硅基流动 SiliconFlow 语音转文字
+    国内直连，GHA正常可用，完全免费
 
     API: POST https://api.siliconflow.cn/v1/audio/transcriptions
     """
@@ -202,6 +135,7 @@ def transcribe_with_siliconflow(audio_path: str, api_key: str = "") -> Optional[
         print("    [SiFlow] ❌ 未配置 SILICONFLOW_API_KEY")
         return None
 
+    model = model or "FunAudioLLM/SenseVoiceSmall"
     file_size = os.path.getsize(audio_path) / 1024 / 1024
     print(f"    [SiFlow] 上传音频 ({file_size:.1f} MB)...")
 
@@ -211,7 +145,7 @@ def transcribe_with_siliconflow(audio_path: str, api_key: str = "") -> Optional[
 
         with open(audio_path, "rb") as f:
             resp = client.audio.transcriptions.create(
-                model="FunAudioLLM/SenseVoiceSmall",
+                model=model,
                 file=f,
                 language="zh",
                 response_format="text",
@@ -231,10 +165,8 @@ def transcribe_with_siliconflow(audio_path: str, api_key: str = "") -> Optional[
 
 def get_text_from_audio(
     bvid: str,
-    hf_token: str = "",
-    model: str = "",
-    zhipu_api_key: str = "",
     siliconflow_api_key: str = "",
+    siliconflow_stt_model: str = "",
 ) -> Optional[str]:
     """
     一站式: B站音频下载 → 智能转写 → 返回文本
@@ -244,6 +176,7 @@ def get_text_from_audio(
     参数:
         bvid: BV号
         siliconflow_api_key: 硅基流动 API Key
+        siliconflow_stt_model: 语音转文字模型 (默认 FunAudioLLM/SenseVoiceSmall)
 
     返回: 转录文本或 None
     """
@@ -253,12 +186,12 @@ def get_text_from_audio(
     cid = get_cid(bvid)
     if not cid:
         print(f"    [音频] 无法获取 cid")
-        return _fallback_ytdlp(bvid, siliconflow_api_key)
+        return _fallback_ytdlp(bvid, siliconflow_api_key, siliconflow_stt_model)
 
     all_urls = get_audio_urls_from_playurl(bvid, cid)
     if not all_urls:
         print(f"    [音频] playurl 失败")
-        return _fallback_ytdlp(bvid, siliconflow_api_key)
+        return _fallback_ytdlp(bvid, siliconflow_api_key, siliconflow_stt_model)
 
     # 下载并转换 (遍历所有链接 + 重试)
     with tempfile.TemporaryDirectory() as tmpdir:
@@ -291,7 +224,7 @@ def get_text_from_audio(
 
         if not download_ok:
             print(f"    [音频] CDN下载彻底失败，尝试 yt-dlp...")
-            return _fallback_ytdlp(bvid, siliconflow_api_key)
+            return _fallback_ytdlp(bvid, siliconflow_api_key, siliconflow_stt_model)
 
         if not convert_to_wav(raw_audio, wav_audio):
             print(f"    [音频] ffmpeg转换失败")
@@ -299,7 +232,7 @@ def get_text_from_audio(
 
         # 转录: 硅基流动 SenseVoiceSmall (稳定可靠)
         if siliconflow_api_key:
-            text = transcribe_with_siliconflow(wav_audio, api_key=siliconflow_api_key)
+            text = transcribe_with_siliconflow(wav_audio, api_key=siliconflow_api_key, model=siliconflow_stt_model)
             if text:
                 return text
             print(f"    [音频] 硅基流动转录失败")
@@ -308,43 +241,7 @@ def get_text_from_audio(
         return None
 
 
-def _transcribe_huggingface(audio_path: str, hf_token: str, model: str) -> Optional[str]:
-    """HuggingFace Whisper 转录 (备选)"""
-    print(f"    [Whisper] 正在上传 ({os.path.getsize(audio_path)/1024/1024:.1f} MB)...")
-    with open(audio_path, "rb") as f:
-        audio_data = f.read()
-
-    endpoints = [
-        f"https://api-inference.huggingface.co/models/{model}",
-        f"https://router.huggingface.co/hf-inference/models/{model}",
-    ]
-    for i, api_url in enumerate(endpoints):
-        label = "主端点" if i == 0 else "备选端点"
-        try:
-            resp = requests.post(api_url,
-                headers={"Authorization": f"Bearer {hf_token}"},
-                data=audio_data, timeout=300)
-            if resp.status_code == 200:
-                text = resp.json().get("text", "")
-                if text:
-                    print(f"    [Whisper] ✅ 转录成功 ({len(text)} 字符)")
-                    return text
-                return None
-            elif resp.status_code == 403:
-                if i < 1: continue
-                return None
-            else:
-                if i < 1: continue
-                return None
-        except Exception as e:
-            print(f"    [Whisper] ❌ {label}: {e}")
-            if i < 1:
-                print(f"    [Whisper]    尝试下一个...")
-                continue
-    return None
-
-
-def _fallback_ytdlp(bvid: str, siliconflow_api_key: str = "") -> Optional[str]:
+def _fallback_ytdlp(bvid: str, siliconflow_api_key: str = "", siliconflow_stt_model: str = "") -> Optional[str]:
     """yt-dlp 备选方案"""
     print(f"    [音频] 尝试 yt-dlp 下载...")
     url = f"https://www.bilibili.com/video/{bvid}"
@@ -360,7 +257,7 @@ def _fallback_ytdlp(bvid: str, siliconflow_api_key: str = "") -> Optional[str]:
             for f in os.listdir(tmpdir):
                 path = os.path.join(tmpdir, f)
                 if siliconflow_api_key:
-                    return transcribe_with_siliconflow(path, api_key=siliconflow_api_key)
+                    return transcribe_with_siliconflow(path, api_key=siliconflow_api_key, model=siliconflow_stt_model)
                 return None
             return None
         except FileNotFoundError:
