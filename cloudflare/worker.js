@@ -95,8 +95,8 @@ async function handleSubmit(request, env) {
     ).catch(() => {});
   }
 
-  // 触发 GitHub Actions
-  fetch(`https://api.github.com/repos/${env.GH_OWNER}/${env.GH_REPO}/actions/workflows/manual.yml/dispatches`, {
+  // 触发 GitHub Actions (使用 summary.yml，支持 workflow_dispatch)
+  fetch(`https://api.github.com/repos/${env.GH_OWNER}/${env.GH_REPO}/actions/workflows/summary.yml/dispatches`, {
     method: 'POST',
     headers: {
       'Accept': 'application/vnd.github.v3+json',
@@ -194,6 +194,7 @@ async function handleCron(event, env) {
 // ═══════════════════════════════════════════════════════
 // Frontend HTML (embedded)
 // ═══════════════════════════════════════════════════════
+
 
 
 

@@ -1,5 +1,6 @@
 # B站AI摘要 - GitHub Actions 工作流
 # 定时: 每天 08:00 / 20:00 (北京时间 = UTC+8, cron 用 UTC)
+# 手动: 通过 workflow_dispatch 触发 (支持单条视频处理)
 # Secrets: SILICONFLOW_API_KEY / SMTP_USER / SMTP_PASS / SMTP_TO
 name: B站AI摘要
 
@@ -7,13 +8,27 @@ on:
   schedule:
     - cron: '0 0,12 * * *'   # UTC 0:00/12:00 = 北京时间 8:00/20:00
   workflow_dispatch:
+    inputs:
+      bvid:
+        description: 'B站视频 BV 号 (留空则运行自动监控)'
+        required: false
+        type: string
+      job_id:
+        description: '任务 ID (可选)'
+        required: false
+        type: string
 
 permissions:
   contents: write
 
+env:
+  PYTHONUNBUFFERED: "1"
+
 jobs:
-  summary:
-    name: AI视频摘要
+  # ──────── 自动监控 (定时触发 或 无输入的手动触发) ────────
+  monitor:
+    if: ${{ inputs.bvid == '' || inputs.bvid == null }}
+    name: UP主监控
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -39,7 +54,7 @@ jobs:
           SILICONFLOW_SUMMARY_MODEL: ${{ secrets.SILICONFLOW_SUMMARY_MODEL }}
         run: python bilibili_summary/inject_config.py
 
-      - name: 运行
+      - name: 运行监控
         run: |
           cd bilibili_summary
           [ ! -f state.json ] && echo '{"processed":{}}' > state.json
@@ -59,3 +74,60 @@ jobs:
           else
             echo "ℹ state.json 无变化，跳过推送"
           fi
+
+  # ──────── 单条处理 (通过 Worker API 触发) ────────
+  process_single:
+    if: ${{ inputs.bvid != '' && inputs.bvid != null }}
+    name: 处理单条视频
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+          cache: 'pip'
+          cache-dependency-path: bilibili_summary/requirements.txt
+
+      - name: 安装依赖
+        run: |
+          pip install -r bilibili_summary/requirements.txt
+          sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg
+
+      - name: 注入配置
+        env:
+          SILICONFLOW_API_KEY: ${{ secrets.SILICONFLOW_API_KEY }}
+        run: python bilibili_summary/inject_config.py
+
+      - name: 处理视频 (音频 → 语音识别 → AI总结)
+        id: process
+        env:
+          BVID: ${{ inputs.bvid }}
+        run: |
+          cd bilibili_summary
+          python process_single.py "$BVID" 2>&1 | tee result.json
+
+      - name: 发送邮件通知
+        env:
+          SMTP_USER: ${{ secrets.SMTP_USER }}
+          SMTP_PASS: ${{ secrets.SMTP_PASS }}
+          SMTP_TO: ${{ secrets.SMTP_TO }}
+        run: |
+          cd bilibili_summary
+          python -c "
+import os, json
+from emailer import send_email
+with open('result.json') as f:
+    data = json.load(f)
+s = data.get('summary','')
+if not s:
+    print('[邮件] 跳过：无总结')
+    exit(0)
+b = data['bvid']
+h = '<div style=\"background:linear-gradient(135deg,#14b8a6,#0ea5e9);color:white;padding:24px;border-radius:12px;margin-bottom:20px\"><h2>🎬 B站视频摘要</h2><p>' + b + '</p></div>'
+h += '<div style=\"border-left:4px solid #14b8a6;padding-left:16px;line-height:1.7\">' + s.replace(chr(10),'<br>') + '</div>'
+h += '<p><a href=\"https://www.bilibili.com/video/' + b + '\" style=\"color:#14b8a6;font-weight:bold\">🔗 观看</a></p>'
+body = '<!DOCTYPE html><html><body style=\"font-family:sans-serif;padding:20px;max-width:600px;margin:0 auto\">' + h + '<p style=\"color:#94a3b8;font-size:12px;margin-top:16px\">Bilibili AI Summary</p></body></html>'
+ok = send_email('🎬 B站AI摘要 - ' + b, body, smtp_server='smtp.qq.com', smtp_port=465, smtp_user=os.environ['SMTP_USER'], smtp_pass=os.environ['SMTP_PASS'], to_addr=os.environ['SMTP_TO'])
+print('[邮件]', 'OK' if ok else 'FAIL')
+" 2>&1
