@@ -108,13 +108,19 @@ def main():
     args = parser.parse_args()
     result = process(args.bvid)
 
-    if args.upload_r2 and args.r2_endpoint:
-        upload_to_r2(result, args.upload_r2, {
-            "endpoint": args.r2_endpoint,
-            "access_key_id": args.r2_key,
-            "secret_access_key": args.r2_secret,
-            "bucket_name": args.r2_bucket,
-        })
+    # 仅在 R2 真正配置时上传 (忽略占位值)
+    if args.upload_r2 and args.r2_endpoint and args.r2_key and "placeholder" not in args.r2_key:
+        try:
+            upload_to_r2(result, args.upload_r2, {
+                "endpoint": args.r2_endpoint,
+                "access_key_id": args.r2_key,
+                "secret_access_key": args.r2_secret,
+                "bucket_name": args.r2_bucket,
+            })
+        except Exception as e:
+            print(f"[R2] ⚠ 上传失败 (非致命): {e}", file=sys.stderr)
+    elif args.upload_r2:
+        print(f"[R2] ⏭ R2 未配置，跳过上传", file=sys.stderr)
 
     # 输出 JSON 到 stdout (供 workflow 使用)
     print(json.dumps(result, ensure_ascii=False))

@@ -1,14 +1,10 @@
 # B站AI摘要 - 手动处理工作流
-# 通过 Cloudflare Worker API 触发，处理用户手动提交的单条视频
+# 通过 Cloudflare Worker API (workflow_dispatch) 触发
 # 
-# Secrets 需求:
+# 依赖:
 #   SILICONFLOW_API_KEY     — 必填，硅基流动 Key
-#   R2_ACCESS_KEY_ID        — 可选，R2 S3 兼容 Access Key
-#   R2_SECRET_ACCESS_KEY    — 可选，R2 Secret Key
-#   R2_ENDPOINT             — 可选，R2 端点 (https://<account>.r2.cloudflarestorage.com)
-#   R2_BUCKET_NAME          — 可选，R2 Bucket 名称
 #   SMTP_USER / SMTP_PASS / SMTP_TO — 可选，邮件通知
-name: B站AI摘要 - 手动处理
+name: 手动处理
 
 on:
   workflow_dispatch:
@@ -18,7 +14,7 @@ on:
         required: true
         type: string
       job_id:
-        description: 'R2 任务 ID（用于回写结果）'
+        description: '任务 ID'
         required: true
         type: string
 
@@ -30,7 +26,7 @@ env:
 
 jobs:
   process:
-    name: 处理单条视频
+    name: 处理视频
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -46,28 +42,26 @@ jobs:
           pip install -r bilibili_summary/requirements.txt
           sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg
 
+      - name: 注入配置
+        env:
+          SILICONFLOW_API_KEY: ${{ secrets.SILICONFLOW_API_KEY }}
+          SMTP_USER: ${{ secrets.SMTP_USER }}
+          SMTP_PASS: ${{ secrets.SMTP_PASS }}
+          SMTP_TO: ${{ secrets.SMTP_TO }}
+        run: python bilibili_summary/inject_config.py
+
       - name: 处理视频 (音频 → 语音识别 → AI总结)
         id: process
         env:
-          SILICONFLOW_API_KEY: ${{ secrets.SILICONFLOW_API_KEY }}
           BVID: ${{ inputs.bvid }}
           JOB_ID: ${{ inputs.job_id }}
-          R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
-          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
-          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
-          R2_BUCKET_NAME: ${{ secrets.R2_BUCKET_NAME }}
         run: |
           cd bilibili_summary
-          python process_single.py "$BVID" \
-            --upload-r2 "$JOB_ID" \
-            --r2-endpoint "$R2_ENDPOINT" \
-            --r2-key "$R2_ACCESS_KEY_ID" \
-            --r2-secret "$R2_SECRET_ACCESS_KEY" \
-            --r2-bucket "$R2_BUCKET_NAME" \
-            > result.json 2>&1
+          python process_single.py "$BVID" > result.json 2>&1
+          echo "status=$(python3 -c "import json; print(json.load(open('result.json'))['status'])")" >> $GITHUB_OUTPUT
 
-      - name: 发送邮件通知 (可选)
-        if: ${{ secrets.SMTP_USER != '' && secrets.SMTP_USER != '' }}
+      - name: 发送邮件通知
+        if: steps.process.outputs.status == 'completed'
         env:
           SMTP_USER: ${{ secrets.SMTP_USER }}
           SMTP_PASS: ${{ secrets.SMTP_PASS }}
@@ -77,35 +71,18 @@ jobs:
           python -c "
 import os, json
 from emailer import send_email
-
 with open('result.json') as f:
     data = json.load(f)
-
-if not data.get('summary') or data.get('status') != 'completed':
-    print('[邮件] 跳过（无有效结果）')
+summary = data.get('summary', '')
+if not summary:
+    print('[邮件] 跳过：无总结内容')
     exit(0)
-
 bvid = data['bvid']
-summary = data['summary']
-subject = f'🎬 B站AI摘要 - {bvid}'
-body = f'''<!DOCTYPE html>
-<html><head><meta charset=\"utf-8\"></head>
-<body style=\"font-family:sans-serif;padding:20px;max-width:600px;margin:0 auto\">
-<div style=\"background:linear-gradient(135deg,#14b8a6,#0ea5e9);color:white;padding:24px;border-radius:12px;margin-bottom:20px\">
-<h2 style=\"margin:0\">🎬 B站视频摘要</h2>
-<p style=\"margin:8px 0 0;opacity:0.9\">{bvid}</p>
-</div>
-<div style=\"border-left:4px solid #14b8a6;padding-left:16px;line-height:1.7\">
-{summary.replace(chr(10), '<br>')}
-</div>
-<p style=\"margin-top:20px\"><a href=\"https://www.bilibili.com/video/{bvid}\" style=\"color:#14b8a6;font-weight:bold\" target=\"_blank\">🔗 在B站观看</a></p>
-<p style=\"color:#94a3b8;font-size:12px;margin-top:16px\">本邮件由 Bilibili AI Summary 自动生成</p>
-</body></html>'''
-
-ok = send_email(subject, body,
-    smtp_server='smtp.qq.com', smtp_port=465,
-    smtp_user=os.environ['SMTP_USER'],
-    smtp_pass=os.environ['SMTP_PASS'],
-    to_addr=os.environ['SMTP_TO'])
-print(f'[邮件] {\"发送成功\" if ok else \"发送失败\"}')
+html = '<div style=\"background:linear-gradient(135deg,#14b8a6,#0ea5e9);color:white;padding:24px;border-radius:12px;margin-bottom:20px\"><h2 style=\"margin:0\">🎬 B站视频摘要</h2><p style=\"margin:8px 0 0\">' + bvid + '</p></div>'
+html += '<div style=\"border-left:4px solid #14b8a6;padding-left:16px;line-height:1.7\">' + summary.replace(chr(10), '<br>') + '</div>'
+html += '<p style=\"margin-top:20px\"><a href=\"https://www.bilibili.com/video/' + bvid + '\" style=\"color:#14b8a6;font-weight:bold\">🔗 在B站观看</a></p>'
+subject = '🎬 B站AI摘要 - ' + bvid
+body = '<!DOCTYPE html><html><head><meta charset=\"utf-8\"></head><body style=\"font-family:sans-serif;padding:20px;max-width:600px;margin:0 auto\">' + html + '<p style=\"color:#94a3b8;font-size:12px;margin-top:16px\">本邮件由 Bilibili AI Summary 自动生成</p></body></html>'
+ok = send_email(subject, body, smtp_server='smtp.qq.com', smtp_port=465, smtp_user=os.environ['SMTP_USER'], smtp_pass=os.environ['SMTP_PASS'], to_addr=os.environ['SMTP_TO'])
+print('[邮件]', '发送成功' if ok else '发送失败')
 " 2>&1
