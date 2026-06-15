@@ -276,10 +276,21 @@ export default {
         return await handleStats(request, env);
       }
 
-      // Serve static frontend (from Worker - fallback when Pages not used)
+      // Root path: show API status or redirect to frontend
       if (path === '/' || path === '/index.html') {
-        const html = await env.ASSETS.fetch(request);
-        return html;
+        return jsonResponse({
+          service: 'Bilibili AI Summary API',
+          version: '1.0',
+          endpoints: {
+            submit: 'POST /api/submit',
+            list_jobs: 'GET /api/jobs',
+            get_job: 'GET /api/jobs/:id',
+            delete_job: 'DELETE /api/jobs/:id',
+            stats: 'GET /api/stats',
+          },
+          frontend: 'Deploy cloudflare/frontend/index.html to Cloudflare Pages',
+          r2_status: env.BILIBILI_BUCKET ? 'connected' : 'not configured (enable R2 in Cloudflare Dashboard)',
+        });
       }
 
       return errorResponse('Not Found', 404);
