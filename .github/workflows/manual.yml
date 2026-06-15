@@ -4,6 +4,7 @@
 # 依赖:
 #   SILICONFLOW_API_KEY     — 必填，硅基流动 Key
 #   SMTP_USER / SMTP_PASS / SMTP_TO — 可选，邮件通知
+# v2: force cache refresh
 name: 手动处理
 
 on:
