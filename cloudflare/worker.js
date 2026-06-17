@@ -175,6 +175,46 @@ async function handleDeleteJob(request, env, jobId) {
   return jsonResponse({ deleted: true, job_id: jobId });
 }
 
+async function handleCallback(request, env) {
+  // GHA 跑完后回调: POST { job_id, bvid, status, summary, title }
+  // 删除 pending 标记 → 写入 results/{job_id}.json
+  if (!env.BILIBILI_BUCKET) {
+    return errorResponse('R2 未配置', 503);
+  }
+  
+  const body = await request.json();
+  const { job_id, bvid, status, summary, title } = body;
+  
+  if (!job_id || !bvid) {
+    return errorResponse('缺少 job_id 或 bvid', 400);
+  }
+  
+  // 验证 pending 任务存在
+  const pending = await env.BILIBILI_BUCKET.get(`pending/${job_id}.json`);
+  if (!pending) {
+    return errorResponse('任务不存在或已处理', 404);
+  }
+  
+  // 写入结果
+  const now = new Date().toISOString();
+  const result = {
+    id: job_id, bvid, status: status || 'completed',
+    summary: summary || null,
+    title: title || '',
+    completed_at: now,
+    video_url: `https://www.bilibili.com/video/${bvid}`,
+  };
+  
+  await env.BILIBILI_BUCKET.put(`results/${job_id}.json`, JSON.stringify(result), {
+    httpMetadata: { contentType: 'application/json' },
+  });
+  
+  // 删除 pending
+  await env.BILIBILI_BUCKET.delete(`pending/${job_id}.json`);
+  
+  return jsonResponse({ status: 'ok', job_id });
+}
+
 async function handleStats(request, env) {
   if (!env.BILIBILI_BUCKET) {
     return jsonResponse({ mode: 'localstorage', note: 'R2 未配置 — 使用浏览器 LocalStorage', max_results: MAX_RESULTS });
@@ -730,6 +770,7 @@ export default {
       if (path.startsWith('/api/jobs/') && request.method === 'GET') return await handleGetJob(request, env, path.replace('/api/jobs/', ''));
       if (path.startsWith('/api/jobs/') && request.method === 'DELETE') return await handleDeleteJob(request, env, path.replace('/api/jobs/', ''));
       if (path === '/api/stats' && request.method === 'GET') return await handleStats(request, env);
+      if (path === '/api/callback' && request.method === 'POST') return await handleCallback(request, env);
       if (path === '/' || path === '/index.html') return htmlResponse(generateFrontendPage());
 
       return errorResponse('Not Found', 404);

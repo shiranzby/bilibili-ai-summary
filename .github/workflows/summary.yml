@@ -118,3 +118,9 @@ jobs:
         run: |
           cd bilibili_summary
           python send_result_email.py result.json
+
+      - name: 回调 Worker (写回 R2)
+        if: ${{ inputs.job_id != '' && inputs.job_id != null }}
+        run: |
+          cd bilibili_summary
+          python callback_worker.py result.json "${{ inputs.job_id }}" "https://bilibili-ai-summary-api.shy2958779577.workers.dev"

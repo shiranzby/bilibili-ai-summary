@@ -25,10 +25,11 @@ from audio_transcriber import get_text_from_audio
 from summarizer import summarize_subtitle
 
 
-def process(bvid: str) -> dict:
+def process(bvid: str, job_id: str = "") -> dict:
     """处理单条视频，返回结果字典"""
     result = {
         "bvid": bvid,
+        "job_id": job_id,
         "title": "",
         "status": "completed",
         "summary": None,
@@ -99,6 +100,8 @@ def upload_to_r2(result: dict, job_id: str, r2_config: dict):
 def main():
     parser = argparse.ArgumentParser(description="处理单条B站视频")
     parser.add_argument("bvid", help="B站视频 BV 号")
+    parser.add_argument("--job-id", help="Worker 任务 ID", default="")
+    parser.add_argument("--callback-url", help="Worker 回调 URL", default="")
     parser.add_argument("--upload-r2", help="上传结果到 R2 (job_id)", default="")
     parser.add_argument("--r2-endpoint", help="R2 S3 兼容端点", default="")
     parser.add_argument("--r2-key", help="R2 Access Key ID", default="")
@@ -106,7 +109,7 @@ def main():
     parser.add_argument("--r2-bucket", help="R2 Bucket 名称", default="")
 
     args = parser.parse_args()
-    result = process(args.bvid)
+    result = process(args.bvid, job_id=args.job_id)
 
     # 仅在 R2 真正配置时上传 (忽略占位值)
     if args.upload_r2 and args.r2_endpoint and args.r2_key and "placeholder" not in args.r2_key:
