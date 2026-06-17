@@ -2,17 +2,10 @@ name = "bilibili-ai-summary-api"
 main = "worker.js"
 compatibility_date = "2025-02-01"
 
-# ──────────────────────────────────────────────
-# ⚠️ R2 Bucket — 请先在 Cloudflare Dashboard 启用 R2
-#    然后在 Cloudflare Dashboard → Workers & Pages → bilibili-ai-summary-api
-#    → Settings → Variables → R2 Bucket Bindings 添加
-#    Variable name: BILIBILI_BUCKET
-#    Bucket name: bilibili-summary
-# ──────────────────────────────────────────────
-# 取消下面注释即可启用 R2:
-# [[r2_buckets]]
-# binding = "BILIBILI_BUCKET"
-# bucket_name = "bilibili-summary"
+# ─── R2 Bucket 绑定 ────────────────────────────
+[[r2_buckets]]
+binding = "BILIBILI_BUCKET"
+bucket_name = "bilibili-summary"
 
 # ──────────────────────────────────────────────
 # Environment Variables (set via wrangler secret)

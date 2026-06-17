@@ -49,11 +49,16 @@ function htmlResponse(html, status = 200) {
 
 async function cleanupExcessResults(R2) {
   const objects = [];
-  for await (const obj of R2.list()) {
-    if (obj.key.startsWith('results/')) {
-      objects.push({ key: obj.key, uploaded: obj.uploaded });
+  let cursor;
+  do {
+    const listed = await R2.list({ cursor, limit: 1000 });
+    for (const obj of listed.objects) {
+      if (obj.key.startsWith('results/')) {
+        objects.push({ key: obj.key, uploaded: obj.uploaded });
+      }
     }
-  }
+    cursor = listed.truncated ? listed.cursor : undefined;
+  } while (cursor);
   objects.sort((a, b) => new Date(a.uploaded) - new Date(b.uploaded));
   const toDelete = objects.slice(0, Math.max(0, objects.length - MAX_RESULTS));
   let deleted = 0;
@@ -124,17 +129,23 @@ async function handleListJobs(request, env) {
   const limit = Math.min(parseInt(url.searchParams.get('limit') || '50'), 100);
 
   const jobs = [];
-  for await (const obj of env.BILIBILI_BUCKET.list()) {
+  let cursor;
+  do {
+    const listed = await env.BILIBILI_BUCKET.list({ cursor, limit: 1000 });
+    for (const obj of listed.objects) {
+      if (jobs.length >= limit) break;
+      const isPending = obj.key.startsWith('pending/');
+      const isResult = obj.key.startsWith('results/');
+      if (!isPending && !isResult) continue;
+      const raw = await env.BILIBILI_BUCKET.get(obj.key);
+      if (!raw) continue;
+      const job = await raw.json();
+      if (status && job.status !== status) continue;
+      jobs.push(job);
+    }
     if (jobs.length >= limit) break;
-    const isPending = obj.key.startsWith('pending/');
-    const isResult = obj.key.startsWith('results/');
-    if (!isPending && !isResult) continue;
-    const raw = await env.BILIBILI_BUCKET.get(obj.key);
-    if (!raw) continue;
-    const job = await raw.json();
-    if (status && job.status !== status) continue;
-    jobs.push(job);
-  }
+    cursor = listed.truncated ? listed.cursor : undefined;
+  } while (cursor);
   jobs.sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
   return jsonResponse({ jobs, total: jobs.length });
 }
@@ -169,10 +180,15 @@ async function handleStats(request, env) {
     return jsonResponse({ mode: 'localstorage', note: 'R2 未配置 — 使用浏览器 LocalStorage', max_results: MAX_RESULTS });
   }
   let pending = 0, completed = 0;
-  for await (const obj of env.BILIBILI_BUCKET.list()) {
-    if (obj.key.startsWith('pending/')) pending++;
-    if (obj.key.startsWith('results/')) completed++;
-  }
+  let cursor;
+  do {
+    const listed = await env.BILIBILI_BUCKET.list({ cursor, limit: 1000 });
+    for (const obj of listed.objects) {
+      if (obj.key.startsWith('pending/')) pending++;
+      if (obj.key.startsWith('results/')) completed++;
+    }
+    cursor = listed.truncated ? listed.cursor : undefined;
+  } while (cursor);
   return jsonResponse({ mode: 'r2', pending_jobs: pending, completed_jobs: completed, max_results: MAX_RESULTS });
 }
 
