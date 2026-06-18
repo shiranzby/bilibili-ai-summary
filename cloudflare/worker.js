@@ -101,11 +101,14 @@ async function handleSubmit(request, env) {
   }
 
   // 触发 GitHub Actions (使用 summary.yml，支持 workflow_dispatch)
-  fetch(`https://api.github.com/repos/${env.GH_OWNER}/${env.GH_REPO}/actions/workflows/summary.yml/dispatches`, {
+  const ghOwner = env.GH_OWNER || 'shiranzby';
+  const ghRepo = env.GH_REPO || 'bilibili-ai-summary';
+  const ghToken = env.GH_TOKEN;
+  fetch(`https://api.github.com/repos/${ghOwner}/${ghRepo}/actions/workflows/summary.yml/dispatches`, {
     method: 'POST',
     headers: {
       'Accept': 'application/vnd.github.v3+json',
-      'Authorization': `Bearer ${env.GH_TOKEN}`,
+      'Authorization': `Bearer ${ghToken}`,
       'Content-Type': 'application/json',
     },
     body: JSON.stringify({ ref: env.GH_REF || 'main', inputs: { bvid, job_id: jobId } }),
