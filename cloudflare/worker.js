@@ -93,9 +93,9 @@ async function handleSubmit(request, env) {
     summary: null, title: '', error: '',
   };
 
-  // 有 R2 则持久化 (可选，静默失败)
+  // 有 R2 则持久化
   if (env.BILIBILI_BUCKET) {
-    env.BILIBILI_BUCKET.put(`pending/${jobId}.json`, JSON.stringify(job),
+    await env.BILIBILI_BUCKET.put(`pending/${jobId}.json`, JSON.stringify(job),
       { httpMetadata: { contentType: 'application/json' } }
     ).catch(() => {});
   }
