@@ -7,12 +7,14 @@
 
 用法:
     python process_single.py BV1xx
-    python process_single.py BV1xx --upload-r2
+    python process_single.py BV1xx --job-id xxx
 """
 import os
 import sys
 import json
 import argparse
+import time
+import re
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -25,48 +27,89 @@ from audio_transcriber import get_text_from_audio
 from summarizer import summarize_subtitle
 
 
+def get_video_title(bvid: str) -> str:
+    """从B站API获取视频标题"""
+    import requests
+    try:
+        resp = requests.get(
+            "https://api.bilibili.com/x/web-interface/view",
+            params={"bvid": bvid},
+            headers={"User-Agent": "Mozilla/5.0", "Referer": "https://m.bilibili.com/"},
+            timeout=10,
+        )
+        data = resp.json()
+        if data.get("code") == 0:
+            return data.get("data", {}).get("title", bvid)
+    except Exception as e:
+        print(f"[标题] 获取失败: {e}", file=sys.stderr)
+    return bvid
+
+
+def clean_transcript(text: str) -> str:
+    """清洗转录文本：去掉音乐符号 🎼🎵🎶 等"""
+    return re.sub(r"[\U0001F3BC\U0001F3B5\U0001F3B6\U0001F3A4\U0001F3A7]", "", text)
+
+
 def process(bvid: str, job_id: str = "", summary_template: str = "") -> dict:
     """处理单条视频，返回结果字典"""
+    # 获取标题
+    print(f"[处理] 获取视频信息: {bvid}", file=sys.stderr)
+    t0 = time.time()
+    title = get_video_title(bvid)
+    t_title = round(time.time() - t0, 1)
+    print(f"[处理] 标题: {title} ({t_title}s)", file=sys.stderr)
+
     result = {
         "bvid": bvid,
         "job_id": job_id,
-        "title": "",
+        "title": title,
         "status": "completed",
         "summary": None,
         "transcript": "",
         "error": "",
+        "timings": {},
         "video_url": f"https://www.bilibili.com/video/{bvid}",
     }
 
     # Step 1: 音频 + 语音识别
-    print(f"[处理] 开始处理: {bvid}", file=sys.stderr)
+    print(f"[处理] 开始语音识别...", file=sys.stderr)
+    t1 = time.time()
     audio_text = get_text_from_audio(
         bvid,
         siliconflow_api_key=SILICONFLOW_API_KEY,
         siliconflow_stt_model=SILICONFLOW_STT_MODEL,
     )
+    t_stt = round(time.time() - t1, 1)
+    result["timings"]["stt"] = t_stt
 
     if not audio_text:
         result["status"] = "failed"
         result["error"] = "语音识别失败"
+        result["timings"]["total"] = round(time.time() - t0, 1)
         return result
 
-    result["transcript"] = audio_text
+    # 清洗转录文本（去掉🎼等音乐符号）
+    result["transcript"] = clean_transcript(audio_text)
+    print(f"[处理] 转录完成 ({len(result['transcript'])} 字符, {t_stt}s)", file=sys.stderr)
 
     # Step 2: AI 总结（带自定义模板）
     template = summary_template or ""
+    t2 = time.time()
     if template:
         print(f"[处理] 使用自定义总结模板", file=sys.stderr)
     summary = summarize_subtitle(
-        audio_text,
-        video_title=bvid,
+        result["transcript"],
+        video_title=title,
         api_key=SILICONFLOW_API_KEY,
         model=SILICONFLOW_SUMMARY_MODEL,
         custom_template=template,
     )
+    t_summary = round(time.time() - t2, 1)
+    result["timings"]["summary"] = t_summary
     result["summary"] = summary or "（AI总结失败，仅完成语音识别）"
+    result["timings"]["total"] = round(time.time() - t0, 1)
 
-    print(f"[处理] ✅ 完成", file=sys.stderr)
+    print(f"[处理] ✅ 完成 (总计 {result['timings']['total']}s)", file=sys.stderr)
     return result
 
 
@@ -120,20 +163,6 @@ def main():
     # 优先使用 --summary-template 参数，否则回退到环境变量
     summary_template = args.summary_template or os.environ.get("SUMMARY_TEMPLATE", "")
     result = process(args.bvid, job_id=args.job_id, summary_template=summary_template)
-
-    # 仅在 R2 真正配置时上传 (忽略占位值)
-    if args.upload_r2 and args.r2_endpoint and args.r2_key and "placeholder" not in args.r2_key:
-        try:
-            upload_to_r2(result, args.upload_r2, {
-                "endpoint": args.r2_endpoint,
-                "access_key_id": args.r2_key,
-                "secret_access_key": args.r2_secret,
-                "bucket_name": args.r2_bucket,
-            })
-        except Exception as e:
-            print(f"[R2] ⚠ 上传失败 (非致命): {e}", file=sys.stderr)
-    elif args.upload_r2:
-        print(f"[R2] ⏭ R2 未配置，跳过上传", file=sys.stderr)
 
     # 输出 JSON 到文件 (供后续步骤使用)
     with open("result.json", "w", encoding="utf-8") as f:

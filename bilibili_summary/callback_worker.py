@@ -22,6 +22,7 @@ def callback(result_file: str, job_id: str, worker_url: str):
         "summary": data.get("summary", ""),
         "transcript": data.get("transcript", ""),
         "title": data.get("title", ""),
+        "timings": data.get("timings", {}),
     })
 
     import urllib.request
