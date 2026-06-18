@@ -27,7 +27,10 @@ def callback(result_file: str, job_id: str, worker_url: str):
     req = urllib.request.Request(
         worker_url.rstrip("/") + "/api/callback",
         data=body.encode("utf-8"),
-        headers={"Content-Type": "application/json"},
+        headers={
+            "Content-Type": "application/json",
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        },
     )
     try:
         resp = urllib.request.urlopen(req, timeout=30)
