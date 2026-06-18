@@ -99,7 +99,7 @@ jobs:
           BVID: ${{ inputs.bvid }}
         run: |
           cd bilibili_summary
-          python process_single.py "$BVID" --job-id "${{ inputs.job_id }}" > result.json 2>&1
+          python process_single.py "$BVID" --job-id "${{ inputs.job_id }}" 2>/dev/null > result.json
       - name: 发送邮件通知
         if: success() || failure()
         env:
