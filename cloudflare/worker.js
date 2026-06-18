@@ -33,12 +33,12 @@ async function fetchGHRunId(env, bvid, jobId) {
   const token = env.GH_TOKEN || '';
   if (!token) return null;
   
-  const url = \`https://api.github.com/repos/\${owner}/\${repo}/actions/runs?event=workflow_dispatch&per_page=5\`;
+  const url = `https://api.github.com/repos/${owner}/${repo}/actions/runs?event=workflow_dispatch&per_page=5`;
   try {
     const resp = await fetch(url, {
       headers: {
         'Accept': 'application/vnd.github.v3+json',
-        'Authorization': \`Bearer \${token}\`,
+        'Authorization': `Bearer ${token}`,
         'User-Agent': 'bilibili-ai-summary-worker/1.0',
       },
     });
@@ -80,12 +80,12 @@ async function fetchGHRunStatus(env, runId) {
   const token = env.GH_TOKEN || '';
   if (!token || !runId) return null;
   
-  const url = \`https://api.github.com/repos/\${owner}/\${repo}/actions/runs/\${runId}\`;
+  const url = `https://api.github.com/repos/${owner}/${repo}/actions/runs/${runId}`;
   try {
     const resp = await fetch(url, {
       headers: {
         'Accept': 'application/vnd.github.v3+json',
-        'Authorization': \`Bearer \${token}\`,
+        'Authorization': `Bearer ${token}`,
         'User-Agent': 'bilibili-ai-summary-worker/1.0',
       },
     });
