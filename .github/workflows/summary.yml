@@ -44,10 +44,7 @@ jobs:
           cache: 'pip'
           cache-dependency-path: bilibili_summary/requirements.txt
       - name: 安装依赖
-        run: |
-          pip install -r bilibili_summary/requirements.txt
-          pip install yt-dlp
-          which ffmpeg || sudo apt-get update -qq -o Acquire::Retries=3 -o Acquire::http::Timeout=5 && sudo apt-get install -y -qq --no-install-recommends ffmpeg
+        run: pip install -r bilibili_summary/requirements.txt
 
       - name: 注入配置
         env:
@@ -88,10 +85,7 @@ jobs:
           cache: 'pip'
           cache-dependency-path: bilibili_summary/requirements.txt
       - name: 安装依赖
-        run: |
-          pip install -r bilibili_summary/requirements.txt
-          pip install yt-dlp
-          which ffmpeg || sudo apt-get update -qq -o Acquire::Retries=3 -o Acquire::http::Timeout=5 && sudo apt-get install -y -qq --no-install-recommends ffmpeg
+        run: pip install -r bilibili_summary/requirements.txt
 
       - name: 注入配置
         env:

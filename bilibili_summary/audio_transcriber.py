@@ -4,14 +4,13 @@
 当B站视频需要转录时，下载音频并转为文字。
 
 方案:
-  1. playurl API → CDN直链 (优先，GHA已验证可用)
-  2. yt-dlp (备选)
+  1. playurl API → CDN直链下载 .m4s
+  2. 直接改名 .m4s → .m4a (AAC容器，无需ffmpeg)
   3. 硅基流动 SenseVoiceSmall → 语音转文字
 """
 
 import os
 import requests
-import subprocess
 import tempfile
 from typing import Optional
 
@@ -112,55 +111,6 @@ def download_from_cdn(audio_url: str, output_path: str, timeout: int = 60) -> bo
         return False
 
 
-def convert_to_wav(input_path: str, output_path: str) -> bool:
-    """ffmpeg 将音频转为 16kHz mono WAV"""
-    try:
-        subprocess.run(
-            ["ffmpeg", "-y", "-i", input_path, "-ac", "1", "-ar", "16000", "-f", "wav", "-loglevel", "error", output_path],
-            capture_output=True, check=True, timeout=60,
-        )
-        return os.path.exists(output_path) and os.path.getsize(output_path) > 100
-    except FileNotFoundError:
-        print(f"    [ffmpeg] 未找到 ffmpeg")
-        return False
-    except Exception as e:
-        print(f"    [ffmpeg] 转换失败: {e}")
-        return False
-
-
-# ==================== yt-dlp 备选 ====================
-
-def download_with_ytdlp(bvid: str, output_dir: str) -> Optional[str]:
-    """yt-dlp 下载B站视频音频 (mp3)，备选方案"""
-    url = f"https://www.bilibili.com/video/{bvid}"
-    output_tpl = os.path.join(output_dir, f"{bvid}.%(ext)s")
-    cmd = [
-        "yt-dlp", "-x", "--audio-format", "mp3", "--audio-quality", "0",
-        "-o", output_tpl, "--quiet", "--no-warnings", "--geo-bypass",
-        "--socket-timeout", "30", url,
-    ]
-    try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
-        if result.returncode != 0:
-            print(f"    [yt-dlp] 失败: {result.stderr[:300]}")
-            return None
-        for f in os.listdir(output_dir):
-            path = os.path.join(output_dir, f)
-            if os.path.isfile(path) and os.path.getsize(path) > 1000:
-                print(f"    [yt-dlp] 下载完成 ({os.path.getsize(path)/1024/1024:.1f} MB)")
-                return path
-        return None
-    except subprocess.TimeoutExpired:
-        print(f"    [yt-dlp] 超时")
-        return None
-    except FileNotFoundError:
-        print(f"    [yt-dlp] 未安装")
-        return None
-    except Exception as e:
-        print(f"    [yt-dlp] 异常: {e}")
-        return None
-
-
 # ==================== 硅基流动 语音识别 ====================
 
 def transcribe_with_siliconflow(audio_path: str, api_key: str = "", model: str = "") -> Optional[str]:
@@ -196,66 +146,59 @@ def get_text_from_audio(
     siliconflow_stt_model: str = "",
 ) -> Optional[str]:
     """
-    一站式: B站音频下载 → 智能转写 → 返回文本
+    一站式: B站音频下载 → 直接上传硅基流动语音识别
 
-    下载策略:
-      1. playurl CDN 直链 (GHA已验证可用, 60s超时)
-      2. yt-dlp (备选, 300s超时)
+    流程:
+      1. playurl API 获取音频 CDN 直链
+      2. 下载 .m4s (AAC容器，直接改名 .m4a)
+      3. 上传到硅基流动语音识别 API
+
+    > 不需要 ffmpeg: .m4s 本身就是 AAC 音频，改后缀即可
+    > 不需要 yt-dlp: playurl CDN 方案已验证每次都能成功
     """
     with tempfile.TemporaryDirectory() as tmpdir:
-        raw_audio = os.path.join(tmpdir, f"{bvid}.m4s")
-        wav_audio = os.path.join(tmpdir, f"{bvid}.wav")
+        m4s_path = os.path.join(tmpdir, f"{bvid}.m4s")
+        m4a_path = os.path.join(tmpdir, f"{bvid}.m4a")
 
-        # ---- 策略1: playurl CDN (优先, 已验证GHA可用) ----
-        print(f"    [音频] 策略1: playurl CDN...")
+        # ---- playurl CDN ----
+        print(f"    [音频] 获取视频信息...")
         cid = get_cid(bvid)
         if not cid:
-            print(f"    [音频] 无法获取 cid")
-            return _fallback_ytdlp(bvid, tmpdir, siliconflow_api_key, siliconflow_stt_model)
+            print(f"    [音频] ❌ 无法获取 cid")
+            return None
 
         all_urls = get_audio_urls_from_playurl(bvid, cid)
-        if all_urls:
-            download_ok = False
-            for idx, url in enumerate(all_urls):
-                print(f"    [CDN] #{idx+1}/{len(all_urls)} (60s)...")
-                if download_from_cdn(url, raw_audio, timeout=60):
-                    download_ok = True
-                    break
+        if not all_urls:
+            print(f"    [音频] ❌ 无法获取音频直链")
+            return None
 
-            if not download_ok:
-                print(f"    [CDN] 全部直链下载失败, 尝试重试...")
-                for retry in range(1, 3):
-                    import time; time.sleep(1)
-                    new_urls = get_audio_urls_from_playurl(bvid, cid)
-                    if not new_urls:
-                        continue
-                    for idx, url in enumerate(new_urls):
-                        print(f"    [CDN] 重试#{retry} #{idx+1}/{len(new_urls)} (60s)...")
-                        if download_from_cdn(url, raw_audio, timeout=60):
-                            download_ok = True
-                            break
-                    if download_ok:
+        download_ok = False
+        for idx, url in enumerate(all_urls):
+            print(f"    [CDN] #{idx+1}/{len(all_urls)} (60s)...")
+            if download_from_cdn(url, m4s_path, timeout=60):
+                download_ok = True
+                break
+
+        if not download_ok:
+            print(f"    [CDN] 全部直链下载失败, 重试一次...")
+            import time; time.sleep(1)
+            new_urls = get_audio_urls_from_playurl(bvid, cid)
+            if new_urls:
+                for idx, url in enumerate(new_urls):
+                    if download_from_cdn(url, m4s_path, timeout=60):
+                        download_ok = True
                         break
 
-            if download_ok:
-                if convert_to_wav(raw_audio, wav_audio):
-                    if siliconflow_api_key:
-                        return transcribe_with_siliconflow(
-                            wav_audio, api_key=siliconflow_api_key, model=siliconflow_stt_model,
-                        )
-                    return None
+        if not download_ok:
+            print(f"    [音频] ❌ 下载失败")
+            return None
 
-        # ---- 策略2: yt-dlp (备选) ----
-        return _fallback_ytdlp(bvid, tmpdir, siliconflow_api_key, siliconflow_stt_model)
+        # .m4s = AAC/M4A 容器，直接改名即可
+        os.rename(m4s_path, m4a_path)
 
+        if siliconflow_api_key:
+            return transcribe_with_siliconflow(
+                m4a_path, api_key=siliconflow_api_key, model=siliconflow_stt_model,
+            )
+        return None
 
-def _fallback_ytdlp(bvid: str, tmpdir: str, api_key: str = "", model: str = "") -> Optional[str]:
-    """yt-dlp 备选"""
-    print(f"    [音频] 策略2: yt-dlp...")
-    audio_file = download_with_ytdlp(bvid, tmpdir)
-    if audio_file:
-        wav_path = os.path.join(tmpdir, f"{bvid}.wav")
-        if convert_to_wav(audio_file, wav_path):
-            if api_key:
-                return transcribe_with_siliconflow(wav_path, api_key=api_key, model=model)
-    return None
