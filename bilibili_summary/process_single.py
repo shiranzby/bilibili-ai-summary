@@ -125,8 +125,13 @@ def main():
     elif args.upload_r2:
         print(f"[R2] ⏭ R2 未配置，跳过上传", file=sys.stderr)
 
-    # 输出 JSON 到 stdout (供 workflow 使用)
-    print(json.dumps(result, ensure_ascii=False))
+    # 输出 JSON 到文件 (供后续步骤使用)
+    with open("result.json", "w", encoding="utf-8") as f:
+        json.dump(result, f, ensure_ascii=False)
+    # 同时在 stdout 打印摘要
+    s = result.get("summary", "")
+    if s:
+        print(f"[处理] ✅ AI总结完成 ({"s[:60]"}...)", file=sys.stderr)
 
 
 if __name__ == "__main__":
