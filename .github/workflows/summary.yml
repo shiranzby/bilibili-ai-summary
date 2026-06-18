@@ -41,8 +41,8 @@ jobs:
       - name: 安装依赖
         run: |
           pip install -r bilibili_summary/requirements.txt
-          pip install yt-dlp  # 避免 apt-get update 卡死
-          # ubuntu-latest 预装 ffmpeg，无需 apt-get install
+          pip install yt-dlp
+          which ffmpeg || sudo apt-get update -qq -o Acquire::Retries=3 -o Acquire::http::Timeout=5 && sudo apt-get install -y -qq --no-install-recommends ffmpeg
 
       - name: 注入配置
         env:
@@ -85,8 +85,8 @@ jobs:
       - name: 安装依赖
         run: |
           pip install -r bilibili_summary/requirements.txt
-          pip install yt-dlp  # 避免 apt-get update 卡死
-          # ubuntu-latest 预装 ffmpeg，无需 apt-get install
+          pip install yt-dlp
+          which ffmpeg || sudo apt-get update -qq -o Acquire::Retries=3 -o Acquire::http::Timeout=5 && sudo apt-get install -y -qq --no-install-recommends ffmpeg
 
       - name: 注入配置
         env:

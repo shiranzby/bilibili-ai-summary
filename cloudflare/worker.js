@@ -93,26 +93,49 @@ async function handleSubmit(request, env) {
     summary: null, title: '', error: '',
   };
 
-  // 有 R2 则持久化
+  // 有 R2 则持久化 (可选，静默失败)
   if (env.BILIBILI_BUCKET) {
-    await env.BILIBILI_BUCKET.put(`pending/${jobId}.json`, JSON.stringify(job),
+    env.BILIBILI_BUCKET.put(`pending/${jobId}.json`, JSON.stringify(job),
       { httpMetadata: { contentType: 'application/json' } }
     ).catch(() => {});
   }
 
   // 触发 GitHub Actions (使用 summary.yml，支持 workflow_dispatch)
-  const ghOwner = env.GH_OWNER || 'shiranzby';
-  const ghRepo = env.GH_REPO || 'bilibili-ai-summary';
-  const ghToken = env.GH_TOKEN;
-  fetch(`https://api.github.com/repos/${ghOwner}/${ghRepo}/actions/workflows/summary.yml/dispatches`, {
-    method: 'POST',
-    headers: {
-      'Accept': 'application/vnd.github.v3+json',
-      'Authorization': `Bearer ${ghToken}`,
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify({ ref: env.GH_REF || 'main', inputs: { bvid, job_id: jobId } }),
-  }).catch(err => console.error('GitHub dispatch failed:', err));
+  const GH_OWNER = env.GH_OWNER || 'shiranzby';
+  const GH_REPO = env.GH_REPO || 'bilibili-ai-summary';
+  const dispatchUrl = `https://api.github.com/repos/${GH_OWNER}/${GH_REPO}/actions/workflows/summary.yml/dispatches`;
+  
+  try {
+    const ghResp = await fetch(dispatchUrl, {
+      method: 'POST',
+      headers: {
+        'Accept': 'application/vnd.github.v3+json',
+        'Authorization': `Bearer ${env.GH_TOKEN}`,
+        'Content-Type': 'application/json',
+        'User-Agent': 'bilibili-ai-summary-worker/1.0',
+      },
+      body: JSON.stringify({ ref: env.GH_REF || 'main', inputs: { bvid, job_id: jobId } }),
+    });
+    
+    if (ghResp.status !== 204 && ghResp.status !== 201 && ghResp.status !== 200) {
+      const errText = await ghResp.text().catch(() => 'unknown');
+      console.error('GitHub dispatch failed:', ghResp.status, errText.slice(0, 200));
+      
+      // 有 R2 时清理过期结果
+      if (env.BILIBILI_BUCKET) {
+        cleanupExcessResults(env.BILIBILI_BUCKET).catch(() => {});
+      }
+      
+      return jsonResponse({ 
+        job_id: jobId, bvid, status: 'pending',
+        warning: 'GitHub Actions 触发可能失败: HTTP ' + ghResp.status,
+      }, 201);
+    }
+    
+    console.log('GitHub dispatch OK:', ghResp.status);
+  } catch (err) {
+    console.error('GitHub dispatch network error:', err.message);
+  }
 
   // 有 R2 时清理过期结果
   if (env.BILIBILI_BUCKET) {
