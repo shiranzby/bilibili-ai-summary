@@ -22,6 +22,111 @@ const CORS_HEADERS = {
 // Helpers
 // ═══════════════════════════════════════════════════════
 
+
+const GH_OWNER_DEF = 'shiranzby';
+const GH_REPO_DEF = 'bilibili-ai-summary';
+
+async function fetchGHRunId(env, bvid, jobId) {
+  // After dispatch, query GitHub for the latest run matching this job
+  const owner = env.GH_OWNER || GH_OWNER_DEF;
+  const repo = env.GH_REPO || GH_REPO_DEF;
+  const token = env.GH_TOKEN || '';
+  if (!token) return null;
+  
+  const url = \`https://api.github.com/repos/\${owner}/\${repo}/actions/runs?event=workflow_dispatch&per_page=5\`;
+  try {
+    const resp = await fetch(url, {
+      headers: {
+        'Accept': 'application/vnd.github.v3+json',
+        'Authorization': \`Bearer \${token}\`,
+        'User-Agent': 'bilibili-ai-summary-worker/1.0',
+      },
+    });
+    if (!resp.ok) return null;
+    const data = await resp.json();
+    const runs = data.workflow_runs || [];
+    if (runs.length > 0) {
+      return runs[0].id;
+    }
+  } catch(e) {
+    console.error('fetchGHRunId error:', e.message);
+  }
+  return null;
+}
+
+async function captureRunId(env, jobId, bvid) {
+  if (!env.BILIBILI_BUCKET || !env.GH_TOKEN) return;
+  const runId = await fetchGHRunId(env, bvid, jobId);
+  if (runId) {
+    try {
+      const existing = await env.BILIBILI_BUCKET.get(`pending/${jobId}.json`);
+      if (existing) {
+        const jobData = await existing.json();
+        jobData.run_id = runId;
+        await env.BILIBILI_BUCKET.put(`pending/${jobId}.json`, JSON.stringify(jobData),
+          { httpMetadata: { contentType: 'application/json' } }
+        );
+        console.log(`run_id ${runId} captured for job ${jobId}`);
+      }
+    } catch(e) {
+      console.error('captureRunId write error:', e.message);
+    }
+  }
+}
+
+async function fetchGHRunStatus(env, runId) {
+  const owner = env.GH_OWNER || GH_OWNER_DEF;
+  const repo = env.GH_REPO || GH_REPO_DEF;
+  const token = env.GH_TOKEN || '';
+  if (!token || !runId) return null;
+  
+  const url = \`https://api.github.com/repos/\${owner}/\${repo}/actions/runs/\${runId}\`;
+  try {
+    const resp = await fetch(url, {
+      headers: {
+        'Accept': 'application/vnd.github.v3+json',
+        'Authorization': \`Bearer \${token}\`,
+        'User-Agent': 'bilibili-ai-summary-worker/1.0',
+      },
+    });
+    if (!resp.ok) return null;
+    return await resp.json();
+  } catch(e) {
+    return null;
+  }
+}
+
+function ghStatusToSteps(ghStatus, ghConclusion) {
+  // Map GitHub Actions status to our progress steps
+  // status: queued, in_progress, completed, waiting
+  // conclusion: null (in progress), success, failure, cancelled
+  const steps = [
+    {name:'任务创建', done:true, active:false, msg:'已提交至处理队列'},
+    {name:'下载视频音频', done:false, active:false, msg:''},
+    {name:'语音转录', done:false, active:false, msg:''},
+    {name:'生成 Markdown', done:false, active:false, msg:''},
+    {name:'LLM 整理总结', done:false, active:false, msg:''},
+    {name:'后处理及文件导出', done:false, active:false, msg:''},
+    {name:'处理完成', done:false, active:false, msg:''},
+  ];
+  
+  if (ghStatus === 'queued') {
+    steps[0].active = true;
+    steps[0].msg = '在队列中等待';
+  } else if (ghStatus === 'in_progress') {
+    steps[1].active = true;
+    steps[1].msg = '正在下载...';
+  } else if (ghStatus === 'completed') {
+    if (ghConclusion === 'success') {
+      steps[6].done = true;
+      steps[6].msg = '✅ 完成';
+    } else {
+      steps[0].done = true;
+      steps[0].msg = '❌ 失败';
+    }
+  }
+  return steps;
+}
 function uuid() { return crypto.randomUUID(); }
 function nowISO() { return new Date().toISOString(); }
 
@@ -73,7 +178,7 @@ async function cleanupExcessResults(R2) {
 // API Handlers
 // ═══════════════════════════════════════════════════════
 
-async function handleSubmit(request, env) {
+async function handleSubmit(request, env, ctx) {
   const body = await request.json();
   const url = body.url;
   const summary_template = body.summary_template || '';
@@ -139,6 +244,9 @@ async function handleSubmit(request, env) {
     }
     
     console.log('GitHub dispatch OK:', ghResp.status);
+    
+    // Capture run_id asynchronously (won't block response)
+    ctx.waitUntil(captureRunId(env, jobId, bvid));
   } catch (err) {
     console.error('GitHub dispatch network error:', err.message);
   }
@@ -189,7 +297,22 @@ async function handleGetJob(request, env, jobId) {
   let raw = await env.BILIBILI_BUCKET.get(`pending/${jobId}.json`);
   if (!raw) raw = await env.BILIBILI_BUCKET.get(`results/${jobId}.json`);
   if (!raw) return errorResponse('任务不存在', 404);
-  return jsonResponse(await raw.json());
+  
+  const job = await raw.json();
+  
+  // If pending job has run_id, enrich with GitHub Actions status
+  if (job.status !== 'completed' && job.run_id) {
+    const ghRun = await fetchGHRunStatus(env, job.run_id);
+    if (ghRun) {
+      job.gh_status = ghRun.status;
+      job.gh_conclusion = ghRun.conclusion;
+      job.gh_html_url = ghRun.html_url;
+      // Map to our steps
+      job.gh_steps = ghStatusToSteps(ghRun.status, ghRun.conclusion);
+    }
+  }
+  
+  return jsonResponse(job);
 }
 
 async function handleDeleteJob(request, env, jobId) {
@@ -298,8 +421,8 @@ function generateFrontendPage() {
 <title>B站AI摘要</title>
 <style>
 *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
-:root{--bg:#f8fafc;--surface:#fff;--border:#e2e8f0;--text:#0f172a;--soft:#475569;--muted:#94a3b8;--brand:#14b8a6;--accent:#0ea5e9;--danger:#ef4444;--success:#22c55e;--radius:12px}
-[data-theme="dark"]{--bg:#0f172a;--surface:#1e293b;--border:#334155;--text:#f1f5f9;--soft:#cbd5e1;--muted:#64748b}
+:root{--bg:#f8fafc;--surface:#fff;--border:#e2e8f0;--text:#0f172a;--soft:#475569;--muted:#94a3b8;--brand:#14b8a6;--accent:#0ea5e9;--danger:#ef4444;--success:#22c55e;--radius:12px;--shadow:0 1px 3px rgba(0,0,0,.06),0 1px 2px rgba(0,0,0,.04);--shadow-lg:0 4px 12px rgba(0,0,0,.08),0 2px 4px rgba(0,0,0,.04);--glass:rgba(255,255,255,.7)}
+[data-theme="dark"]{--bg:#0f172a;--surface:#1e293b;--border:#334155;--text:#f1f5f9;--soft:#cbd5e1;--muted:#64748b;--shadow:0 1px 3px rgba(0,0,0,.2),0 1px 2px rgba(0,0,0,.15);--shadow-lg:0 4px 12px rgba(0,0,0,.3),0 2px 4px rgba(0,0,0,.15);--glass:rgba(30,41,59,.85)}
 body{font-family:-apple-system,'Segoe UI',system-ui,sans-serif;background:var(--bg);color:var(--text);min-height:100vh}
 .app{display:grid;grid-template-columns:380px 1fr;min-height:100vh;max-width:1200px;margin:0 auto}
 @media(max-width:800px){.app{grid-template-columns:1fr}}
@@ -343,9 +466,12 @@ body{font-family:-apple-system,'Segoe UI',system-ui,sans-serif;background:var(--
 .job-item .status.done{background:#dcfce7;color:#166534}
 .job-item .status.fail{background:#fee2e2;color:#991b1b}
 .job-info{flex:1;min-width:0}
-.job-bvid{font-weight:700;font-size:.88rem}
-.job-time{font-size:.78rem;color:var(--muted)}
-.job-title{font-size:.82rem;color:var(--soft);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.job-bvid{font-size:.78rem;color:var(--muted);margin-top:2px}
+.job-time{font-size:.78rem;color:var(--soft)}
+.job-title{font-size:.88rem;font-weight:700;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.job-title a{color:var(--text);text-decoration:none}
+.job-title a:hover{color:var(--accent);text-decoration:underline}
+.job-title .link-icon{font-size:.75rem;margin-left:4px;opacity:.6}
 .job-actions{display:flex;gap:4px;flex-shrink:0}
 /* Detail panel */
 .detail-card{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);padding:20px;margin-bottom:16px}
@@ -365,9 +491,35 @@ body{font-family:-apple-system,'Segoe UI',system-ui,sans-serif;background:var(--
 .mb{margin-bottom:16px}
 .mt{margin-top:12px}
 .gap-sm{gap:6px}
-.tab-bar{display:flex;gap:4px;padding:4px;background:var(--surface);border:1px solid var(--border);border-radius:10px;margin-bottom:16px}
-.tab-btn{flex:1;padding:8px 12px;border:none;border-radius:7px;background:transparent;color:var(--soft);font-size:.8rem;font-weight:600;cursor:pointer;transition:all .2s}
-.tab-btn.active{background:var(--brand);color:#fff;box-shadow:0 2px 6px rgba(20,184,166,.2)}
+
+/* Premium additions */
+.card{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);padding:20px;margin-bottom:16px;box-shadow:var(--shadow);transition:box-shadow .2s,transform .2s}
+.card:hover{box-shadow:var(--shadow-lg);transform:translateY(-1px)}
+.card-header{display:flex;justify-content:space-between;align-items:center;margin-bottom:12px}
+.card-header h3{font-size:.85rem;font-weight:700;color:var(--muted);text-transform:uppercase;letter-spacing:.03em}
+.card-body{font-size:.88rem;line-height:1.7;white-space:pre-wrap;word-break:break-word}
+.glass{background:var(--glass);backdrop-filter:blur(12px);-webkit-backdrop-filter:blur(12px);border:1px solid var(--border)}
+.pill{display:inline-flex;align-items:center;gap:4px;padding:2px 10px;border-radius:20px;font-size:.75rem;font-weight:600}
+.pill-success{background:#dcfce7;color:#166534}
+.pill-warn{background:#fef3c7;color:#92400e}
+.pill-error{background:#fee2e2;color:#991b1b}
+[data-theme="dark"] .pill-success{background:#052e16;color:#86efac}
+[data-theme="dark"] .pill-warn{background:#422006;color:#fbbf24}
+[data-theme="dark"] .pill-error{background:#450a0a;color:#fca5a5}
+.search-box{width:100%;padding:8px 12px 8px 36px;border:1px solid var(--border);border-radius:8px;background:var(--bg);color:var(--text);font-size:.82rem;outline:0;transition:border-color .2s}
+.search-box:focus{border-color:var(--accent);box-shadow:0 0 0 2px rgba(14,165,233,.15)}
+.search-wrap{position:relative;margin-bottom:10px}
+.search-wrap .icon{position:absolute;left:10px;top:50%;transform:translateY(-50%);font-size:.85rem;opacity:.5;pointer-events:none}
+/* Accordion */
+.accordion{border:1px solid var(--border);border-radius:var(--radius);margin-bottom:16px;overflow:hidden}
+.accordion-header{display:flex;align-items:center;gap:10px;padding:14px 16px;cursor:pointer;background:var(--surface);transition:background .15s;user-select:none}
+.accordion-header:hover{background:color-mix(in srgb,var(--border) 15%,var(--surface))}
+.accordion-header .arrow{font-size:.7rem;transition:transform .2s;opacity:.5}
+.accordion-header.open .arrow{transform:rotate(90deg)}
+.accordion-header .label{font-size:.85rem;font-weight:600}
+.accordion-header .status-icon{font-size:.9rem}
+.accordion-body{padding:16px;border-top:1px solid var(--border);background:var(--bg)}
+.accordion-body.hidden{display:none}
 </style>
 </head>
 <body>
@@ -425,9 +577,16 @@ body{font-family:-apple-system,'Segoe UI',system-ui,sans-serif;background:var(--
     <div style="margin-top:20px;padding-top:16px;border-top:1px solid var(--border)">
       <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
         <span style="font-size:.82rem;font-weight:700;color:var(--soft)">📋 历史记录</span>
-        <span id="countBadge" class="badge"></span>
+        <div class="flex" style="gap:4px">
+          <button class="btn btn-sm btn-outline" onclick="clearAllJobs()" style="font-size:.75rem;padding:4px 10px" title="清除全部">🗑 全部</button>
+          <span id="countBadge" class="badge"></span>
+        </div>
       </div>
-      <div id="historyList" style="max-height:400px;overflow-y:auto"></div>
+      <div class="search-wrap">
+        <span class="icon">🔍</span>
+        <input class="search-box" id="searchInput" type="text" placeholder="搜索标题或BV号…" oninput="renderList()" />
+      </div>
+      <div id="historyList" style="max-height:360px;overflow-y:auto"></div>
     </div>
   </div>
 
@@ -441,61 +600,55 @@ body{font-family:-apple-system,'Segoe UI',system-ui,sans-serif;background:var(--
 
     <!-- Job Detail (hidden initially) -->
     <div id="detailView" class="hidden" style="width:100%">
-      <div class="tab-bar">
-        <button class="tab-btn active" data-tab="progress" onclick="switchDetailTab('progress')">📊 进度</button>
-        <button class="tab-btn" data-tab="transcript" onclick="switchDetailTab('transcript')">📝 转录文本</button>
-        <button class="tab-btn" data-tab="summary" onclick="switchDetailTab('summary')">🤖 AI 总结</button>
-        <button class="tab-btn" data-tab="email" onclick="switchDetailTab('email')">📧 邮件预览</button>
-      </div>
+      <!-- Progress (always visible) -->
+      <div class="progress" id="progressSteps"></div>
 
-      <!-- Progress Tab -->
-      <div id="dt-progress" class="tab-content">
-        <div class="progress" id="progressSteps"></div>
-      </div>
-
-      <!-- Transcript Tab -->
-      <div id="dt-transcript" class="tab-content hidden">
-        <div class="detail-card">
-          <div class="flex" style="justify-content:space-between">
-            <h3>转录文本</h3>
-            <div class="flex gap-sm">
-              <button class="btn btn-sm btn-outline" onclick="downloadTranscript()">⬇ 下载</button>
-              <button class="btn btn-sm btn-outline" onclick="copyTranscript()">📋 复制</button>
-            </div>
-          </div>
-          <div class="content" id="transcriptContent">加载中…</div>
+      <!-- Accordion: Transcript -->
+      <div class="accordion">
+        <div class="accordion-header open" onclick="toggleAccordion(this)">
+          <span class="arrow">▶</span>
+          <span class="status-icon">📝</span>
+          <span class="label">转录文本</span>
+          <span style="flex:1"></span>
+          <button class="btn btn-sm btn-outline" onclick="event.stopPropagation();downloadTranscript()">⬇ 下载</button>
+          <button class="btn btn-sm btn-outline" onclick="event.stopPropagation();copyTranscript()">📋 复制</button>
+        </div>
+        <div class="accordion-body">
+          <div class="card-body" id="transcriptContent">加载中…</div>
         </div>
       </div>
 
-      <!-- Summary Tab -->
-      <div id="dt-summary" class="tab-content hidden">
-        <div class="detail-card">
-          <div class="flex" style="justify-content:space-between">
-            <h3>AI 总结</h3>
-            <div class="flex gap-sm">
-              <button class="btn btn-sm btn-outline" onclick="downloadSummary()">⬇ 下载</button>
-              <button class="btn btn-sm btn-outline" onclick="copySummary()">📋 复制</button>
-            </div>
-          </div>
-          <div class="content" id="summaryContent" style="min-height:200px;padding:12px;border:1px solid var(--border);border-radius:8px;background:var(--bg)">暂无总结内容</div>
-          <textarea id="summaryEditor" oninput="saveSummary()" placeholder="手动编辑总结内容…" style="display:none;width:100%;min-height:120px;padding:10px;border:1px solid var(--border);border-radius:8px;background:var(--bg);color:var(--text);font-size:.85rem;line-height:1.6;resize:vertical;outline:0;font-family:inherit"></textarea>
-          <div class="flex mt">
-            <button class="btn btn-sm btn-outline" onclick="toggleSummaryEdit()">✏️ 编辑</button>
-            <button class="btn btn-sm btn-primary" onclick="saveSummary()" style="display:none" id="summarySaveBtn">💾 保存</button>
-            <span style="font-size:.78rem;color:var(--muted);margin-left:8px" id="summarySavedHint"></span>
-          </div>
+      <!-- Accordion: AI Summary -->
+      <div class="accordion">
+        <div class="accordion-header open" onclick="toggleAccordion(this)">
+          <span class="arrow">▶</span>
+          <span class="status-icon">🤖</span>
+          <span class="label">AI 总结</span>
+          <span style="flex:1"></span>
+          <button class="btn btn-sm btn-outline" onclick="event.stopPropagation();downloadSummary()">⬇ 下载</button>
+          <button class="btn btn-sm btn-outline" onclick="event.stopPropagation();copySummary()">📋 复制</button>
+          <button class="btn btn-sm btn-outline" onclick="event.stopPropagation();toggleSummaryEdit()">✏️ 编辑</button>
+          <button class="btn btn-sm btn-primary" onclick="event.stopPropagation();saveSummary()" style="display:none" id="summarySaveBtn">💾 保存</button>
+        </div>
+        <div class="accordion-body">
+          <div class="card-body" id="summaryContent" style="min-height:120px;padding:12px;border:1px solid var(--border);border-radius:8px;background:var(--bg)">暂无总结内容</div>
+          <textarea id="summaryEditor" oninput="saveSummary()" placeholder="手动编辑总结内容…" style="display:none;width:100%;min-height:120px;padding:10px;border:1px solid var(--border);border-radius:8px;background:var(--bg);color:var(--text);font-size:.85rem;line-height:1.6;resize:vertical;outline:0;font-family:inherit;margin-top:8px"></textarea>
+          <span style="font-size:.78rem;color:var(--muted);margin-left:8px" id="summarySavedHint"></span>
         </div>
       </div>
 
-      <!-- Email Preview Tab -->
-      <div id="dt-email" class="tab-content hidden">
-        <div class="detail-card">
-          <h3>HTML 邮件预览</h3>
-          <div class="content" id="emailPreview"></div>
+      <!-- Accordion: Email Preview -->
+      <div class="accordion">
+        <div class="accordion-header" onclick="toggleAccordion(this)">
+          <span class="arrow">▶</span>
+          <span class="status-icon">📧</span>
+          <span class="label">HTML 邮件预览</span>
+        </div>
+        <div class="accordion-body hidden">
+          <div class="card-body" id="emailPreview"></div>
         </div>
       </div>
-    </div>
-  </div>
+    </div>  </div>
 </div>
 
 <script>
@@ -587,14 +740,27 @@ function showStatus(msg, type='') {
 // ═══════════════════════════════════════════════════════
 // Render History List
 // ═══════════════════════════════════════════════════════
+
+function escHtml(s) {
+  if(!s) return '';
+  return s.replace(/&/g,'&amp;').replace(/"/g,'&quot;').replace(/'/g,'&#39;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+}
+
 function renderList() {
   const jobs=getJobs();
   const el=document.getElementById('historyList');
+  const q=(document.getElementById('searchInput')||{}).value||'';
+  const filtered=q ? jobs.filter(j=>{
+    const t=(j.title||'').toLowerCase();
+    const b=(j.bvid||'').toLowerCase();
+    const sq=q.toLowerCase();
+    return t.includes(sq)||b.includes(sq);
+  }) : jobs;
   if(jobs.length===0){
     el.innerHTML='<div style="text-align:center;padding:16px;color:var(--muted);font-size:.82rem">暂无记录</div>';
     return;
   }
-  el.innerHTML=jobs.map(j=>{
+  el.innerHTML=filtered.map(j=>{
     const icon=j.status==='submitted'?'⏳':j.status==='done'?'✅':'❌';
     const cls=j.status==='submitted'?'sub':j.status==='done'?'done':'fail';
     const sel=j.id===selectedJobId?'selected':'';
@@ -602,8 +768,8 @@ function renderList() {
     return \`<div class="job-item \${sel}" onclick="selectJob('\${j.id}')">
       <div class="status \${cls}">\${icon}</div>
       <div class="job-info">
-        <div class="job-bvid">\${j.bvid}</div>
-        <div class="job-title" style="font-size:.78rem;color:var(--soft);white-space:nowrap;overflow:hidden;text-overflow:ellipsis">\${j.title||''}</div>
+        <div class="job-title">\${j.title ? '<a href="https://www.bilibili.com/video/'+j.bvid+'" target="_blank" onclick="event.stopPropagation()">'+escHtml(j.title)+' <span class="link-icon">↗</span></a>' : escHtml(j.bvid)}</div>
+        <div class="job-bvid">\${j.title ? escHtml(j.bvid) : ''}</div>
         <div class="job-time">\${ago}</div>
       </div>
       <div class="job-actions">
@@ -639,7 +805,7 @@ function renderDetail(id) {
 
   // Progress steps
   const pe=document.getElementById('progressSteps');
-  pe.innerHTML=job.steps.map(s=>
+  if(pe) pe.innerHTML=job.steps.map(s=>
     \`<div class="progress-step \${s.done?'done':''} \${s.active?'active':''}">
       <div class="icon">\${s.done?'✅':s.active?'🔄':'⏳'}</div>
       <div class="step-label">\${s.name}</div>
@@ -648,39 +814,33 @@ function renderDetail(id) {
   ).join('');
 
   // Transcript
-  document.getElementById('transcriptContent').textContent=job.transcript||'（暂无转录内容，收到邮件后可手动添加）';
+  const tc=document.getElementById('transcriptContent');
+  if(tc) tc.textContent=job.transcript||'（暂无转录内容，收到邮件后可手动添加）';
 
   // Summary — content view + editor sync
   const sumContent=document.getElementById('summaryContent');
   const sumEditor=document.getElementById('summaryEditor');
-  const editBtn=document.querySelector('button[onclick="toggleSummaryEdit()"]');
   const saveBtn=document.getElementById('summarySaveBtn');
   if(sumContent){sumContent.style.display='block';sumContent.textContent=job.summary||'（暂无总结内容，收到邮件后可手动添加）';}
   if(sumEditor){sumEditor.style.display='none';sumEditor.value=job.summary||'';}
-  if(editBtn) editBtn.style.display='inline-block';
   if(saveBtn) saveBtn.style.display='none';
 
   // Email Preview
   const ep=document.getElementById('emailPreview');
-  if(job.summary){
-    ep.innerHTML=buildEmailHTML(job.bvid, job.summary);
-  } else {
-    ep.innerHTML='<div style="color:var(--muted)">暂无总结内容</div>';
+  if(ep){
+    if(job.summary) ep.innerHTML=buildEmailHTML(job.bvid, job.summary);
+    else ep.innerHTML='<div style="color:var(--muted)">暂无总结内容</div>';
   }
-
-  switchDetailTab('progress');
 }
 
 // ═══════════════════════════════════════════════════════
-// Tab Switching
+// Accordion Toggle
 // ═══════════════════════════════════════════════════════
-function switchDetailTab(tab) {
-  document.querySelectorAll('#detailView .tab-btn').forEach(b=>{
-    b.classList.toggle('active', b.dataset.tab===tab);
-  });
-  document.querySelectorAll('#detailView .tab-content').forEach(el=>{
-    el.classList.toggle('hidden', el.id!=='dt-'+tab);
-  });
+function toggleAccordion(header) {
+  const body=header.nextElementSibling;
+  if(!body) return;
+  header.classList.toggle('open');
+  body.classList.toggle('hidden');
 }
 
 // ═══════════════════════════════════════════════════════
@@ -689,13 +849,13 @@ function switchDetailTab(tab) {
 function toggleSummaryEdit() {
   const content=document.getElementById('summaryContent');
   const editor=document.getElementById('summaryEditor');
-  const editBtn=document.querySelector('#detailView button[onclick*="toggleSummaryEdit"]');
+  const editBtns=document.querySelectorAll('button[onclick*="toggleSummaryEdit"]');
   const saveBtn=document.getElementById('summarySaveBtn');
   if(!content||!editor) return;
   const showingContent=content.style.display!=='none';
   content.style.display=showingContent?'none':'block';
   editor.style.display=showingContent?'block':'none';
-  if(editBtn) editBtn.style.display=showingContent?'none':'inline-block';
+  editBtns.forEach(b=>b.style.display=showingContent?'none':'inline-block');
   if(saveBtn) saveBtn.style.display=showingContent?'inline-block':'none';
   if(showingContent) editor.focus();
 }
@@ -735,14 +895,27 @@ async function pollJobStatus(jobId) {
     const resp = await fetch('/api/jobs/' + jobId);
     if(!resp.ok) return;
     const r2job = await resp.json();
-    if(r2job.status !== 'completed' && r2job.status !== 'failed') return;
     
-    // R2 has a completed/failed result — update local storage
     const jobs = getJobs();
     const idx = jobs.findIndex(j => j.id === jobId);
     if(idx === -1) return;
     
     const job = jobs[idx];
+    
+    // If still pending but has gh_status, update steps in real-time
+    if(r2job.status !== 'completed' && r2job.status !== 'failed') {
+      if(r2job.gh_steps) {
+        job.steps = r2job.gh_steps;
+      }
+      if(r2job.gh_html_url) {
+        job.gh_html_url = r2job.gh_html_url;
+      }
+      saveJobs(jobs);
+      if(selectedJobId === jobId) renderDetail(jobId);
+      return;
+    }
+    
+    // R2 has a completed/failed result — update local storage
     job.status = r2job.status === 'completed' ? 'done' : 'failed';
     job.title = r2job.title || job.title;
     job.summary = r2job.summary || job.summary;
@@ -752,13 +925,12 @@ async function pollJobStatus(jobId) {
     
     // Mark all steps as done with timing info
     const timings = r2job.timings || {};
-    const totalTime = timings.total ? formatTime(timings.total) : '';
     job.steps = job.steps.map((s, i) => {
-      let timing = '';
-      if (i === 1 && timings.stt) timing = formatTime(timings.stt);
-      else if (i === 4 && timings.summary) timing = formatTime(timings.summary);
-      else if (i === 6 && timings.total) timing = formatTime(timings.total);
-      return {...s, done: true, active: false, msg: timing || '✅ 完成'};
+      let msg = '';
+      if (i === 1 && timings.stt) msg = formatTime(timings.stt);
+      else if (i === 4 && timings.summary) msg = formatTime(timings.summary);
+      else if (i === 6 && timings.total) msg = formatTime(timings.total);
+      return {...s, done: true, active: false, msg: msg || '✅ 完成'};
     });
     
     saveJobs(jobs);
@@ -774,7 +946,7 @@ async function pollJobStatus(jobId) {
       delete pollingTimers[jobId];
     }
   } catch(e) {
-    // Silently fail — network may be unavailable
+    // Silently fail
   }
 }
 
@@ -820,6 +992,16 @@ function deleteJob(id) {
   }
 }
 
+function clearAllJobs() {
+  if(!confirm('确定清除所有历史记录？此操作不可撤销！')) return;
+  localStorage.removeItem(LS_JOBS);
+  selectedJobId=null;
+  document.getElementById('emptyState').classList.remove('hidden');
+  document.getElementById('detailView').classList.add('hidden');
+  renderList();
+  updateBadge();
+}
+
 // ═══════════════════════════════════════════════════════
 // Save frontend keys
 // ═══════════════════════════════════════════════════════
@@ -856,14 +1038,16 @@ document.getElementById('summaryTemplateInput').addEventListener('input', functi
 // HTML Email Builder
 // ═══════════════════════════════════════════════════════
 function buildEmailHTML(bvid, summary) {
-  const html=summary.replace(/\\n/g, '<br>');
-  return \`<div style="font-family:sans-serif;max-width:600px;margin:0 auto;padding:20px">
-<div style="background:linear-gradient(135deg,#14b8a6,#0ea5e9);color:white;padding:24px;border-radius:12px;margin-bottom:20px">
-<h2 style="margin:0">🎬 B站视频摘要</h2>
-<p style="margin:8px 0 0;opacity:.9">\${bvid}</p>
+  const html=summary.replace(/\n/g, '<br>');
+  return \`<div style="font-family:-apple-system,'Segoe UI',sans-serif;max-width:600px;margin:0 auto;padding:24px;background:#f8fafc;border-radius:16px">
+<div style="background:linear-gradient(135deg,#0d9488,#0891b2);color:white;padding:28px 24px;border-radius:12px;margin-bottom:24px;box-shadow:0 4px 12px rgba(13,148,136,.2)">
+<div style="font-size:2rem;margin-bottom:8px">🎬</div>
+<h2 style="margin:0;font-size:1.3rem;font-weight:800">B站视频摘要</h2>
+<p style="margin:6px 0 0;opacity:.85;font-size:.9rem">\${bvid}</p>
+<a href="https://www.bilibili.com/video/\${bvid}" style="display:inline-block;margin-top:12px;padding:8px 20px;background:rgba(255,255,255,.2);border-radius:8px;color:white;text-decoration:none;font-weight:600;font-size:.85rem">🔗 前往B站观看 →</a>
 </div>
-<div style="border-left:4px solid #14b8a6;padding-left:16px;line-height:1.7">\${html}</div>
-<p style="margin-top:20px"><a href="https://www.bilibili.com/video/\${bvid}" style="color:#14b8a6;font-weight:bold">🔗 在B站观看</a></p>
+<div style="background:white;border-radius:12px;padding:24px;box-shadow:0 1px 3px rgba(0,0,0,.06);line-height:1.8;font-size:.95rem;color:#334155">\${html}</div>
+<p style="margin-top:20px;text-align:center;font-size:.8rem;color:#94a3b8">由 B站AI摘要 自动生成</p>
 </div>\`;
 }
 
@@ -915,7 +1099,7 @@ export default {
     const path = url.pathname;
 
     try {
-      if (path === '/api/submit' && request.method === 'POST') return await handleSubmit(request, env);
+      if (path === '/api/submit' && request.method === 'POST') return await handleSubmit(request, env, ctx);
       if (path === '/api/jobs' && request.method === 'GET') return await handleListJobs(request, env);
       if (path.startsWith('/api/jobs/') && request.method === 'GET') return await handleGetJob(request, env, path.replace('/api/jobs/', ''));
       if (path.startsWith('/api/jobs/') && request.method === 'DELETE') return await handleDeleteJob(request, env, path.replace('/api/jobs/', ''));
