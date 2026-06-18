@@ -25,7 +25,7 @@ from audio_transcriber import get_text_from_audio
 from summarizer import summarize_subtitle
 
 
-def process(bvid: str, job_id: str = "") -> dict:
+def process(bvid: str, job_id: str = "", summary_template: str = "") -> dict:
     """处理单条视频，返回结果字典"""
     result = {
         "bvid": bvid,
@@ -33,6 +33,7 @@ def process(bvid: str, job_id: str = "") -> dict:
         "title": "",
         "status": "completed",
         "summary": None,
+        "transcript": "",
         "error": "",
         "video_url": f"https://www.bilibili.com/video/{bvid}",
     }
@@ -50,12 +51,18 @@ def process(bvid: str, job_id: str = "") -> dict:
         result["error"] = "语音识别失败"
         return result
 
-    # Step 2: AI 总结
+    result["transcript"] = audio_text
+
+    # Step 2: AI 总结（带自定义模板）
+    template = summary_template or ""
+    if template:
+        print(f"[处理] 使用自定义总结模板", file=sys.stderr)
     summary = summarize_subtitle(
         audio_text,
         video_title=bvid,
         api_key=SILICONFLOW_API_KEY,
         model=SILICONFLOW_SUMMARY_MODEL,
+        custom_template=template,
     )
     result["summary"] = summary or "（AI总结失败，仅完成语音识别）"
 
@@ -107,9 +114,12 @@ def main():
     parser.add_argument("--r2-key", help="R2 Access Key ID", default="")
     parser.add_argument("--r2-secret", help="R2 Secret Access Key", default="")
     parser.add_argument("--r2-bucket", help="R2 Bucket 名称", default="")
+    parser.add_argument("--summary-template", help="自定义总结模板（含 {content} 占位符）", default="")
 
     args = parser.parse_args()
-    result = process(args.bvid, job_id=args.job_id)
+    # 优先使用 --summary-template 参数，否则回退到环境变量
+    summary_template = args.summary_template or os.environ.get("SUMMARY_TEMPLATE", "")
+    result = process(args.bvid, job_id=args.job_id, summary_template=summary_template)
 
     # 仅在 R2 真正配置时上传 (忽略占位值)
     if args.upload_r2 and args.r2_endpoint and args.r2_key and "placeholder" not in args.r2_key:

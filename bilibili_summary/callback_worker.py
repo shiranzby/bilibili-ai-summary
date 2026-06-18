@@ -20,6 +20,7 @@ def callback(result_file: str, job_id: str, worker_url: str):
         "bvid": data.get("bvid", ""),
         "status": data.get("status", "completed"),
         "summary": data.get("summary", ""),
+        "transcript": data.get("transcript", ""),
         "title": data.get("title", ""),
     })
 

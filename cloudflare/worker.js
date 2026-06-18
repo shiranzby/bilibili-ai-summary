@@ -74,7 +74,9 @@ async function cleanupExcessResults(R2) {
 // ═══════════════════════════════════════════════════════
 
 async function handleSubmit(request, env) {
-  const { url } = await request.json();
+  const body = await request.json();
+  const url = body.url;
+  const summary_template = body.summary_template || '';
   if (!url || typeof url !== 'string') {
     return errorResponse('请提供 B站视频 URL 或 BV 号');
   }
@@ -105,6 +107,10 @@ async function handleSubmit(request, env) {
   const GH_REPO = env.GH_REPO || 'bilibili-ai-summary';
   const dispatchUrl = `https://api.github.com/repos/${GH_OWNER}/${GH_REPO}/actions/workflows/summary.yml/dispatches`;
   
+  // 只在 summary_template 非空时传，避免旧版 workflow 不认识的 input 导致 422
+  const inputs = { bvid, job_id: jobId };
+  if (summary_template) inputs.summary_template = summary_template;
+
   try {
     const ghResp = await fetch(dispatchUrl, {
       method: 'POST',
@@ -114,7 +120,7 @@ async function handleSubmit(request, env) {
         'Content-Type': 'application/json',
         'User-Agent': 'bilibili-ai-summary-worker/1.0',
       },
-      body: JSON.stringify({ ref: env.GH_REF || 'main', inputs: { bvid, job_id: jobId } }),
+      body: JSON.stringify({ ref: env.GH_REF || 'main', inputs }),
     });
     
     if (ghResp.status !== 204 && ghResp.status !== 201 && ghResp.status !== 200) {
@@ -202,14 +208,14 @@ async function handleDeleteJob(request, env, jobId) {
 }
 
 async function handleCallback(request, env) {
-  // GHA 跑完后回调: POST { job_id, bvid, status, summary, title }
+  // GHA 跑完后回调: POST { job_id, bvid, status, summary, transcript, title }
   // 删除 pending 标记 → 写入 results/{job_id}.json
   if (!env.BILIBILI_BUCKET) {
     return errorResponse('R2 未配置', 503);
   }
   
   const body = await request.json();
-  const { job_id, bvid, status, summary, title } = body;
+  const { job_id, bvid, status, summary, transcript, title } = body;
   
   if (!job_id || !bvid) {
     return errorResponse('缺少 job_id 或 bvid', 400);
@@ -226,6 +232,7 @@ async function handleCallback(request, env) {
   const result = {
     id: job_id, bvid, status: status || 'completed',
     summary: summary || null,
+    transcript: transcript || '',
     title: title || '',
     completed_at: now,
     video_url: `https://www.bilibili.com/video/${bvid}`,
@@ -402,6 +409,10 @@ body{font-family:-apple-system,'Segoe UI',system-ui,sans-serif;background:var(--
             <option value="Pro/Qwen/Qwen3-8B">Qwen3-8B (Pro)</option>
           </select>
         </div>
+        <div class="form-group">
+          <label>自定义总结模板（可选）</label>
+          <textarea id="summaryTemplateInput" rows="4" style="width:100%;padding:8px 10px;border:1px solid var(--border);border-radius:8px;background:var(--bg);color:var(--text);font-size:.82rem;line-height:1.5;resize:vertical;outline:0;font-family:inherit" placeholder="留空使用默认模板&#10;填入模板后，{content} 会被替换为字幕文本"></textarea>
+        </div>
       </div>
     </details>
 
@@ -526,6 +537,7 @@ async function submitJob() {
     if(keys.apiKey) payload.api_key=keys.apiKey;
     if(keys.sttModel && keys.sttModel!=='FunAudioLLM/SenseVoiceSmall') payload.stt_model=keys.sttModel;
     if(keys.summaryModel && keys.summaryModel!=='Qwen/Qwen3-8B') payload.summary_model=keys.summaryModel;
+    if(keys.summaryTemplate) payload.summary_template=keys.summaryTemplate;
 
     const resp=await fetch('/api/submit',{
       method:'POST', headers:{'Content-Type':'application/json'},
@@ -540,17 +552,20 @@ async function submitJob() {
       created_at:new Date().toISOString(), updated_at:new Date().toISOString(),
       title:'', transcript:'', summary:'', error:'',
       steps:[
-        {name:'提交任务', done:true, active:false, msg:'已提交至处理队列'},
-        {name:'下载音频', done:false, active:false, msg:'等待处理…'},
-        {name:'语音转文字', done:false, active:false, msg:''},
-        {name:'AI 总结', done:false, active:false, msg:''},
-        {name:'邮件通知', done:false, active:false, msg:''},
+        {name:'任务创建', done:true, active:false, msg:'已提交至处理队列'},
+        {name:'下载视频音频', done:false, active:false, msg:'等待处理…'},
+        {name:'语音转录', done:false, active:false, msg:''},
+        {name:'生成 Markdown', done:false, active:false, msg:''},
+        {name:'LLM 整理总结', done:false, active:false, msg:''},
+        {name:'后处理及文件导出', done:false, active:false, msg:''},
+        {name:'处理完成', done:false, active:false, msg:''},
       ],
     };
     jobs.unshift(job);
     saveJobs(jobs);
     selectJob(job.id);
-    showStatus(\`✅ 已提交: \${data.bvid}，结果将通过邮件发送\`, 'success');
+    startPolling(data.job_id);
+    showStatus(\`✅ 已提交: \${data.bvid}，正在处理…\`, 'success');
     input.value='';
   } catch(err) {
     showStatus('❌ '+err.message, 'error');
@@ -676,6 +691,58 @@ function saveSummary() {
 }
 
 // ═══════════════════════════════════════════════════════
+// Polling: Refresh job status from R2
+// ═══════════════════════════════════════════════════════
+const pollingTimers = {};
+const POLL_INTERVAL = 10000; // 10 seconds
+
+function startPolling(jobId) {
+  if(pollingTimers[jobId]) clearInterval(pollingTimers[jobId]);
+  pollingTimers[jobId] = setInterval(() => pollJobStatus(jobId), POLL_INTERVAL);
+  // Immediate first poll
+  pollJobStatus(jobId);
+}
+
+async function pollJobStatus(jobId) {
+  try {
+    const resp = await fetch('/api/jobs/' + jobId);
+    if(!resp.ok) return;
+    const r2job = await resp.json();
+    if(r2job.status !== 'completed' && r2job.status !== 'failed') return;
+    
+    // R2 has a completed/failed result — update local storage
+    const jobs = getJobs();
+    const idx = jobs.findIndex(j => j.id === jobId);
+    if(idx === -1) return;
+    
+    const job = jobs[idx];
+    job.status = r2job.status === 'completed' ? 'done' : 'failed';
+    job.title = r2job.title || job.title;
+    job.summary = r2job.summary || job.summary;
+    job.transcript = r2job.transcript || job.transcript;
+    job.updated_at = new Date().toISOString();
+    
+    // Mark all steps as done
+    job.steps = job.steps.map(s => ({...s, done: true, active: false}));
+    
+    saveJobs(jobs);
+    
+    // If this job is currently selected, refresh the detail view
+    if(selectedJobId === jobId) {
+      renderDetail(jobId);
+    }
+    
+    // Stop polling for this job
+    if(pollingTimers[jobId]) {
+      clearInterval(pollingTimers[jobId]);
+      delete pollingTimers[jobId];
+    }
+  } catch(e) {
+    // Silently fail — network may be unavailable
+  }
+}
+
+// ═══════════════════════════════════════════════════════
 // Copy & Download
 // ═══════════════════════════════════════════════════════
 function copyTranscript() {
@@ -735,12 +802,18 @@ document.getElementById('summaryModelSelect').addEventListener('change', functio
   keys.summaryModel=this.value;
   saveKeys(keys);
 });
+document.getElementById('summaryTemplateInput').addEventListener('input', function(){
+  const keys=getKeys();
+  keys.summaryTemplate=this.value;
+  saveKeys(keys);
+});
 // Restore saved keys
 (function(){
   const keys=getKeys();
   if(keys.apiKey) document.getElementById('apiKeyInput').value=keys.apiKey;
   if(keys.sttModel) document.getElementById('sttModelSelect').value=keys.sttModel;
   if(keys.summaryModel) document.getElementById('summaryModelSelect').value=keys.summaryModel;
+  if(keys.summaryTemplate) document.getElementById('summaryTemplateInput').value=keys.summaryTemplate;
 })();
 
 // ═══════════════════════════════════════════════════════
@@ -773,6 +846,14 @@ function timeAgo(iso) {
 // Init
 renderList();
 updateBadge();
+
+// Resume polling for any submitted jobs
+const existingJobs = getJobs();
+existingJobs.forEach(j => {
+  if(j.status === 'submitted' || (j.status === 'pending')) {
+    startPolling(j.id);
+  }
+});
 
 // Check R2
 fetch('/api/stats').then(r=>r.json()).then(d=>{

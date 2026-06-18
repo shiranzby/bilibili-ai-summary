@@ -14,7 +14,15 @@ except ImportError:
     OpenAI = None
 
 
-def _build_summary_prompt(subtitle_text: str, video_title: str = "") -> tuple:
+def _build_summary_prompt(subtitle_text: str, video_title: str = "", custom_template: str = "") -> tuple:
+    if custom_template:
+        # 使用自定义模板，{content} 替换为字幕文本
+        user_prompt = custom_template.replace("{content}", subtitle_text)
+        system_prompt = "你是一个专业的视频内容分析师。请严格按照用户指定的模板处理转录文本。"
+        if len(user_prompt) > 15000:
+            user_prompt = user_prompt[:15000] + "\n\n[注意: 内容过长已被截断]"
+        return system_prompt, user_prompt
+
     title_info = f"（视频标题: {video_title}）" if video_title else ""
 
     system_prompt = f"""你是一个专业的视频内容分析师。你的任务是根据视频字幕文本，提取视频的核心内容和关键信息。
@@ -44,6 +52,7 @@ def _call_siliconflow(
     model: str,
     subtitle_text: str,
     video_title: str = "",
+    custom_template: str = "",
 ) -> Optional[str]:
     if not api_key:
         print("    [AI总结] ❌ 未设置 SILICONFLOW_API_KEY")
@@ -55,7 +64,7 @@ def _call_siliconflow(
         print("    [AI总结] 请先安装 openai 库: pip install openai")
         return None
 
-    system_prompt, user_prompt = _build_summary_prompt(subtitle_text, video_title)
+    system_prompt, user_prompt = _build_summary_prompt(subtitle_text, video_title, custom_template)
     try:
         client = OpenAI(api_key=api_key, base_url="https://api.siliconflow.cn/v1")
         response = client.chat.completions.create(
@@ -77,6 +86,7 @@ def summarize_subtitle(
     video_title: str = "",
     api_key: str = "",
     model: str = "Qwen/Qwen3-8B",
+    custom_template: str = "",
 ) -> Optional[str]:
     """
     使用硅基流动对视频字幕进行 AI 总结。
@@ -86,7 +96,8 @@ def summarize_subtitle(
         video_title: 视频标题 (可选，用于提示)
         api_key: 硅基流动 API Key
         model: 模型名 (默认 Qwen/Qwen3-8B)
+        custom_template: 自定义总结模板（含 {content} 占位符）
 
     返回: 总结文本或 None
     """
-    return _call_siliconflow(api_key, model, subtitle_text, video_title)
+    return _call_siliconflow(api_key, model, subtitle_text, video_title, custom_template)

@@ -1,1 +1,4 @@
 cloudflare/.wrangler/
+.wrangler/
+__pycache__/
+*.pyc

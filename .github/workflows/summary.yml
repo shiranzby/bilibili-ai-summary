@@ -18,6 +18,11 @@ on:
         description: '任务 ID (可选)'
         required: false
         type: string
+      summary_template:
+        description: '自定义总结模板 (可选)'
+        required: false
+        default: ''
+        type: string
 
 permissions:
   contents: write
@@ -101,6 +106,7 @@ jobs:
         id: process
         env:
           BVID: ${{ inputs.bvid }}
+          SUMMARY_TEMPLATE: ${{ inputs.summary_template }}
         run: |
           cd bilibili_summary
           python process_single.py "$BVID" --job-id "${{ inputs.job_id }}"
