@@ -128,10 +128,10 @@ def main():
     # 输出 JSON 到文件 (供后续步骤使用)
     with open("result.json", "w", encoding="utf-8") as f:
         json.dump(result, f, ensure_ascii=False)
-    # 同时在 stdout 打印摘要
-    s = result.get("summary", "")
-    if s:
-        print(f"[处理] ✅ AI总结完成 ({"s[:60]"}...)", file=sys.stderr)
+    # 在 stderr 打印简短确认
+    summary = result.get("summary", "")
+    if summary:
+        print(f"[处理] ✅ AI总结完成 ({summary[:60]}...)", file=sys.stderr)
 
 
 if __name__ == "__main__":
