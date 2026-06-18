@@ -26,9 +26,6 @@ env:
   PYTHONUNBUFFERED: 1
 
 jobs:
-  # -----------------------------------------------------------
-  # 自动监控 (定时触发 或 无输入的手动触发)
-  # -----------------------------------------------------------
   monitor:
     if: ${{ inputs.bvid == '' || inputs.bvid == null }}
     name: UP主监控
@@ -41,12 +38,10 @@ jobs:
           python-version: '3.10'
           cache: 'pip'
           cache-dependency-path: bilibili_summary/requirements.txt
-
       - name: 安装依赖
         run: |
           pip install -r bilibili_summary/requirements.txt
           sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg yt-dlp
-
       - name: 注入配置
         env:
           SILICONFLOW_API_KEY: ${{ secrets.SILICONFLOW_API_KEY }}
@@ -54,13 +49,11 @@ jobs:
           SMTP_PASS: ${{ secrets.SMTP_PASS }}
           SMTP_TO: ${{ secrets.SMTP_TO }}
         run: python bilibili_summary/inject_config.py
-
       - name: 运行监控
         run: |
           cd bilibili_summary
           [ ! -f state.json ] && echo '{"processed":{}}' > state.json
-          python monitor.py
-
+          python monitor.py 2>&1
       - name: 保存状态
         if: success() || failure()
         run: |
@@ -75,10 +68,6 @@ jobs:
           else
             echo "state.json unchanged, skip"
           fi
-
-  # -----------------------------------------------------------
-  # 单条处理 (通过 Worker API 触发)
-  # -----------------------------------------------------------
   process_single:
     if: ${{ inputs.bvid != '' && inputs.bvid != null }}
     name: 处理单条视频
@@ -91,36 +80,37 @@ jobs:
           python-version: '3.10'
           cache: 'pip'
           cache-dependency-path: bilibili_summary/requirements.txt
-
       - name: 安装依赖
         run: |
           pip install -r bilibili_summary/requirements.txt
           sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg yt-dlp
-
       - name: 注入配置
         env:
           SILICONFLOW_API_KEY: ${{ secrets.SILICONFLOW_API_KEY }}
+          SILICONFLOW_STT_MODEL: ${{ secrets.SILICONFLOW_STT_MODEL || 'FunAudioLLM/SenseVoiceSmall' }}
+          SILICONFLOW_SUMMARY_MODEL: ${{ secrets.SILICONFLOW_SUMMARY_MODEL || 'Qwen/Qwen3-8B' }}
+          SMTP_USER: ${{ secrets.SMTP_USER }}
+          SMTP_PASS: ${{ secrets.SMTP_PASS }}
+          SMTP_TO: ${{ secrets.SMTP_TO }}
         run: python bilibili_summary/inject_config.py
-
       - name: 处理视频 (音频 -> 语音识别 -> AI总结)
         id: process
         env:
           BVID: ${{ inputs.bvid }}
         run: |
           cd bilibili_summary
-          python process_single.py "$BVID" --job-id "${{ inputs.job_id }}" > result.json
-
+          python process_single.py "$BVID" --job-id "${{ inputs.job_id }}" > result.json 2>&1
       - name: 发送邮件通知
+        if: success() || failure()
         env:
           SMTP_USER: ${{ secrets.SMTP_USER }}
           SMTP_PASS: ${{ secrets.SMTP_PASS }}
           SMTP_TO: ${{ secrets.SMTP_TO }}
         run: |
           cd bilibili_summary
-          python send_result_email.py result.json
-
+          python send_result_email.py result.json 2>&1 || echo "[邮件] 发送失败（非致命）"
       - name: 回调 Worker (写回 R2)
-        if: ${{ inputs.job_id != '' && inputs.job_id != null }}
+        if: ${{ always() && inputs.job_id != '' && inputs.job_id != null }}
         run: |
           cd bilibili_summary
-          python callback_worker.py result.json "${{ inputs.job_id }}" "https://bilibili-ai-summary-api.shy2958779577.workers.dev"
+          python callback_worker.py result.json "${{ inputs.job_id }}" "https://bilibili-ai-summary-api.shy2958779577.workers.dev" 2>&1 || echo "[回调] 失败（非致命）"
