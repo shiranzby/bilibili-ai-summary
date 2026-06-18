@@ -215,7 +215,7 @@ async function handleCallback(request, env) {
   }
   
   const body = await request.json();
-  const { job_id, bvid, status, summary, transcript, title } = body;
+  const { job_id, bvid, status, summary, transcript, title, timings } = body;
   
   if (!job_id || !bvid) {
     return errorResponse('缺少 job_id 或 bvid', 400);
@@ -234,6 +234,7 @@ async function handleCallback(request, env) {
     summary: summary || null,
     transcript: transcript || '',
     title: title || '',
+    timings: timings || {},
     completed_at: now,
     video_url: `https://www.bilibili.com/video/${bvid}`,
   };
@@ -349,7 +350,7 @@ body{font-family:-apple-system,'Segoe UI',system-ui,sans-serif;background:var(--
 /* Detail panel */
 .detail-card{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);padding:20px;margin-bottom:16px}
 .detail-card h3{font-size:.85rem;font-weight:700;color:var(--muted);text-transform:uppercase;letter-spacing:.03em;margin-bottom:8px}
-.detail-card .content{font-size:.88rem;line-height:1.7;white-space:pre-wrap;word-break:break-word;max-height:400px;overflow-y:auto}
+.detail-card .content{font-size:.88rem;line-height:1.7;white-space:pre-wrap;word-break:break-word}
 .detail-card textarea{width:100%;min-height:120px;padding:10px;border:1px solid var(--border);border-radius:8px;background:var(--bg);color:var(--text);font-size:.85rem;line-height:1.6;resize:vertical;outline:0;font-family:inherit}
 .detail-card textarea:focus{border-color:var(--accent)}
 .empty{text-align:center;padding:48px 20px;color:var(--muted);font-size:.9rem}
@@ -476,9 +477,11 @@ body{font-family:-apple-system,'Segoe UI',system-ui,sans-serif;background:var(--
               <button class="btn btn-sm btn-outline" onclick="copySummary()">📋 复制</button>
             </div>
           </div>
-          <textarea id="summaryEditor" oninput="saveSummary()" placeholder="总结内容将在这里显示…&#10;&#10;收到邮件后，可以粘贴到这里保存。"></textarea>
+          <div class="content" id="summaryContent" style="min-height:200px;padding:12px;border:1px solid var(--border);border-radius:8px;background:var(--bg)">暂无总结内容</div>
+          <textarea id="summaryEditor" oninput="saveSummary()" placeholder="手动编辑总结内容…" style="display:none;width:100%;min-height:120px;padding:10px;border:1px solid var(--border);border-radius:8px;background:var(--bg);color:var(--text);font-size:.85rem;line-height:1.6;resize:vertical;outline:0;font-family:inherit"></textarea>
           <div class="flex mt">
-            <button class="btn btn-sm btn-primary" onclick="saveSummary()">💾 保存</button>
+            <button class="btn btn-sm btn-outline" onclick="toggleSummaryEdit()">✏️ 编辑</button>
+            <button class="btn btn-sm btn-primary" onclick="saveSummary()" style="display:none" id="summarySaveBtn">💾 保存</button>
             <span style="font-size:.78rem;color:var(--muted);margin-left:8px" id="summarySavedHint"></span>
           </div>
         </div>
@@ -600,6 +603,7 @@ function renderList() {
       <div class="status \${cls}">\${icon}</div>
       <div class="job-info">
         <div class="job-bvid">\${j.bvid}</div>
+        <div class="job-title" style="font-size:.78rem;color:var(--soft);white-space:nowrap;overflow:hidden;text-overflow:ellipsis">\${j.title||''}</div>
         <div class="job-time">\${ago}</div>
       </div>
       <div class="job-actions">
@@ -646,8 +650,15 @@ function renderDetail(id) {
   // Transcript
   document.getElementById('transcriptContent').textContent=job.transcript||'（暂无转录内容，收到邮件后可手动添加）';
 
-  // Summary
-  document.getElementById('summaryEditor').value=job.summary||'';
+  // Summary — content view + editor sync
+  const sumContent=document.getElementById('summaryContent');
+  const sumEditor=document.getElementById('summaryEditor');
+  const editBtn=document.querySelector('button[onclick="toggleSummaryEdit()"]');
+  const saveBtn=document.getElementById('summarySaveBtn');
+  if(sumContent){sumContent.style.display='block';sumContent.textContent=job.summary||'（暂无总结内容，收到邮件后可手动添加）';}
+  if(sumEditor){sumEditor.style.display='none';sumEditor.value=job.summary||'';}
+  if(editBtn) editBtn.style.display='inline-block';
+  if(saveBtn) saveBtn.style.display='none';
 
   // Email Preview
   const ep=document.getElementById('emailPreview');
@@ -673,7 +684,23 @@ function switchDetailTab(tab) {
 }
 
 // ═══════════════════════════════════════════════════════
-// Summary Save
+// Summary Edit Toggle
+// ═══════════════════════════════════════════════════════
+function toggleSummaryEdit() {
+  const content=document.getElementById('summaryContent');
+  const editor=document.getElementById('summaryEditor');
+  const editBtn=document.querySelector('#detailView button[onclick*="toggleSummaryEdit"]');
+  const saveBtn=document.getElementById('summarySaveBtn');
+  if(!content||!editor) return;
+  const showingContent=content.style.display!=='none';
+  content.style.display=showingContent?'none':'block';
+  editor.style.display=showingContent?'block':'none';
+  if(editBtn) editBtn.style.display=showingContent?'none':'inline-block';
+  if(saveBtn) saveBtn.style.display=showingContent?'inline-block':'none';
+  if(showingContent) editor.focus();
+}
+
+// ═══════════════════════════════════════════════════════
 // ═══════════════════════════════════════════════════════
 function saveSummary() {
   const jobs=getJobs();
@@ -720,10 +747,19 @@ async function pollJobStatus(jobId) {
     job.title = r2job.title || job.title;
     job.summary = r2job.summary || job.summary;
     job.transcript = r2job.transcript || job.transcript;
+    job.timings = r2job.timings || {};
     job.updated_at = new Date().toISOString();
     
-    // Mark all steps as done
-    job.steps = job.steps.map(s => ({...s, done: true, active: false}));
+    // Mark all steps as done with timing info
+    const timings = r2job.timings || {};
+    const totalTime = timings.total ? formatTime(timings.total) : '';
+    job.steps = job.steps.map((s, i) => {
+      let timing = '';
+      if (i === 1 && timings.stt) timing = formatTime(timings.stt);
+      else if (i === 4 && timings.summary) timing = formatTime(timings.summary);
+      else if (i === 6 && timings.total) timing = formatTime(timings.total);
+      return {...s, done: true, active: false, msg: timing || '✅ 完成'};
+    });
     
     saveJobs(jobs);
     
@@ -834,6 +870,13 @@ function buildEmailHTML(bvid, summary) {
 // ═══════════════════════════════════════════════════════
 // Utils
 // ═══════════════════════════════════════════════════════
+function formatTime(seconds) {
+  if(!seconds) return '';
+  const m = Math.floor(seconds / 60);
+  const s = Math.round(seconds % 60);
+  return m > 0 ? m + 'min' + s + 's' : s + 's';
+}
+
 function timeAgo(iso) {
   if(!iso) return '';
   const diff=Math.floor((Date.now()-new Date(iso).getTime())/1000);
