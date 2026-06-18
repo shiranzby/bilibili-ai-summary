@@ -1038,7 +1038,7 @@ document.getElementById('summaryTemplateInput').addEventListener('input', functi
 // HTML Email Builder
 // ═══════════════════════════════════════════════════════
 function buildEmailHTML(bvid, summary) {
-  const html=summary.replace(/\n/g, '<br>');
+  const html=summary.replace(/\\n/g, '<br>');
   return \`<div style="font-family:-apple-system,'Segoe UI',sans-serif;max-width:600px;margin:0 auto;padding:24px;background:#f8fafc;border-radius:16px">
 <div style="background:linear-gradient(135deg,#0d9488,#0891b2);color:white;padding:28px 24px;border-radius:12px;margin-bottom:24px;box-shadow:0 4px 12px rgba(13,148,136,.2)">
 <div style="font-size:2rem;margin-bottom:8px">🎬</div>
