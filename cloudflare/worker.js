@@ -101,13 +101,13 @@ function ghStatusToSteps(ghStatus, ghConclusion, startedAt) {
   // status: queued, in_progress, completed, waiting
   // conclusion: null (in progress), success, failure, cancelled
   const steps = [
-    {name:'📋 任务创建', done:true, active:false, msg:'已提交至处理队列'},
-    {name:'⬇️ 下载音频', done:false, active:false, msg:''},
-    {name:'🎙️ 语音转录', done:false, active:false, msg:''},
-    {name:'📝 生成稿文', done:false, active:false, msg:''},
-    {name:'🤖 AI 总结', done:false, active:false, msg:''},
-    {name:'📦 导出文件', done:false, active:false, msg:''},
-    {name:'✅ 完成', done:false, active:false, msg:''},
+    {name:'任务创建', done:true, active:false, msg:'已提交至处理队列'},
+    {name:'下载视频音频', done:false, active:false, msg:''},
+    {name:'语音转录', done:false, active:false, msg:''},
+    {name:'生成 Markdown', done:false, active:false, msg:''},
+    {name:'LLM 整理总结', done:false, active:false, msg:''},
+    {name:'后处理及文件导出', done:false, active:false, msg:''},
+    {name:'处理完成', done:false, active:false, msg:''},
   ];
   
   if (ghStatus === 'queued') {
