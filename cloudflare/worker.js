@@ -200,9 +200,9 @@ async function handleSubmit(request, env, ctx) {
   }
 
   let bvid = url.trim();
-  const bvMatch = bvid.match(/BV[a-zA-Z0-9]{10}/);
+  const bvMatch = bvid.match(/BV[a-zA-Z0-9]{8,12}/);
   if (bvMatch) bvid = bvMatch[0];
-  if (!/^BV[a-zA-Z0-9]{10}$/.test(bvid)) {
+  if (!/^BV[a-zA-Z0-9]{8,12}$/.test(bvid)) {
     return errorResponse('无法解析视频 ID，请输入 B站视频链接或 BV 号');
   }
 
