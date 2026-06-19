@@ -194,14 +194,24 @@ async function handleSubmit(request, env, ctx) {
   const body = await request.json();
   const url = body.url;
   const summary_template = body.summary_template || '';
+  const custom_email = body.email || '';
   if (!url || typeof url !== 'string') {
     return errorResponse('请提供 B站视频 URL 或 BV 号');
   }
 
   let bvid = url.trim();
+  // Extract BV/AV from full URL with Chinese text
   const bvMatch = bvid.match(/BV[a-zA-Z0-9]{8,12}/);
   if (bvMatch) bvid = bvMatch[0];
-  if (!/^BV[a-zA-Z0-9]{8,12}$/.test(bvid)) {
+  else {
+    const avMatch = bvid.match(/[Aa][Vv](\d+)/);
+    if (avMatch) bvid = 'av' + avMatch[1];
+    else {
+      const urlM = bvid.match(/bilibili\.com\/video\/([A-Za-z0-9]+)/i);
+      if (urlM) bvid = urlM[1];
+    }
+  }
+  if (!/^BV[a-zA-Z0-9]{8,12}$/.test(bvid) && !/^av\d+$/i.test(bvid)) {
     return errorResponse('无法解析视频 ID，请输入 B站视频链接或 BV 号');
   }
 
@@ -227,6 +237,7 @@ async function handleSubmit(request, env, ctx) {
   // 只在 summary_template 非空时传，避免旧版 workflow 不认识的 input 导致 422
   const inputs = { bvid, job_id: jobId };
   if (summary_template) inputs.summary_template = summary_template;
+  if (custom_email) inputs.email = custom_email;
 
   try {
     const ghResp = await fetch(dispatchUrl, {
@@ -440,7 +451,19 @@ function generateFrontendPage() {
 body{font-family:-apple-system,'Segoe UI',system-ui,sans-serif;background:var(--bg);color:var(--text);height:100%;overflow:hidden}
 html{height:100%;overflow:hidden}
 .app{display:grid;grid-template-columns:var(--sidebar-w,33%) 4px 1fr;height:100vh;user-select:none}
-@media(max-width:900px){.app{grid-template-columns:1fr}}
+@media(max-width:900px){
+.app{grid-template-columns:1fr;height:auto;min-height:100vh}
+html,body{overflow:auto!important;height:auto!important}
+.sidebar{height:auto;overflow:visible}
+.sidebar-history .history-inner{min-height:260px}
+.main{max-height:none;overflow-y:visible}
+.divider{display:none}
+.back-to-top{display:none!important}
+.detail-body.layout-h .detail-pair{display:block}
+.detail-body.layout-h .detail-pair .detail-panel{width:100%}
+.detail-body.layout-h .pair-divider{display:none}
+.layout-bar{display:none}
+}
 /* Divider — draggable handle */
 .divider{cursor:col-resize;background:var(--border);position:relative;transition:background .15s;flex-shrink:0}
 .divider:hover,.divider:active{background:var(--brand)}
@@ -572,17 +595,13 @@ html{height:100%;overflow:hidden}
 .detail-pair{width:100%}
 .detail-pair .detail-panel{width:100%}
 .pair-divider{display:none}
-/* Layout: h = horizontal side-by-side */
-.detail-body.layout-h .detail-pair{display:flex;gap:16px}
-.detail-body.layout-h .detail-pair .detail-panel{flex:1 1 0;width:0;min-width:200px}
-/* Layout: s = split with draggable divider */
-.detail-body.layout-s .detail-pair{display:flex;gap:0}
-.detail-body.layout-s .detail-pair .detail-panel{flex:1 1 0;width:0;min-width:150px;overflow:hidden}
-.detail-body.layout-s .pair-divider{display:block;width:4px;cursor:col-resize;background:var(--border);border-radius:2px;flex-shrink:0;position:relative;margin:0 6px}
-.detail-body.layout-s .pair-divider:hover,.detail-body.layout-s .pair-divider:active{background:var(--brand)}
-.detail-body.layout-s .pair-divider::after{content:'';position:absolute;left:-4px;right:-4px;top:0;bottom:0}
-/* Adjust accordion in h/s modes */
-.detail-body.layout-h .accordion,.detail-body.layout-s .accordion{margin-bottom:0}
+/* Layout: h = horizontal side-by-side with draggable divider */
+.detail-body.layout-h .detail-pair{display:flex;gap:0}
+.detail-body.layout-h .detail-pair .detail-panel{flex:1 1 0;width:0;min-width:150px;overflow:hidden}
+.detail-body.layout-h .pair-divider{display:block;width:4px;cursor:col-resize;background:var(--border);border-radius:2px;flex-shrink:0;position:relative;margin:0 6px}
+.detail-body.layout-h .pair-divider:hover,.detail-body.layout-h .pair-divider:active{background:var(--brand)}
+.detail-body.layout-h .pair-divider::after{content:'';position:absolute;left:-4px;right:-4px;top:0;bottom:0}
+.detail-body.layout-h .accordion{margin-bottom:0}
 </style>
 </head>
 <body>
@@ -598,9 +617,12 @@ html{height:100%;overflow:hidden}
       </div>
 
       <div class="form-group">
-        <label>B站视频链接或 BV 号</label>
-        <input id="urlInput" type="text" placeholder="bilibili.com/video/BVxxx 或直接输入BV号…"
-          onkeydown="if(event.key==='Enter')submitJob()" />
+        <label>B站视频链接或 BV/AV 号</label>
+        <div style="display:flex;gap:6px">
+        <input id="urlInput" type="text" placeholder="粘贴完整链接或直接输入BV号…"
+          onkeydown="if(event.key==='Enter')submitJob()" style="flex:1" />
+        <button class="btn btn-sm btn-outline" onclick="pasteUrl()" title="从剪贴板粘贴" style="padding:4px 10px;font-size:.9rem">📋</button>
+        </div>
       </div>
 
       <details style="margin-bottom:16px">
@@ -631,6 +653,10 @@ html{height:100%;overflow:hidden}
           <div class="form-group">
             <label>自定义总结模板（可选）</label>
             <textarea id="summaryTemplateInput" rows="4" style="width:100%;padding:8px 10px;border:1px solid var(--border);border-radius:8px;background:var(--bg);color:var(--text);font-size:.82rem;line-height:1.5;resize:vertical;outline:0;font-family:inherit" placeholder="留空使用默认模板&#10;填入模板后，{content} 会被替换为字幕文本"></textarea>
+          </div>
+          <div class="form-group">
+            <label>接收邮箱（可选）</label>
+            <input id="emailInput" type="email" placeholder="留空使用服务端配置的邮箱" />
           </div>
         </div>
       </details>
@@ -678,8 +704,7 @@ html{height:100%;overflow:hidden}
       <div class="layout-bar">
         <span class="lbl">排版:</span>
         <button class="layout-btn active" data-layout="v" onclick="setLayout('v')" title="垂直排版">↕ 垂直</button>
-        <button class="layout-btn" data-layout="h" onclick="setLayout('h')" title="水平并列">↔ 水平</button>
-        <button class="layout-btn" data-layout="s" onclick="setLayout('s')" title="分列可拖拽">⊞ 分列</button>
+        <button class="layout-btn" data-layout="h" onclick="setLayout('h')" title="水平分列（可拖拽）">↔ 水平/分列</button>
       </div>
 
       <div class="detail-body" id="detailBody">
@@ -724,17 +749,6 @@ html{height:100%;overflow:hidden}
         </div>
       </div>
 
-      <!-- Accordion: Email Preview -->
-      <div class="accordion">
-        <div class="accordion-header" onclick="toggleAccordion(this)">
-          <span class="arrow">▶</span>
-          <span class="status-icon">📧</span>
-          <span class="label">HTML 邮件预览</span>
-        </div>
-        <div class="accordion-body hidden">
-          <div class="card-body" id="emailPreview"></div>
-        </div>
-      </div>
     </div>  </div>
 </div>
 
@@ -841,13 +855,75 @@ function setLayout(mode) {
 })();
 
 // ═══════════════════════════════════════════════════════
+// URL extraction — supports av/BV + full URLs with Chinese
+// ═══════════════════════════════════════════════════════
+function extractBvid(raw) {
+  if(!raw) return '';
+  let s=raw.trim();
+  // Try BV number first
+  const bv=s.match(/BV[a-zA-Z0-9]{8,12}/);
+  if(bv) return bv[0];
+  // Try av number — convert to bvid via API
+  const av=s.match(/[Aa][Vv](\d+)/);
+  if(av) return 'av'+av[1];
+  // Try full URL pattern (supports Chinese chars in title)
+  const urlMatch=s.match(/bilibili\\.com\\/video\\/([A-Za-z0-9]+)/i);
+  if(urlMatch) return urlMatch[1];
+  // Finally check if it looks like a plain BV
+  if(/^BV[a-zA-Z0-9]{8,12}$/.test(s)) return s;
+  return s;
+}
+// Paste from clipboard
+async function pasteUrl() {
+  try {
+    const text=await navigator.clipboard.readText();
+    if(text){
+      document.getElementById('urlInput').value=text;
+      console.log('[b2t] pasted:', text.slice(0,60));
+    }
+  } catch(e) {
+    console.warn('[b2t] paste failed:', e.message);
+  }
+}
+// AV → BV conversion
+let avBvCache={};
+async function convertAvToBv(avId) {
+  if(avBvCache[avId]) return avBvCache[avId];
+  try {
+    const resp=await fetch('https://api.bilibili.com/x/web-interface/view?aid='+avId.replace('av',''));
+    if(!resp.ok) return avId;
+    const data=await resp.json();
+    if(data.code===0&&data.data&&data.data.bvid){
+      avBvCache[avId]=data.data.bvid;
+      return data.data.bvid;
+    }
+  } catch(e) {}
+  return avId;
+}
+
+// ═══════════════════════════════════════════════════════
 // Submit
 // ═══════════════════════════════════════════════════════
 async function submitJob() {
   const input=document.getElementById('urlInput');
-  const url=input.value.trim();
+  let url=input.value.trim();
   console.log('[b2t] submitJob:', url);
   if(!url){showStatus('请先输入视频链接','error');return;}
+
+  // Extract and convert
+  url=extractBvid(url);
+  if(!url){showStatus('无法识别视频链接','error');return;}
+  
+  // If av number, try to convert (async)
+  if(url.startsWith('av')){
+    const converted=await convertAvToBv(url);
+    if(converted!==url) console.log('[b2t] av→bv:', url, '→', converted);
+    url=converted;
+  }
+  
+  if(!/^BV[a-zA-Z0-9]{8,12}$/.test(url) && !url.startsWith('av')){
+    showStatus('无法解析视频 ID','error');return;
+  }
 
   const btn=document.getElementById('submitBtn');
   btn.disabled=true; btn.innerHTML='<span class="sp"></span> 提交中…';
@@ -860,6 +936,7 @@ async function submitJob() {
     if(keys.sttModel && keys.sttModel!=='FunAudioLLM/SenseVoiceSmall') payload.stt_model=keys.sttModel;
     if(keys.summaryModel && keys.summaryModel!=='Qwen/Qwen3-8B') payload.summary_model=keys.summaryModel;
     if(keys.summaryTemplate) payload.summary_template=keys.summaryTemplate;
+    if(keys.email) payload.email=keys.email;
 
     const resp=await fetch('/api/submit',{
       method:'POST', headers:{'Content-Type':'application/json'},
@@ -999,13 +1076,6 @@ function renderDetail(id) {
   // Summary — content view only
   const sumContent=document.getElementById('summaryContent');
   if(sumContent){sumContent.textContent=job.summary||'（暂无总结内容，收到邮件后可手动添加）';}
-
-  // Email Preview
-  const ep=document.getElementById('emailPreview');
-  if(ep){
-    if(job.summary) ep.innerHTML=buildEmailHTML(job.bvid, job.summary);
-    else ep.innerHTML='<div style="color:var(--muted)">暂无总结内容</div>';
-  }
 }
 
 // ═══════════════════════════════════════════════════════
@@ -1215,6 +1285,11 @@ document.getElementById('summaryTemplateInput').addEventListener('input', functi
   keys.summaryTemplate=this.value;
   saveKeys(keys);
 });
+document.getElementById('emailInput').addEventListener('change', function(){
+  const keys=getKeys();
+  keys.email=this.value;
+  saveKeys(keys);
+});
 // Restore saved keys
 (function(){
   const keys=getKeys();
@@ -1222,6 +1297,7 @@ document.getElementById('summaryTemplateInput').addEventListener('input', functi
   if(keys.sttModel) document.getElementById('sttModelSelect').value=keys.sttModel;
   if(keys.summaryModel) document.getElementById('summaryModelSelect').value=keys.summaryModel;
   if(keys.summaryTemplate) document.getElementById('summaryTemplateInput').value=keys.summaryTemplate;
+  if(keys.email) document.getElementById('emailInput').value=keys.email;
 })();
 
 // ═══════════════════════════════════════════════════════
