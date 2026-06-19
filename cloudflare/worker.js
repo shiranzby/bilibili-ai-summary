@@ -439,8 +439,12 @@ function generateFrontendPage() {
 [data-theme="dark"]{--bg:#0f172a;--surface:#1e293b;--border:#334155;--text:#f1f5f9;--soft:#cbd5e1;--muted:#64748b;--shadow:0 1px 3px rgba(0,0,0,.2),0 1px 2px rgba(0,0,0,.15);--shadow-lg:0 4px 12px rgba(0,0,0,.3),0 2px 4px rgba(0,0,0,.15);--glass:rgba(30,41,59,.85)}
 body{font-family:-apple-system,'Segoe UI',system-ui,sans-serif;background:var(--bg);color:var(--text);height:100%;overflow:hidden}
 html{height:100%;overflow:hidden}
-.app{display:grid;grid-template-columns:1fr 2fr;height:100vh}
+.app{display:grid;grid-template-columns:var(--sidebar-w,33%) 4px 1fr;height:100vh;user-select:none}
 @media(max-width:900px){.app{grid-template-columns:1fr}}
+/* Divider — draggable handle */
+.divider{cursor:col-resize;background:var(--border);position:relative;transition:background .15s;flex-shrink:0}
+.divider:hover,.divider:active{background:var(--brand)}
+.divider::after{content:'';position:absolute;left:-3px;right:-3px;top:0;bottom:0}
 /* Sidebar — flex fills viewport, history list auto-expands */
 .sidebar{background:var(--surface);border-right:1px solid var(--border);padding:24px 20px;overflow:hidden;display:flex;flex-direction:column}
 .sidebar-top{flex-shrink:0}
@@ -469,16 +473,16 @@ html{height:100%;overflow:hidden}
 .notice{padding:12px 16px;background:#fef3c7;border:1px solid #f59e0b;border-radius:10px;font-size:.82rem;color:#92400e;margin-bottom:16px;line-height:1.6}
 /* Progress — 2-row flex with arrow flow */
 .progress{margin-bottom:16px}
-.progress-row{display:flex;align-items:stretch;margin-bottom:8px}
-.progress-row.r1{justify-content:center}
-.progress-row.r2{justify-content:center}
-.progress-step{display:flex;flex-direction:column;align-items:center;justify-content:center;text-align:center;padding:10px 12px;background:var(--surface);border:1px solid var(--border);border-radius:6px;font-size:.75rem;min-height:52px;flex:1;max-width:200px}
-.progress-step .step-label{font-weight:600;line-height:1.3}
-.progress-step .step-msg{font-size:.7rem;color:var(--muted);margin-top:2px}
+.progress-row{display:flex;align-items:stretch;margin-bottom:8px;width:100%}
+.progress-row.r1{width:100%}
+.progress-row.r2{width:100%}
+.progress-step{display:flex;flex-direction:column;align-items:center;justify-content:center;text-align:center;padding:12px 6px;background:var(--surface);border:1px solid var(--border);border-radius:6px;font-size:.78rem;min-height:56px;flex:1 1 0;width:0}
+.progress-step .step-label{font-weight:600;line-height:1.3;white-space:nowrap}
+.progress-step .step-msg{font-size:.68rem;color:var(--muted);margin-top:3px}
 .progress-step.done{border-color:var(--success);background:#f0fdf4;opacity:.85}
 .progress-step.active{border-color:var(--accent);background:#eff6ff;animation:pulse 2s ease-in-out infinite}
 .progress-step.pending{opacity:.55}
-.arrow-sep{display:flex;align-items:center;justify-content:center;padding:0 4px;color:var(--muted);font-size:1rem;flex-shrink:0;user-select:none}
+.arrow-sep{display:flex;align-items:center;justify-content:center;padding:0 2px;color:var(--muted);font-size:1.5rem;flex-shrink:0;user-select:none;width:20px}
 .arrow-sep.done{color:var(--success)}
 .arrow-sep.active{color:var(--accent)}
 @keyframes pulse{0%,100%{box-shadow:0 0 0 0 rgba(14,165,233,.4)}50%{box-shadow:0 0 0 3px rgba(14,165,233,.1)}}
@@ -557,6 +561,28 @@ html{height:100%;overflow:hidden}
 .accordion-header .status-icon{font-size:.9rem}
 .accordion-body{padding:16px;border-top:1px solid var(--border);background:var(--bg)}
 .accordion-body.hidden{display:none}
+/* Layout toolbar */
+.layout-bar{display:flex;gap:6px;margin-bottom:12px;align-items:center}
+.layout-bar .lbl{font-size:.78rem;color:var(--muted);margin-right:4px}
+.layout-btn{padding:4px 10px;border:1px solid var(--border);border-radius:6px;background:var(--surface);color:var(--soft);font-size:.78rem;cursor:pointer;transition:all .15s;line-height:1.4}
+.layout-btn:hover{border-color:var(--accent);color:var(--accent)}
+.layout-btn.active{background:var(--accent);color:#fff;border-color:var(--accent)}
+/* Layout: detail-pair (transcript + summary) */
+.detail-body{width:100%}
+.detail-pair{width:100%}
+.detail-pair .detail-panel{width:100%}
+.pair-divider{display:none}
+/* Layout: h = horizontal side-by-side */
+.detail-body.layout-h .detail-pair{display:flex;gap:16px}
+.detail-body.layout-h .detail-pair .detail-panel{flex:1 1 0;width:0;min-width:200px}
+/* Layout: s = split with draggable divider */
+.detail-body.layout-s .detail-pair{display:flex;gap:0}
+.detail-body.layout-s .detail-pair .detail-panel{flex:1 1 0;width:0;min-width:150px;overflow:hidden}
+.detail-body.layout-s .pair-divider{display:block;width:4px;cursor:col-resize;background:var(--border);border-radius:2px;flex-shrink:0;position:relative;margin:0 6px}
+.detail-body.layout-s .pair-divider:hover,.detail-body.layout-s .pair-divider:active{background:var(--brand)}
+.detail-body.layout-s .pair-divider::after{content:'';position:absolute;left:-4px;right:-4px;top:0;bottom:0}
+/* Adjust accordion in h/s modes */
+.detail-body.layout-h .accordion,.detail-body.layout-s .accordion{margin-bottom:0}
 </style>
 </head>
 <body>
@@ -634,7 +660,7 @@ html{height:100%;overflow:hidden}
       <div class="history-inner" id="historyList"></div>
     </div>
   </div>
-
+  <div class="divider" id="divider"></div>
   <!-- Main Content -->
   <div class="main" id="mainContent">
     <div class="empty" id="emptyState">
@@ -648,38 +674,53 @@ html{height:100%;overflow:hidden}
       <!-- Progress (always visible) -->
       <div class="progress" id="progressSteps"></div>
 
-      <!-- Accordion: Transcript -->
-      <div class="accordion">
-        <div class="accordion-header open" onclick="toggleAccordion(this)">
-          <span class="arrow">▶</span>
-          <span class="status-icon">📝</span>
-          <span class="label">转录文本</span>
-          <span style="flex:1"></span>
-          <button class="btn btn-sm btn-outline" onclick="event.stopPropagation();downloadTranscript()" title="TXT">⬇ TXT</button>
-          <button class="btn btn-sm btn-outline" onclick="event.stopPropagation();downloadTranscriptMD()" title="Markdown">📄 MD</button>
-          <button class="btn btn-sm btn-outline" onclick="event.stopPropagation();previewTranscript()" title="HTML预览">👁 预览</button>
-          <button class="btn btn-sm btn-outline" onclick="event.stopPropagation();copyTranscript()">📋 复制</button>
-        </div>
-        <div class="accordion-body">
-          <div class="card-body" id="transcriptContent">加载中…</div>
-        </div>
+      <!-- Layout toolbar -->
+      <div class="layout-bar">
+        <span class="lbl">排版:</span>
+        <button class="layout-btn active" data-layout="v" onclick="setLayout('v')" title="垂直排版">↕ 垂直</button>
+        <button class="layout-btn" data-layout="h" onclick="setLayout('h')" title="水平并列">↔ 水平</button>
+        <button class="layout-btn" data-layout="s" onclick="setLayout('s')" title="分列可拖拽">⊞ 分列</button>
       </div>
 
-      <!-- Accordion: AI Summary -->
-      <div class="accordion">
-        <div class="accordion-header open" onclick="toggleAccordion(this)">
-          <span class="arrow">▶</span>
-          <span class="status-icon">🤖</span>
-          <span class="label">AI 总结</span>
-          <span style="flex:1"></span>
-          <button class="btn btn-sm btn-outline" onclick="event.stopPropagation();downloadSummary()" title="Markdown">📄 MD</button>
-          <button class="btn btn-sm btn-outline" onclick="event.stopPropagation();downloadSummaryHTML()" title="Fancy HTML">🌐 HTML</button>
-          <button class="btn btn-sm btn-outline" onclick="event.stopPropagation();previewSummary()" title="打开预览">👁 预览</button>
-          <button class="btn btn-sm btn-outline" onclick="event.stopPropagation();printSummary()" title="打印/导出PDF">🖨 PDF</button>
-          <button class="btn btn-sm btn-outline" onclick="event.stopPropagation();copySummary()">📋 复制</button>
+      <div class="detail-body" id="detailBody">
+      <div class="detail-pair" id="detailPair">
+        <div class="detail-panel" id="transcriptPanel">
+        <!-- Accordion: Transcript -->
+        <div class="accordion">
+          <div class="accordion-header open" onclick="toggleAccordion(this)">
+            <span class="arrow">▶</span>
+            <span class="status-icon">📝</span>
+            <span class="label">转录文本</span>
+            <span style="flex:1"></span>
+            <button class="btn btn-sm btn-outline" onclick="event.stopPropagation();downloadTranscript()" title="TXT">⬇ TXT</button>
+            <button class="btn btn-sm btn-outline" onclick="event.stopPropagation();downloadTranscriptMD()" title="Markdown">📄 MD</button>
+            <button class="btn btn-sm btn-outline" onclick="event.stopPropagation();previewTranscript()" title="HTML预览">👁 预览</button>
+            <button class="btn btn-sm btn-outline" onclick="event.stopPropagation();copyTranscript()">📋 复制</button>
+          </div>
+          <div class="accordion-body">
+            <div class="card-body" id="transcriptContent">加载中…</div>
+          </div>
         </div>
-        <div class="accordion-body">
-          <div class="card-body" id="summaryContent" style="min-height:120px;padding:12px;border:1px solid var(--border);border-radius:8px;background:var(--bg)">暂无总结内容</div>
+        </div>
+        <div class="pair-divider" id="pairDivider"></div>
+        <div class="detail-panel" id="summaryPanel">
+        <!-- Accordion: AI Summary -->
+        <div class="accordion">
+          <div class="accordion-header open" onclick="toggleAccordion(this)">
+            <span class="arrow">▶</span>
+            <span class="status-icon">🤖</span>
+            <span class="label">AI 总结</span>
+            <span style="flex:1"></span>
+            <button class="btn btn-sm btn-outline" onclick="event.stopPropagation();downloadSummary()" title="Markdown">📄 MD</button>
+            <button class="btn btn-sm btn-outline" onclick="event.stopPropagation();downloadSummaryHTML()" title="Fancy HTML">🌐 HTML</button>
+            <button class="btn btn-sm btn-outline" onclick="event.stopPropagation();previewSummary()" title="打开预览">👁 预览</button>
+            <button class="btn btn-sm btn-outline" onclick="event.stopPropagation();printSummary()" title="打印/导出PDF">🖨 PDF</button>
+            <button class="btn btn-sm btn-outline" onclick="event.stopPropagation();copySummary()">📋 复制</button>
+          </div>
+          <div class="accordion-body">
+            <div class="card-body" id="summaryContent" style="min-height:120px;padding:12px;border:1px solid var(--border);border-radius:8px;background:var(--bg)">暂无总结内容</div>
+          </div>
+        </div>
         </div>
       </div>
 
@@ -723,6 +764,81 @@ function toggleTheme() {
   h.setAttribute('data-theme',n); localStorage.setItem('theme',n);
 }
 (function(){const s=localStorage.getItem('theme');if(s)document.documentElement.setAttribute('data-theme',s);})();
+
+// ═══════════════════════════════════════════════════════
+// Draggable Sidebar Divider
+// ═══════════════════════════════════════════════════════
+(function(){
+  const app=document.getElementById('app');
+  const divider=document.getElementById('divider');
+  if(!app||!divider) return;
+  // Restore saved width
+  const saved=localStorage.getItem('b2t_sidebar_w');
+  if(saved) app.style.setProperty('--sidebar-w',saved);
+  let isDragging=false;
+  divider.addEventListener('mousedown',function(e){isDragging=true;e.preventDefault();document.body.style.cursor='col-resize';});
+  document.addEventListener('mousemove',function(e){
+    if(!isDragging) return;
+    const rect=app.getBoundingClientRect();
+    const pct=((e.clientX-rect.left)/rect.width*100).toFixed(1);
+    const sw=Math.max(18,Math.min(55,pct));
+    app.style.setProperty('--sidebar-w',sw+'%');
+  });
+  document.addEventListener('mouseup',function(){
+    if(!isDragging)return;
+    isDragging=false;
+    document.body.style.cursor='';
+    const sw=app.style.getPropertyValue('--sidebar-w');
+    if(sw) localStorage.setItem('b2t_sidebar_w',sw);
+  });
+})();
+
+// ═══════════════════════════════════════════════════════
+// Layout Switch (v/h/s)
+// ═══════════════════════════════════════════════════════
+function setLayout(mode) {
+  console.log('[b2t] setLayout:', mode);
+  const body=document.getElementById('detailBody');
+  if(!body) return;
+  body.className='detail-body layout-'+mode;
+  document.querySelectorAll('.layout-btn').forEach(b=>b.classList.toggle('active',b.dataset.layout===mode));
+  localStorage.setItem('b2t_layout',mode);
+}
+// Restore saved layout
+(function(){
+  const saved=localStorage.getItem('b2t_layout');
+  if(saved) setLayout(saved);
+})();
+// Draggable pair-divider (split mode)
+(function(){
+  const divider=document.getElementById('pairDivider');
+  if(!divider) return;
+  let isDragging=false,startX=0,startLeft=0;
+  const leftPanel=document.getElementById('transcriptPanel');
+  const rightPanel=document.getElementById('summaryPanel');
+  if(!leftPanel||!rightPanel) return;
+  divider.addEventListener('mousedown',function(e){
+    isDragging=true;startX=e.clientX;
+    const pair=document.getElementById('detailPair');
+    if(pair) startLeft=leftPanel.getBoundingClientRect().width;
+    document.body.style.cursor='col-resize';e.preventDefault();
+  });
+  document.addEventListener('mousemove',function(e){
+    if(!isDragging||!leftPanel||!rightPanel) return;
+    const pair=document.getElementById('detailPair');
+    if(!pair) return;
+    const pairW=pair.getBoundingClientRect().width;
+    const dx=e.clientX-startX;
+    let leftPct=((startLeft+dx)/pairW*100);
+    leftPct=Math.max(20,Math.min(80,leftPct));
+    leftPanel.style.flex='0 0 '+leftPct+'%';
+    rightPanel.style.flex='1 1 0';
+  });
+  document.addEventListener('mouseup',function(){
+    if(!isDragging)return;
+    isDragging=false;document.body.style.cursor='';
+  });
+})();
 
 // ═══════════════════════════════════════════════════════
 // Submit
@@ -827,13 +943,12 @@ function renderList() {
     const meta=[];
     if(j.bvid) meta.push('<span class="meta-tag"><a href="https://www.bilibili.com/video/'+j.bvid+'" target="_blank" onclick="event.stopPropagation()" class="meta-link">BV'+escHtml(j.bvid)+' ↗</a></span>');
     if(j.owner) meta.push('<span class="meta-tag">👤 '+escHtml(j.owner)+'</span>');
-    if(j.pubdate) meta.push('<span class="meta-tag">📅 '+formatPubDate(j.pubdate)+'</span>');
     if(j.timings&&j.timings.total) meta.push('<span class="meta-tag">⏱️ '+formatTime(j.timings.total)+'</span>');
     return '<div class="job-item '+sel+'" onclick="selectJob('+Q+j.id+Q+')">'+
       '<input type="checkbox" class="job-check" '+checked+' onclick="event.stopPropagation();toggleJobCheck('+Q+j.id+Q+',this.checked)" />'+
       '<div class="status '+cls+'">'+icon+'</div>'+
       '<div class="job-info">'+
-        '<div class="job-title">'+escHtml(j.title||j.bvid)+'</div>'+
+        '<div class="job-title" title="'+escHtml(j.title||j.bvid)+'">'+escHtml(j.title||j.bvid)+'</div>'+
         '<div class="job-meta">'+meta.join('')+'</div>'+
         '<div class="job-time">'+ago+'</div>'+
       '</div>'+
@@ -1138,11 +1253,16 @@ function formatTime(seconds) {
 
 function timeAgo(iso) {
   if(!iso) return '';
-  const diff=Math.floor((Date.now()-new Date(iso).getTime())/1000);
+  const now=Date.now();
+  const dt=new Date(iso).getTime();
+  const diff=Math.floor((now-dt)/1000);
   if(diff<60) return '刚刚';
   if(diff<3600) return Math.floor(diff/60)+' 分钟前';
   if(diff<86400) return Math.floor(diff/3600)+' 小时前';
-  return new Date(iso).toLocaleDateString('zh-CN',{month:'short',day:'numeric'});
+  // Past 24h → show exact date+time
+  const d=new Date(iso);
+  const pad=n=>n<10?'0'+n:''+n;
+  return d.getFullYear()+'/'+pad(d.getMonth()+1)+'/'+pad(d.getDate())+' '+pad(d.getHours())+':'+pad(d.getMinutes());
 }
 
 function updateBadge() {
