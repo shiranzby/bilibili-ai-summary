@@ -5,7 +5,6 @@
 用法:
     python callback_worker.py result.json <job_id> <worker_url>
 """
-import os
 import sys
 import json
 
@@ -22,6 +21,8 @@ def callback(result_file: str, job_id: str, worker_url: str):
         "summary": data.get("summary", ""),
         "transcript": data.get("transcript", ""),
         "title": data.get("title", ""),
+        "owner": data.get("owner", ""),
+        "pubdate": data.get("pubdate"),
         "timings": data.get("timings", {}),
     })
 

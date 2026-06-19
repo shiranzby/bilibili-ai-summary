@@ -96,33 +96,46 @@ async function fetchGHRunStatus(env, runId) {
   }
 }
 
-function ghStatusToSteps(ghStatus, ghConclusion) {
+function ghStatusToSteps(ghStatus, ghConclusion, startedAt) {
   // Map GitHub Actions status to our progress steps
   // status: queued, in_progress, completed, waiting
   // conclusion: null (in progress), success, failure, cancelled
   const steps = [
-    {name:'任务创建', done:true, active:false, msg:'已提交至处理队列'},
-    {name:'下载视频音频', done:false, active:false, msg:''},
-    {name:'语音转录', done:false, active:false, msg:''},
-    {name:'生成 Markdown', done:false, active:false, msg:''},
-    {name:'LLM 整理总结', done:false, active:false, msg:''},
-    {name:'后处理及文件导出', done:false, active:false, msg:''},
-    {name:'处理完成', done:false, active:false, msg:''},
+    {name:'📋 任务创建', done:true, active:false, msg:'已提交至处理队列'},
+    {name:'⬇️ 下载音频', done:false, active:false, msg:''},
+    {name:'🎙️ 语音转录', done:false, active:false, msg:''},
+    {name:'📝 生成稿文', done:false, active:false, msg:''},
+    {name:'🤖 AI 总结', done:false, active:false, msg:''},
+    {name:'📦 导出文件', done:false, active:false, msg:''},
+    {name:'✅ 完成', done:false, active:false, msg:''},
   ];
   
   if (ghStatus === 'queued') {
     steps[0].active = true;
-    steps[0].msg = '在队列中等待';
+    steps[0].msg = '排队等待中…';
   } else if (ghStatus === 'in_progress') {
-    steps[1].active = true;
-    steps[1].msg = '正在下载...';
+    // Estimate progress based on elapsed time since job start
+    // Typical CI: checkout+setup ~20s, download ~30s, STT ~60s, LLM ~60s, email+callback ~10s
+    const elapsed = startedAt ? (Date.now() - new Date(startedAt).getTime()) / 1000 : 0;
+    const doneCount = elapsed < 20 ? 0 : elapsed < 50 ? 1 : elapsed < 120 ? 2 : elapsed < 130 ? 3 : elapsed < 200 ? 4 : 5;
+    for (let i = 1; i <= doneCount && i < 7; i++) {
+      steps[i].done = true;
+      steps[i].msg = '✅ 完成';
+    }
+    const next = Math.min(doneCount + 1, 6);
+    if (next < 7) {
+      steps[next].active = true;
+      steps[next].msg = '处理中…';
+    }
   } else if (ghStatus === 'completed') {
     if (ghConclusion === 'success') {
+      for (let i = 1; i < 6; i++) { steps[i].done = true; steps[i].msg = '✅ 完成'; }
       steps[6].done = true;
       steps[6].msg = '✅ 完成';
     } else {
-      steps[0].done = true;
       steps[0].msg = '❌ 失败';
+      steps[6].done = true;
+      steps[6].msg = '❌ 失败';
     }
   }
   return steps;
@@ -308,7 +321,7 @@ async function handleGetJob(request, env, jobId) {
       job.gh_conclusion = ghRun.conclusion;
       job.gh_html_url = ghRun.html_url;
       // Map to our steps
-      job.gh_steps = ghStatusToSteps(ghRun.status, ghRun.conclusion);
+      job.gh_steps = ghStatusToSteps(ghRun.status, ghRun.conclusion, job.created_at);
     }
   }
   
@@ -338,7 +351,7 @@ async function handleCallback(request, env) {
   }
   
   const body = await request.json();
-  const { job_id, bvid, status, summary, transcript, title, timings } = body;
+  const { job_id, bvid, status, summary, transcript, title, timings, owner, pubdate } = body;
   
   if (!job_id || !bvid) {
     return errorResponse('缺少 job_id 或 bvid', 400);
@@ -358,6 +371,8 @@ async function handleCallback(request, env) {
     transcript: transcript || '',
     title: title || '',
     timings: timings || {},
+    owner: owner || '',
+    pubdate: pubdate || null,
     completed_at: now,
     video_url: `https://www.bilibili.com/video/${bvid}`,
   };
@@ -448,13 +463,16 @@ body{font-family:-apple-system,'Segoe UI',system-ui,sans-serif;background:var(--
 .main h2{font-size:1rem;font-weight:700;margin-bottom:12px;color:var(--soft);text-transform:uppercase;letter-spacing:.03em}
 /* Notice */
 .notice{padding:12px 16px;background:#fef3c7;border:1px solid #f59e0b;border-radius:10px;font-size:.82rem;color:#92400e;margin-bottom:16px;line-height:1.6}
-/* Progress */
-.progress{display:grid;gap:8px;margin-bottom:20px}
-.progress-step{display:flex;align-items:center;gap:10px;padding:10px 14px;background:var(--surface);border:1px solid var(--border);border-radius:8px;font-size:.85rem}
-.progress-step .icon{width:24px;text-align:center;font-size:1rem}
-.progress-step .step-label{flex:1}
-.progress-step.done{border-color:var(--success);background:#f0fdf4}
-.progress-step.active{border-color:var(--accent);background:#eff6ff}
+/* Progress — horizontal compact */
+.progress{display:flex;flex-wrap:wrap;gap:6px;margin-bottom:16px}
+.progress-step{display:flex;align-items:center;gap:6px;padding:6px 10px;background:var(--surface);border:1px solid var(--border);border-radius:6px;font-size:.78rem;white-space:nowrap}
+.progress-step .icon{font-size:.8rem}
+.progress-step .step-label{font-weight:600}
+.progress-step .step-msg{font-size:.7rem;color:var(--muted)}
+.progress-step.done{border-color:var(--success);background:#f0fdf4;opacity:.85}
+.progress-step.active{border-color:var(--accent);background:#eff6ff;animation:pulse 2s ease-in-out infinite}
+.progress-step.pending{opacity:.5}
+@keyframes pulse{0%,100%{box-shadow:0 0 0 0 rgba(14,165,233,.4)}50%{box-shadow:0 0 0 3px rgba(14,165,233,.1)}}
 [data-theme="dark"] .progress-step.done{background:#052e16}
 [data-theme="dark"] .progress-step.active{background:#172554}
 /* Job items */
@@ -473,6 +491,11 @@ body{font-family:-apple-system,'Segoe UI',system-ui,sans-serif;background:var(--
 .job-title a:hover{color:var(--accent);text-decoration:underline}
 .job-title .link-icon{font-size:.75rem;margin-left:4px;opacity:.6}
 .job-actions{display:flex;gap:4px;flex-shrink:0}
+.job-check{width:16px;height:16px;cursor:pointer;accent-color:var(--brand);flex-shrink:0}
+.job-meta{display:flex;flex-wrap:wrap;gap:6px;margin-top:3px;font-size:.74rem}
+.job-meta .meta-tag{display:inline-flex;align-items:center;gap:3px;padding:1px 8px;background:var(--bg);border:1px solid var(--border);border-radius:4px;color:var(--soft);white-space:nowrap}
+.job-meta .meta-link{color:var(--accent);text-decoration:none;font-size:.74rem}
+.job-meta .meta-link:hover{text-decoration:underline}
 /* Detail panel */
 .detail-card{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);padding:20px;margin-bottom:16px}
 .detail-card h3{font-size:.85rem;font-weight:700;color:var(--muted);text-transform:uppercase;letter-spacing:.03em;margin-bottom:8px}
@@ -548,19 +571,21 @@ body{font-family:-apple-system,'Segoe UI',system-ui,sans-serif;background:var(--
         </div>
         <div class="form-group">
           <label>语音转文字模型</label>
-          <select id="sttModelSelect">
+          <input id="sttModelSelect" type="text" list="sttModelList" placeholder="FunAudioLLM/SenseVoiceSmall (默认)" />
+          <datalist id="sttModelList">
             <option value="FunAudioLLM/SenseVoiceSmall">SenseVoiceSmall (默认)</option>
             <option value="FunAudioLLM/SenseVoiceLarge">SenseVoiceLarge</option>
-          </select>
+          </datalist>
         </div>
         <div class="form-group">
           <label>AI 总结模型</label>
-          <select id="summaryModelSelect">
+          <input id="summaryModelSelect" type="text" list="summaryModelList" placeholder="Qwen/Qwen3-8B (默认)" />
+          <datalist id="summaryModelList">
             <option value="Qwen/Qwen3-8B">Qwen3-8B (默认)</option>
             <option value="Qwen/Qwen3-14B">Qwen3-14B</option>
             <option value="deepseek-ai/DeepSeek-V3">DeepSeek V3</option>
             <option value="Pro/Qwen/Qwen3-8B">Qwen3-8B (Pro)</option>
-          </select>
+          </datalist>
         </div>
         <div class="form-group">
           <label>自定义总结模板（可选）</label>
@@ -578,6 +603,9 @@ body{font-family:-apple-system,'Segoe UI',system-ui,sans-serif;background:var(--
       <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
         <span style="font-size:.82rem;font-weight:700;color:var(--soft)">📋 历史记录</span>
         <div class="flex" style="gap:4px">
+          <button class="btn btn-sm btn-outline" onclick="toggleSelectAll()" style="font-size:.75rem;padding:4px 10px" title="全选">☑️ 全选</button>
+          <button class="btn btn-sm btn-outline" onclick="invertSelection()" style="font-size:.75rem;padding:4px 10px" title="反选">🔄 反选</button>
+          <button class="btn btn-sm btn-danger" onclick="deleteSelectedJobs()" style="font-size:.75rem;padding:4px 10px" title="删除选中">🗑 删除</button>
           <button class="btn btn-sm btn-outline" onclick="clearAllJobs()" style="font-size:.75rem;padding:4px 10px" title="清除全部">🗑 全部</button>
           <span id="countBadge" class="badge"></span>
         </div>
@@ -586,7 +614,7 @@ body{font-family:-apple-system,'Segoe UI',system-ui,sans-serif;background:var(--
         <span class="icon">🔍</span>
         <input class="search-box" id="searchInput" type="text" placeholder="搜索标题或BV号…" oninput="renderList()" />
       </div>
-      <div id="historyList" style="max-height:360px;overflow-y:auto"></div>
+      <div id="historyList"></div>
     </div>
   </div>
 
@@ -627,13 +655,9 @@ body{font-family:-apple-system,'Segoe UI',system-ui,sans-serif;background:var(--
           <span style="flex:1"></span>
           <button class="btn btn-sm btn-outline" onclick="event.stopPropagation();downloadSummary()">⬇ 下载</button>
           <button class="btn btn-sm btn-outline" onclick="event.stopPropagation();copySummary()">📋 复制</button>
-          <button class="btn btn-sm btn-outline" onclick="event.stopPropagation();toggleSummaryEdit()">✏️ 编辑</button>
-          <button class="btn btn-sm btn-primary" onclick="event.stopPropagation();saveSummary()" style="display:none" id="summarySaveBtn">💾 保存</button>
         </div>
         <div class="accordion-body">
           <div class="card-body" id="summaryContent" style="min-height:120px;padding:12px;border:1px solid var(--border);border-radius:8px;background:var(--bg)">暂无总结内容</div>
-          <textarea id="summaryEditor" oninput="saveSummary()" placeholder="手动编辑总结内容…" style="display:none;width:100%;min-height:120px;padding:10px;border:1px solid var(--border);border-radius:8px;background:var(--bg);color:var(--text);font-size:.85rem;line-height:1.6;resize:vertical;outline:0;font-family:inherit;margin-top:8px"></textarea>
-          <span style="font-size:.78rem;color:var(--muted);margin-left:8px" id="summarySavedHint"></span>
         </div>
       </div>
 
@@ -664,6 +688,7 @@ function getKeys() { try { return JSON.parse(localStorage.getItem(LS_KEYS)||'{}'
 function saveKeys(k) { localStorage.setItem(LS_KEYS, JSON.stringify(k)); }
 
 let selectedJobId = null;
+let selectedIds = [];
 
 // ═══════════════════════════════════════════════════════
 // Theme
@@ -760,33 +785,37 @@ function renderList() {
     el.innerHTML='<div style="text-align:center;padding:16px;color:var(--muted);font-size:.82rem">暂无记录</div>';
     return;
   }
+  if(filtered.length===0){
+    el.innerHTML='<div style="text-align:center;padding:16px;color:var(--muted);font-size:.82rem">无匹配结果</div>';
+    return;
+  }
+  const Q="'";
+  const selSet=new Set(selectedIds||[]);
   el.innerHTML=filtered.map(j=>{
     const icon=j.status==='submitted'?'⏳':j.status==='done'?'✅':'❌';
     const cls=j.status==='submitted'?'sub':j.status==='done'?'done':'fail';
     const sel=j.id===selectedJobId?'selected':'';
+    const checked=selSet.has(j.id)?'checked':'';
     const ago=timeAgo(j.created_at);
-    return \`<div class="job-item \${sel}" onclick="selectJob('\${j.id}')">
-      <div class="status \${cls}">\${icon}</div>
-      <div class="job-info">
-        <div class="job-title">\${j.title ? '<a href="https://www.bilibili.com/video/'+j.bvid+'" target="_blank" onclick="event.stopPropagation()">'+escHtml(j.title)+' <span class="link-icon">↗</span></a>' : escHtml(j.bvid)}</div>
-        <div class="job-bvid">\${j.title ? escHtml(j.bvid) : ''}</div>
-        <div class="job-time">\${ago}</div>
-      </div>
-      <div class="job-actions">
-        <button class="btn btn-sm btn-danger" onclick="event.stopPropagation();deleteJob('\${j.id}')">🗑</button>
-      </div>
-    </div>\`;
+    const meta=[];
+    if(j.bvid) meta.push('<a href="https://www.bilibili.com/video/'+j.bvid+'" target="_blank" onclick="event.stopPropagation()" class="meta-link">BV'+escHtml((j.bvid.length>2?j.bvid.substring(2):j.bvid))+' ↗</a>');
+    if(j.owner) meta.push('<span class="meta-tag">👤 '+escHtml(j.owner)+'</span>');
+    if(j.pubdate) meta.push('<span class="meta-tag">📅 '+formatPubDate(j.pubdate)+'</span>');
+    if(j.timings&&j.timings.total) meta.push('<span class="meta-tag">⏱️ '+formatTime(j.timings.total)+'</span>');
+    return '<div class="job-item '+sel+'" onclick="selectJob('+Q+j.id+Q+')">'+
+      '<input type="checkbox" class="job-check" '+checked+' onclick="event.stopPropagation();toggleJobCheck('+Q+j.id+Q+',this.checked)" />'+
+      '<div class="status '+cls+'">'+icon+'</div>'+
+      '<div class="job-info">'+
+        '<div class="job-title">'+(j.title ? '<a href="https://www.bilibili.com/video/'+j.bvid+'" target="_blank" onclick="event.stopPropagation()">'+escHtml(j.title)+' <span class="link-icon">↗</span></a>' : escHtml(j.bvid))+'</div>'+
+        '<div class="job-meta">'+meta.join('')+'</div>'+
+        '<div class="job-time">'+ago+'</div>'+
+      '</div>'+
+      '<div class="job-actions">'+
+        '<button class="btn btn-sm btn-danger" onclick="event.stopPropagation();deleteJob('+Q+j.id+Q+')">🗑</button>'+
+      '</div>'+
+    '</div>';
   }).join('');
 }
-
-function updateBadge() {
-  const jobs=getJobs();
-  document.getElementById('countBadge').textContent=\`\${jobs.length} 条\`;
-}
-
-// ═══════════════════════════════════════════════════════
-// Select & Display Job
-// ═══════════════════════════════════════════════════════
 function selectJob(id) {
   selectedJobId=id;
   document.getElementById('emptyState').classList.add('hidden');
@@ -803,27 +832,23 @@ function renderDetail(id) {
   const job=getJobs().find(j=>j.id===id);
   if(!job) return;
 
-  // Progress steps
+  // Progress steps — compact horizontal
   const pe=document.getElementById('progressSteps');
-  if(pe) pe.innerHTML=job.steps.map(s=>
-    \`<div class="progress-step \${s.done?'done':''} \${s.active?'active':''}">
-      <div class="icon">\${s.done?'✅':s.active?'🔄':'⏳'}</div>
-      <div class="step-label">\${s.name}</div>
-      <div style="font-size:.78rem;color:var(--muted)">\${s.msg||''}</div>
-    </div>\`
-  ).join('');
+  if(pe) pe.innerHTML=job.steps.map(s=>{
+    const cls=s.done?'done':s.active?'active':'pending';
+    const msg=s.msg?'<span class="step-msg">'+escHtml(s.msg)+'</span>':'';
+    return '<div class="progress-step '+cls+'" title="'+escHtml(s.msg||'')+'">'+
+      '<span class="step-label">'+s.name+'</span>'+msg+
+    '</div>';
+  }).join('');
 
   // Transcript
   const tc=document.getElementById('transcriptContent');
   if(tc) tc.textContent=job.transcript||'（暂无转录内容，收到邮件后可手动添加）';
 
-  // Summary — content view + editor sync
+  // Summary — content view only
   const sumContent=document.getElementById('summaryContent');
-  const sumEditor=document.getElementById('summaryEditor');
-  const saveBtn=document.getElementById('summarySaveBtn');
-  if(sumContent){sumContent.style.display='block';sumContent.textContent=job.summary||'（暂无总结内容，收到邮件后可手动添加）';}
-  if(sumEditor){sumEditor.style.display='none';sumEditor.value=job.summary||'';}
-  if(saveBtn) saveBtn.style.display='none';
+  if(sumContent){sumContent.textContent=job.summary||'（暂无总结内容，收到邮件后可手动添加）';}
 
   // Email Preview
   const ep=document.getElementById('emailPreview');
@@ -845,38 +870,6 @@ function toggleAccordion(header) {
 
 // ═══════════════════════════════════════════════════════
 // Summary Edit Toggle
-// ═══════════════════════════════════════════════════════
-function toggleSummaryEdit() {
-  const content=document.getElementById('summaryContent');
-  const editor=document.getElementById('summaryEditor');
-  const editBtns=document.querySelectorAll('button[onclick*="toggleSummaryEdit"]');
-  const saveBtn=document.getElementById('summarySaveBtn');
-  if(!content||!editor) return;
-  const showingContent=content.style.display!=='none';
-  content.style.display=showingContent?'none':'block';
-  editor.style.display=showingContent?'block':'none';
-  editBtns.forEach(b=>b.style.display=showingContent?'none':'inline-block');
-  if(saveBtn) saveBtn.style.display=showingContent?'inline-block':'none';
-  if(showingContent) editor.focus();
-}
-
-// ═══════════════════════════════════════════════════════
-// ═══════════════════════════════════════════════════════
-function saveSummary() {
-  const jobs=getJobs();
-  const idx=jobs.findIndex(j=>j.id===selectedJobId);
-  if(idx===-1) return;
-  const text=document.getElementById('summaryEditor').value;
-  jobs[idx].summary=text;
-  jobs[idx].updated_at=new Date().toISOString();
-  if(text) jobs[idx].status='done';
-  saveJobs(jobs);
-  const hint=document.getElementById('summarySavedHint');
-  hint.textContent='✅ 已保存';
-  setTimeout(()=>hint.textContent='',2000);
-  renderDetail(selectedJobId);
-}
-
 // ═══════════════════════════════════════════════════════
 // Polling: Refresh job status from R2
 // ═══════════════════════════════════════════════════════
@@ -918,6 +911,8 @@ async function pollJobStatus(jobId) {
     // R2 has a completed/failed result — update local storage
     job.status = r2job.status === 'completed' ? 'done' : 'failed';
     job.title = r2job.title || job.title;
+    job.owner = r2job.owner || job.owner || '';
+    job.pubdate = r2job.pubdate || job.pubdate || null;
     job.summary = r2job.summary || job.summary;
     job.transcript = r2job.transcript || job.transcript;
     job.timings = r2job.timings || {};
@@ -959,9 +954,9 @@ function copyTranscript() {
   navigator.clipboard.writeText(job.transcript).then(()=>showStatus('✅ 已复制')).catch(()=>{});
 }
 function copySummary() {
-  const text=document.getElementById('summaryEditor').value;
-  if(!text) return;
-  navigator.clipboard.writeText(text).then(()=>showStatus('✅ 已复制')).catch(()=>{});
+  const job=getSelectedJob();
+  if(!job||!job.summary) return;
+  navigator.clipboard.writeText(job.summary).then(()=>showStatus('✅ 已复制')).catch(()=>{});
 }
 function downloadTranscript() {
   const job=getSelectedJob();
@@ -971,11 +966,11 @@ function downloadTranscript() {
   a.download=\`\${job.bvid}_transcript.txt\`;a.click();
 }
 function downloadSummary() {
-  const text=document.getElementById('summaryEditor').value;
-  if(!text) return;
-  const blob=new Blob([text],{type:'text/plain;charset=utf-8'});
+  const job=getSelectedJob();
+  if(!job||!job.summary) return;
+  const blob=new Blob([job.summary],{type:'text/plain;charset=utf-8'});
   const a=document.createElement('a');a.href=URL.createObjectURL(blob);
-  a.download=\`\${(getSelectedJob()||{}).bvid||'summary'}_summary.txt\`;a.click();
+  a.download=\`\${job.bvid}_summary.txt\`;a.click();
 }
 
 // ═══════════════════════════════════════════════════════
@@ -990,12 +985,14 @@ function deleteJob(id) {
     document.getElementById('emptyState').classList.remove('hidden');
     document.getElementById('detailView').classList.add('hidden');
   }
+  selectedIds=selectedIds.filter(i=>i!==id);
 }
 
 function clearAllJobs() {
   if(!confirm('确定清除所有历史记录？此操作不可撤销！')) return;
   localStorage.removeItem(LS_JOBS);
   selectedJobId=null;
+  selectedIds=[];
   document.getElementById('emptyState').classList.remove('hidden');
   document.getElementById('detailView').classList.add('hidden');
   renderList();
@@ -1068,6 +1065,58 @@ function timeAgo(iso) {
   if(diff<3600) return Math.floor(diff/60)+' 分钟前';
   if(diff<86400) return Math.floor(diff/3600)+' 小时前';
   return new Date(iso).toLocaleDateString('zh-CN',{month:'short',day:'numeric'});
+}
+
+function formatPubDate(ts) {
+  if(!ts) return '';
+  return new Date(ts*1000).toLocaleDateString('zh-CN',{year:'numeric',month:'2-digit',day:'2-digit'});
+}
+
+// ═══════════════════════════════════════════════════════
+// Selection
+// ═══════════════════════════════════════════════════════
+function toggleJobCheck(id, checked) {
+  if(checked) selectedIds.push(id);
+  else selectedIds=selectedIds.filter(i=>i!==id);
+}
+function toggleSelectAll() {
+  const jobs=getJobs();
+  const q=document.getElementById('searchInput').value||'';
+  const filtered=q?jobs.filter(j=>{
+    const t=(j.title||'').toLowerCase();
+    const b=(j.bvid||'').toLowerCase();
+    const sq=q.toLowerCase();
+    return t.includes(sq)||b.includes(sq);
+  }):jobs;
+  if(selectedIds.length===filtered.length) { selectedIds=[]; }
+  else { selectedIds=filtered.map(j=>j.id); }
+  renderList();
+}
+function invertSelection() {
+  const jobs=getJobs();
+  const q=document.getElementById('searchInput').value||'';
+  const filtered=q?jobs.filter(j=>{
+    const t=(j.title||'').toLowerCase();
+    const b=(j.bvid||'').toLowerCase();
+    const sq=q.toLowerCase();
+    return t.includes(sq)||b.includes(sq);
+  }):jobs;
+  const selSet=new Set(selectedIds);
+  selectedIds=filtered.map(j=>j.id).filter(id=>!selSet.has(id));
+  renderList();
+}
+function deleteSelectedJobs() {
+  if(!selectedIds||selectedIds.length===0) { showStatus('请先勾选记录','error'); return; }
+  if(!confirm('确定删除已勾选的 '+selectedIds.length+' 条记录？')) return;
+  const ids=new Set(selectedIds);
+  const jobs=getJobs().filter(j=>!ids.has(j.id));
+  if(ids.has(selectedJobId)){
+    selectedJobId=null;
+    document.getElementById('emptyState').classList.remove('hidden');
+    document.getElementById('detailView').classList.add('hidden');
+  }
+  saveJobs(jobs);
+  selectedIds=[];
 }
 
 // Init
