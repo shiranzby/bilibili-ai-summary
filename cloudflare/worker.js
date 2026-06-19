@@ -187,6 +187,55 @@ async function cleanupExcessResults(R2) {
 }
 
 // ═══════════════════════════════════════════════════════
+// R2 History Sync (cross-device shared history)
+// ═══════════════════════════════════════════════════════
+
+const HISTORY_KEY = 'history/shared.json';
+
+async function handleGetHistory(request, env) {
+  if (!env.BILIBILI_BUCKET) return jsonResponse({ error: 'R2 not configured' }, 503);
+  try {
+    const obj = await env.BILIBILI_BUCKET.get(HISTORY_KEY);
+    if (!obj) return jsonResponse([]);
+    const data = await obj.json();
+    return jsonResponse(data.jobs || []);
+  } catch (e) {
+    console.error('handleGetHistory error:', e.message);
+    return jsonResponse([]);
+  }
+}
+
+async function handlePostHistory(request, env) {
+  if (!env.BILIBILI_BUCKET) return jsonResponse({ error: 'R2 not configured' }, 503);
+  try {
+    const body = await request.json();
+    const jobs = body.jobs || [];
+    // Keep max 30 items to stay within R2 free tier (~30kb)
+    const trimmed = jobs.slice(0, 30);
+    await env.BILIBILI_BUCKET.put(HISTORY_KEY, JSON.stringify({ jobs: trimmed, updated_at: nowISO() }),
+      { httpMetadata: { contentType: 'application/json' } }
+    );
+    console.log('R2 history saved:', trimmed.length, 'jobs');
+    return jsonResponse({ ok: true, count: trimmed.length });
+  } catch (e) {
+    console.error('handlePostHistory error:', e.message);
+    return jsonResponse({ error: e.message }, 500);
+  }
+}
+
+async function handleDeleteHistory(request, env) {
+  if (!env.BILIBILI_BUCKET) return jsonResponse({ error: 'R2 not configured' }, 503);
+  try {
+    await env.BILIBILI_BUCKET.delete(HISTORY_KEY);
+    console.log('R2 history deleted');
+    return jsonResponse({ ok: true });
+  } catch (e) {
+    console.error('handleDeleteHistory error:', e.message);
+    return jsonResponse({ error: e.message }, 500);
+  }
+}
+
+// ═══════════════════════════════════════════════════════
 // API Handlers
 // ═══════════════════════════════════════════════════════
 
@@ -619,7 +668,7 @@ html,body{overflow:auto!important;height:auto!important}
       <div class="form-group">
         <label>B站视频链接或 BV/AV 号</label>
         <div style="display:flex;gap:6px">
-        <input id="urlInput" type="text" placeholder="粘贴完整链接或直接输入BV号…"
+        <input id="urlInput" type="text" placeholder="直接粘贴链接（含标题），系统自动提取…"
           onkeydown="if(event.key==='Enter')submitJob()" style="flex:1" />
         <button class="btn btn-sm btn-outline" onclick="pasteUrl()" title="从剪贴板粘贴" style="padding:4px 10px;font-size:.9rem">📋</button>
         </div>
@@ -680,7 +729,7 @@ html,body{overflow:auto!important;height:auto!important}
         </div>
         <div class="search-wrap">
           <span class="icon">🔍</span>
-          <input class="search-box" id="searchInput" type="text" placeholder="搜索标题或BV号…" oninput="renderList()" />
+          <input class="search-box" id="searchInput" type="text" placeholder="搜索标题、BV号、UP主或日期…" oninput="renderList()" />
         </div>
       </div>
       <div class="history-inner" id="historyList"></div>
@@ -719,7 +768,6 @@ html,body{overflow:auto!important;height:auto!important}
             <span style="flex:1"></span>
             <button class="btn btn-sm btn-outline" onclick="event.stopPropagation();downloadTranscript()" title="TXT">⬇ TXT</button>
             <button class="btn btn-sm btn-outline" onclick="event.stopPropagation();downloadTranscriptMD()" title="Markdown">📄 MD</button>
-            <button class="btn btn-sm btn-outline" onclick="event.stopPropagation();previewTranscript()" title="HTML预览">👁 预览</button>
             <button class="btn btn-sm btn-outline" onclick="event.stopPropagation();copyTranscript()">📋 复制</button>
           </div>
           <div class="accordion-body">
@@ -737,9 +785,8 @@ html,body{overflow:auto!important;height:auto!important}
             <span class="label">AI 总结</span>
             <span style="flex:1"></span>
             <button class="btn btn-sm btn-outline" onclick="event.stopPropagation();downloadSummary()" title="Markdown">📄 MD</button>
+            <button class="btn btn-sm btn-outline" onclick="event.stopPropagation();downloadSummaryTXT()" title="TXT">⬇ TXT</button>
             <button class="btn btn-sm btn-outline" onclick="event.stopPropagation();downloadSummaryHTML()" title="Fancy HTML">🌐 HTML</button>
-            <button class="btn btn-sm btn-outline" onclick="event.stopPropagation();previewSummary()" title="打开预览">👁 预览</button>
-            <button class="btn btn-sm btn-outline" onclick="event.stopPropagation();printSummary()" title="打印/导出PDF">🖨 PDF</button>
             <button class="btn btn-sm btn-outline" onclick="event.stopPropagation();copySummary()">📋 复制</button>
           </div>
           <div class="accordion-body">
@@ -761,8 +808,44 @@ html,body{overflow:auto!important;height:auto!important}
 const LS_JOBS = 'b2t_jobs';
 const LS_KEYS = 'b2t_keys';
 
+// Local storage — fast access
 function getJobs() { try { return JSON.parse(localStorage.getItem(LS_JOBS)||'[]'); } catch { return []; } }
-function saveJobs(j) { localStorage.setItem(LS_JOBS, JSON.stringify(j)); renderList(); updateBadge(); }
+function saveJobs(j) { 
+  localStorage.setItem(LS_JOBS, JSON.stringify(j)); 
+  renderList(); 
+  updateBadge();
+  // Async R2 sync (fire-and-forget)
+  r2SaveJobs(j);
+}
+
+// R2 sync — cross-device shared history
+let r2Loaded = false;
+async function r2LoadJobs() {
+  try {
+    const resp = await fetch('/api/history');
+    if (!resp.ok) return;
+    const jobs = await resp.json();
+    if (Array.isArray(jobs) && jobs.length > 0) {
+      localStorage.setItem(LS_JOBS, JSON.stringify(jobs));
+      console.log('[b2t] R2 history loaded:', jobs.length, 'jobs');
+    }
+  } catch(e) {
+    console.warn('[b2t] R2 load failed:', e.message);
+  }
+  r2Loaded = true;
+}
+async function r2SaveJobs(j) {
+  if (!r2Loaded) return; // Don't write until initial load completed
+  try {
+    await fetch('/api/history', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ jobs: j }),
+    });
+  } catch(e) {
+    // Silent fail — localStorage is the primary store
+  }
+}
 function getKeys() { try { return JSON.parse(localStorage.getItem(LS_KEYS)||'{}'); } catch { return {}; } }
 function saveKeys(k) { localStorage.setItem(LS_KEYS, JSON.stringify(k)); }
 
@@ -998,8 +1081,10 @@ function renderList() {
   const filtered=q ? jobs.filter(j=>{
     const t=(j.title||'').toLowerCase();
     const b=(j.bvid||'').toLowerCase();
+    const o=(j.owner||'').toLowerCase();
+    const ta=timeAgo(j.created_at).toLowerCase();
     const sq=q.toLowerCase();
-    return t.includes(sq)||b.includes(sq);
+    return t.includes(sq)||b.includes(sq)||o.includes(sq)||ta.includes(sq);
   }) : jobs;
   if(jobs.length===0){
     el.innerHTML='<div style="text-align:center;padding:16px;color:var(--muted);font-size:.82rem">暂无记录</div>';
@@ -1195,6 +1280,13 @@ function downloadSummary() {
   const a=document.createElement('a');a.href=URL.createObjectURL(blob);
   a.download=\`\${job.bvid}_summary.md\`;a.click();
 }
+function downloadSummaryTXT() {
+  const job=getSelectedJob();
+  if(!job||!job.summary) return;
+  const blob=new Blob([job.summary],{type:'text/plain;charset=utf-8'});
+  const a=document.createElement('a');a.href=URL.createObjectURL(blob);
+  a.download=\`\${job.bvid}_summary.txt\`;a.click();
+}
 
 function downloadTranscriptMD() {
   const job=getSelectedJob();
@@ -1212,27 +1304,6 @@ function downloadSummaryHTML() {
   const blob=new Blob(['<!DOCTYPE html><html><head><meta charset="UTF-8"><title>'+escHtml(job.title||job.bvid)+'</title></head><body>'+html+'</body></html>'],{type:'text/html;charset=utf-8'});
   const a=document.createElement('a');a.href=URL.createObjectURL(blob);
   a.download=\`\${job.bvid}_summary.html\`;a.click();
-}
-function previewTranscript() {
-  const job=getSelectedJob();
-  if(!job||!job.transcript) return;
-  const html='<!DOCTYPE html><html><head><meta charset="UTF-8"><title>转录文本 - '+escHtml(job.bvid)+'</title><style>body{font-family:-apple-system,sans-serif;max-width:800px;margin:40px auto;padding:20px;line-height:1.8;color:#333;background:#fafafa}h2{color:#0891b2}.content{white-space:pre-wrap;background:#fff;padding:24px;border-radius:12px;box-shadow:0 1px 3px rgba(0,0,0,.1)}</style></head><body><h2>转录文本</h2><p>BV: '+escHtml(job.bvid)+'</p><div class="content">'+escHtml(job.transcript)+'</div></body></html>';
-  const w=window.open('','_blank');
-  w.document.write(html);w.document.close();
-}
-function previewSummary() {
-  const job=getSelectedJob();
-  if(!job||!job.summary) return;
-  const w=window.open('','_blank');
-  w.document.write('<!DOCTYPE html><html><head><meta charset="UTF-8"><title>'+escHtml(job.title||job.bvid)+'</title></head><body>'+buildEmailHTML(job.bvid,job.summary)+'</body></html>');
-  w.document.close();
-}
-function printSummary() {
-  const job=getSelectedJob();
-  if(!job||!job.summary) return;
-  const w=window.open('','_blank');
-  w.document.write('<!DOCTYPE html><html><head><meta charset="UTF-8"><title>'+escHtml(job.title||job.bvid)+'</title><style>@media print{body{margin:0;padding:20px}}</style></head><body>'+buildEmailHTML(job.bvid,job.summary)+'<'+'/script><script>setTimeout(function(){window.print();window.close()},500);<'+'/script></body></html>');
-  w.document.close();
 }
 
 // ═══════════════════════════════════════════════════════
@@ -1260,6 +1331,8 @@ function clearAllJobs() {
   document.getElementById('detailView').classList.add('hidden');
   renderList();
   updateBadge();
+  // Also clear from R2
+  fetch('/api/history', { method: 'DELETE' }).catch(()=>{});
 }
 
 // ═══════════════════════════════════════════════════════
@@ -1379,8 +1452,10 @@ function toggleSelectAll() {
   const filtered=q?jobs.filter(j=>{
     const t=(j.title||'').toLowerCase();
     const b=(j.bvid||'').toLowerCase();
+    const o=(j.owner||'').toLowerCase();
+    const ta=timeAgo(j.created_at).toLowerCase();
     const sq=q.toLowerCase();
-    return t.includes(sq)||b.includes(sq);
+    return t.includes(sq)||b.includes(sq)||o.includes(sq)||ta.includes(sq);
   }):jobs;
   if(selectedIds.length===filtered.length) { selectedIds=[]; }
   else { selectedIds=filtered.map(j=>j.id); }
@@ -1392,8 +1467,10 @@ function invertSelection() {
   const filtered=q?jobs.filter(j=>{
     const t=(j.title||'').toLowerCase();
     const b=(j.bvid||'').toLowerCase();
+    const o=(j.owner||'').toLowerCase();
+    const ta=timeAgo(j.created_at).toLowerCase();
     const sq=q.toLowerCase();
-    return t.includes(sq)||b.includes(sq);
+    return t.includes(sq)||b.includes(sq)||o.includes(sq)||ta.includes(sq);
   }):jobs;
   const selSet=new Set(selectedIds);
   selectedIds=filtered.map(j=>j.id).filter(id=>!selSet.has(id));
@@ -1414,6 +1491,7 @@ function deleteSelectedJobs() {
     document.getElementById('detailView').classList.add('hidden');
     renderList();
     updateBadge();
+    fetch('/api/history',{method:'DELETE'}).catch(()=>{});
     return;
   }
   const ids=new Set(selectedIds);
@@ -1430,6 +1508,9 @@ function deleteSelectedJobs() {
 // Init
 renderList();
 updateBadge();
+
+// Load from R2 after initial render, then re-render if needed
+r2LoadJobs().then(() => { renderList(); updateBadge(); });
 
 // Resume polling for any submitted jobs
 const existingJobs = getJobs();
@@ -1457,6 +1538,9 @@ export default {
 
     try {
       if (path === '/api/submit' && request.method === 'POST') return await handleSubmit(request, env, ctx);
+      if (path === '/api/history' && request.method === 'GET') return await handleGetHistory(request, env);
+      if (path === '/api/history' && request.method === 'POST') return await handlePostHistory(request, env);
+      if (path === '/api/history' && request.method === 'DELETE') return await handleDeleteHistory(request, env);
       if (path === '/api/jobs' && request.method === 'GET') return await handleListJobs(request, env);
       if (path.startsWith('/api/jobs/') && request.method === 'GET') return await handleGetJob(request, env, path.replace('/api/jobs/', ''));
       if (path.startsWith('/api/jobs/') && request.method === 'DELETE') return await handleDeleteJob(request, env, path.replace('/api/jobs/', ''));
