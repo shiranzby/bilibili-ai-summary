@@ -437,13 +437,14 @@ function generateFrontendPage() {
 *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
 :root{--bg:#f8fafc;--surface:#fff;--border:#e2e8f0;--text:#0f172a;--soft:#475569;--muted:#94a3b8;--brand:#14b8a6;--accent:#0ea5e9;--danger:#ef4444;--success:#22c55e;--radius:12px;--shadow:0 1px 3px rgba(0,0,0,.06),0 1px 2px rgba(0,0,0,.04);--shadow-lg:0 4px 12px rgba(0,0,0,.08),0 2px 4px rgba(0,0,0,.04);--glass:rgba(255,255,255,.7)}
 [data-theme="dark"]{--bg:#0f172a;--surface:#1e293b;--border:#334155;--text:#f1f5f9;--soft:#cbd5e1;--muted:#64748b;--shadow:0 1px 3px rgba(0,0,0,.2),0 1px 2px rgba(0,0,0,.15);--shadow-lg:0 4px 12px rgba(0,0,0,.3),0 2px 4px rgba(0,0,0,.15);--glass:rgba(30,41,59,.85)}
-body{font-family:-apple-system,'Segoe UI',system-ui,sans-serif;background:var(--bg);color:var(--text);min-height:100vh}
-.app{display:grid;grid-template-columns:400px 1fr;min-height:100vh}
-@media(max-width:800px){.app{grid-template-columns:1fr}}
+body{font-family:-apple-system,'Segoe UI',system-ui,sans-serif;background:var(--bg);color:var(--text);height:100%;overflow:hidden}
+html{height:100%;overflow:hidden}
+.app{display:grid;grid-template-columns:1fr 2fr;height:100vh}
+@media(max-width:900px){.app{grid-template-columns:1fr}}
 /* Sidebar — flex fills viewport, history list auto-expands */
 .sidebar{background:var(--surface);border-right:1px solid var(--border);padding:24px 20px;overflow:hidden;display:flex;flex-direction:column}
 .sidebar-top{flex-shrink:0}
-.sidebar-history{flex:1;display:flex;flex-direction:column;min-height:0;margin-top:16px;padding-top:12px;border-top:1px solid var(--border)}
+.sidebar-history{flex:1;display:flex;flex-direction:column;min-height:0;margin-top:16px;padding-top:12px;border-top:1px solid var(--border);overflow:hidden}
 .sidebar-history .history-inner{flex:1;overflow-y:auto;min-height:0}
 .sidebar-history .history-inner::-webkit-scrollbar{display:none}
 .sidebar h1{font-size:1.3rem;font-weight:800;background:linear-gradient(135deg,var(--brand),var(--accent));-webkit-background-clip:text;-webkit-text-fill-color:transparent;margin-bottom:20px}
@@ -462,21 +463,24 @@ body{font-family:-apple-system,'Segoe UI',system-ui,sans-serif;background:var(--
 .btn-danger:hover{background:var(--danger);color:#fff}
 .ht{position:fixed;top:16px;right:16px;z-index:10;background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:8px 12px;cursor:pointer;font-size:.8rem;color:var(--soft);z-index:100}
 /* Main */
-.main{padding:24px;overflow-y:auto;max-height:100vh;scrollbar-width:none;-ms-overflow-style:none}.main::-webkit-scrollbar{display:none}
+.main{padding:24px;overflow-y:auto;overflow-x:hidden;scrollbar-width:none;-ms-overflow-style:none}.main::-webkit-scrollbar{display:none}
 .main h2{font-size:1rem;font-weight:700;margin-bottom:12px;color:var(--soft);text-transform:uppercase;letter-spacing:.03em}
 /* Notice */
 .notice{padding:12px 16px;background:#fef3c7;border:1px solid #f59e0b;border-radius:10px;font-size:.82rem;color:#92400e;margin-bottom:16px;line-height:1.6}
-/* Progress — 2-row grid: row1=3 steps, row2=3 steps */
+/* Progress — 2-row flex with arrow flow */
 .progress{margin-bottom:16px}
-.progress-row{display:grid;gap:6px;margin-bottom:6px}
-.progress-row.r1{grid-template-columns:1fr 1fr 1fr}
-.progress-row.r2{grid-template-columns:1fr 1fr 1fr}
-.progress-step{display:flex;flex-direction:column;align-items:center;justify-content:center;text-align:center;padding:8px 6px;background:var(--surface);border:1px solid var(--border);border-radius:6px;font-size:.75rem;min-height:48px}
+.progress-row{display:flex;align-items:stretch;margin-bottom:8px}
+.progress-row.r1{justify-content:center}
+.progress-row.r2{justify-content:center}
+.progress-step{display:flex;flex-direction:column;align-items:center;justify-content:center;text-align:center;padding:10px 12px;background:var(--surface);border:1px solid var(--border);border-radius:6px;font-size:.75rem;min-height:52px;flex:1;max-width:200px}
 .progress-step .step-label{font-weight:600;line-height:1.3}
 .progress-step .step-msg{font-size:.7rem;color:var(--muted);margin-top:2px}
 .progress-step.done{border-color:var(--success);background:#f0fdf4;opacity:.85}
 .progress-step.active{border-color:var(--accent);background:#eff6ff;animation:pulse 2s ease-in-out infinite}
-.progress-step.pending{opacity:.5}
+.progress-step.pending{opacity:.55}
+.arrow-sep{display:flex;align-items:center;justify-content:center;padding:0 4px;color:var(--muted);font-size:1rem;flex-shrink:0;user-select:none}
+.arrow-sep.done{color:var(--success)}
+.arrow-sep.active{color:var(--accent)}
 @keyframes pulse{0%,100%{box-shadow:0 0 0 0 rgba(14,165,233,.4)}50%{box-shadow:0 0 0 3px rgba(14,165,233,.1)}}
 [data-theme="dark"] .progress-step.done{background:#052e16}
 [data-theme="dark"] .progress-step.active{background:#172554}
@@ -726,6 +730,7 @@ function toggleTheme() {
 async function submitJob() {
   const input=document.getElementById('urlInput');
   const url=input.value.trim();
+  console.log('[b2t] submitJob:', url);
   if(!url){showStatus('请先输入视频链接','error');return;}
 
   const btn=document.getElementById('submitBtn');
@@ -767,7 +772,9 @@ async function submitJob() {
     startPolling(data.job_id);
     showStatus(\`✅ 已提交: \${data.bvid}，正在处理…\`, 'success');
     input.value='';
+    console.log('[b2t] submitJob OK:', data.bvid, data.job_id);
   } catch(err) {
+    console.error('[b2t] submitJob error:', err.message);
     showStatus('❌ '+err.message, 'error');
   } finally {
     btn.disabled=false; btn.textContent='🚀 开始处理';
@@ -792,6 +799,7 @@ function escHtml(s) {
 
 function renderList() {
   const jobs=getJobs();
+  console.log('[b2t] renderList:', jobs.length, 'jobs');
   const el=document.getElementById('historyList');
   const q=(document.getElementById('searchInput')||{}).value||'';
   const filtered=q ? jobs.filter(j=>{
@@ -836,6 +844,7 @@ function renderList() {
   }).join('');
 }
 function selectJob(id) {
+  console.log('[b2t] selectJob:', id);
   selectedJobId=id;
   document.getElementById('emptyState').classList.add('hidden');
   document.getElementById('detailView').classList.remove('hidden');
@@ -849,17 +858,21 @@ function getSelectedJob() {
 
 function renderDetail(id) {
   const job=getJobs().find(j=>j.id===id);
-  if(!job) return;
+  if(!job) { console.warn('[b2t] renderDetail job not found:', id); return; }
+  console.log('[b2t] renderDetail:', id, job.bvid);
 
-  // Progress steps — 2-row layout: row1[0,1,2] row2[3,4,5]
+  // Progress steps — 2-row flex layout with arrow flow: row1[0,1,2] row2[3,4,5]
   const pe=document.getElementById('progressSteps');
   if(pe){
     const row1=job.steps.slice(0,3);
     const row2=job.steps.slice(3,6);
-    const renderRow=arr=>arr.map(s=>{
+    const renderRow=arr=>arr.map((s,i,all)=>{
       const cls=s.done?'done':s.active?'active':'pending';
       const msg=s.msg?'<div class="step-msg">'+escHtml(s.msg)+'</div>':'';
-      return '<div class="progress-step '+cls+'"><span class="step-label">'+s.name+'</span>'+msg+'</div>';
+      const card='<div class="progress-step '+cls+'"><span class="step-label">'+s.name+'</span>'+msg+'</div>';
+      // Add arrow separator between steps (not after the last one)
+      const arrow=i<all.length-1?'<span class="arrow-sep '+cls+'">→</span>':'';
+      return card+arrow;
     }).join('');
     pe.innerHTML='<div class="progress-row r1">'+renderRow(row1)+'</div><div class="progress-row r2">'+renderRow(row2)+'</div>';
   }
@@ -897,6 +910,7 @@ const pollingTimers = {};
 const POLL_INTERVAL = 10000; // 10 seconds
 
 function startPolling(jobId) {
+  console.log('[b2t] startPolling:', jobId);
   if(pollingTimers[jobId]) clearInterval(pollingTimers[jobId]);
   pollingTimers[jobId] = setInterval(() => pollJobStatus(jobId), POLL_INTERVAL);
   // Immediate first poll
@@ -904,9 +918,10 @@ function startPolling(jobId) {
 }
 
 async function pollJobStatus(jobId) {
+  console.log('[b2t] pollJobStatus:', jobId);
   try {
     const resp = await fetch('/api/jobs/' + jobId);
-    if(!resp.ok) return;
+    if(!resp.ok) { console.warn('[b2t] pollJobStatus resp not ok:', resp.status); return; }
     const r2job = await resp.json();
     
     const jobs = getJobs();
@@ -917,6 +932,7 @@ async function pollJobStatus(jobId) {
     
     // If still pending but has gh_status, update steps in real-time
     if(r2job.status !== 'completed' && r2job.status !== 'failed') {
+      console.log('[b2t] pollJobStatus in_progress, steps:', r2job.gh_steps?.length);
       if(r2job.gh_steps) {
         job.steps = r2job.gh_steps;
       }
@@ -929,6 +945,7 @@ async function pollJobStatus(jobId) {
     }
     
     // R2 has a completed/failed result — update local storage
+    console.log('[b2t] pollJobStatus done/fail:', r2job.status, r2job.bvid);
     job.status = r2job.status === 'completed' ? 'done' : 'failed';
     job.title = r2job.title || job.title;
     job.owner = r2job.owner || job.owner || '';
@@ -959,6 +976,7 @@ async function pollJobStatus(jobId) {
     if(pollingTimers[jobId]) {
       clearInterval(pollingTimers[jobId]);
       delete pollingTimers[jobId];
+      console.log('[b2t] pollJobStatus done, polling stopped for:', jobId);
     }
   } catch(e) {
     // Silently fail
@@ -1036,6 +1054,7 @@ function printSummary() {
 // Delete
 // ═══════════════════════════════════════════════════════
 function deleteJob(id) {
+  console.log('[b2t] deleteJob:', id);
   if(!confirm('确定删除？')) return;
   const jobs=getJobs().filter(j=>j.id!==id);
   saveJobs(jobs);
@@ -1185,6 +1204,7 @@ function invertSelection() {
   renderList();
 }
 function deleteSelectedJobs() {
+  console.log('[b2t] deleteSelectedJobs:', selectedIds?.length, 'selected');
   if(!selectedIds||selectedIds.length===0) { showStatus('请先勾选记录','error'); return; }
   const total=getJobs().length;
   const isAll=selectedIds.length>=total;
