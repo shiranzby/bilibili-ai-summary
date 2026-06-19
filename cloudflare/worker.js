@@ -104,7 +104,6 @@ function ghStatusToSteps(ghStatus, ghConclusion, startedAt) {
     {name:'任务创建', done:true, active:false, msg:'已提交至处理队列'},
     {name:'下载视频音频', done:false, active:false, msg:''},
     {name:'语音转录', done:false, active:false, msg:''},
-    {name:'生成 Markdown', done:false, active:false, msg:''},
     {name:'LLM 整理总结', done:false, active:false, msg:''},
     {name:'后处理及文件导出', done:false, active:false, msg:''},
     {name:'处理完成', done:false, active:false, msg:''},
@@ -117,25 +116,25 @@ function ghStatusToSteps(ghStatus, ghConclusion, startedAt) {
     // Estimate progress based on elapsed time since job start
     // Typical CI: checkout+setup ~20s, download ~30s, STT ~60s, LLM ~60s, email+callback ~10s
     const elapsed = startedAt ? (Date.now() - new Date(startedAt).getTime()) / 1000 : 0;
-    const doneCount = elapsed < 20 ? 0 : elapsed < 50 ? 1 : elapsed < 120 ? 2 : elapsed < 130 ? 3 : elapsed < 200 ? 4 : 5;
-    for (let i = 1; i <= doneCount && i < 7; i++) {
+    const doneCount = elapsed < 20 ? 0 : elapsed < 50 ? 1 : elapsed < 120 ? 2 : elapsed < 200 ? 3 : 4;
+    for (let i = 1; i <= doneCount && i < 6; i++) {
       steps[i].done = true;
       steps[i].msg = '✅ 完成';
     }
-    const next = Math.min(doneCount + 1, 6);
-    if (next < 7) {
+    const next = Math.min(doneCount + 1, 5);
+    if (next < 6) {
       steps[next].active = true;
       steps[next].msg = '处理中…';
     }
   } else if (ghStatus === 'completed') {
     if (ghConclusion === 'success') {
-      for (let i = 1; i < 6; i++) { steps[i].done = true; steps[i].msg = '✅ 完成'; }
-      steps[6].done = true;
-      steps[6].msg = '✅ 完成';
+      for (let i = 1; i < 5; i++) { steps[i].done = true; steps[i].msg = '✅ 完成'; }
+      steps[5].done = true;
+      steps[5].msg = '✅ 完成';
     } else {
       steps[0].msg = '❌ 失败';
-      steps[6].done = true;
-      steps[6].msg = '❌ 失败';
+      steps[5].done = true;
+      steps[5].msg = '❌ 失败';
     }
   }
   return steps;
@@ -439,10 +438,14 @@ function generateFrontendPage() {
 :root{--bg:#f8fafc;--surface:#fff;--border:#e2e8f0;--text:#0f172a;--soft:#475569;--muted:#94a3b8;--brand:#14b8a6;--accent:#0ea5e9;--danger:#ef4444;--success:#22c55e;--radius:12px;--shadow:0 1px 3px rgba(0,0,0,.06),0 1px 2px rgba(0,0,0,.04);--shadow-lg:0 4px 12px rgba(0,0,0,.08),0 2px 4px rgba(0,0,0,.04);--glass:rgba(255,255,255,.7)}
 [data-theme="dark"]{--bg:#0f172a;--surface:#1e293b;--border:#334155;--text:#f1f5f9;--soft:#cbd5e1;--muted:#64748b;--shadow:0 1px 3px rgba(0,0,0,.2),0 1px 2px rgba(0,0,0,.15);--shadow-lg:0 4px 12px rgba(0,0,0,.3),0 2px 4px rgba(0,0,0,.15);--glass:rgba(30,41,59,.85)}
 body{font-family:-apple-system,'Segoe UI',system-ui,sans-serif;background:var(--bg);color:var(--text);min-height:100vh}
-.app{display:grid;grid-template-columns:380px 1fr;min-height:100vh;max-width:1200px;margin:0 auto}
+.app{display:grid;grid-template-columns:400px 1fr;min-height:100vh}
 @media(max-width:800px){.app{grid-template-columns:1fr}}
-/* Sidebar */
-.sidebar{background:var(--surface);border-right:1px solid var(--border);padding:24px;overflow-y:auto}
+/* Sidebar — flex fills viewport, history list auto-expands */
+.sidebar{background:var(--surface);border-right:1px solid var(--border);padding:24px 20px;overflow:hidden;display:flex;flex-direction:column}
+.sidebar-top{flex-shrink:0}
+.sidebar-history{flex:1;display:flex;flex-direction:column;min-height:0;margin-top:16px;padding-top:12px;border-top:1px solid var(--border)}
+.sidebar-history .history-inner{flex:1;overflow-y:auto;min-height:0}
+.sidebar-history .history-inner::-webkit-scrollbar{display:none}
 .sidebar h1{font-size:1.3rem;font-weight:800;background:linear-gradient(135deg,var(--brand),var(--accent));-webkit-background-clip:text;-webkit-text-fill-color:transparent;margin-bottom:20px}
 .form-group{margin-bottom:16px}
 .form-group label{display:block;font-size:.8rem;font-weight:700;color:var(--soft);margin-bottom:4px;text-transform:uppercase;letter-spacing:.03em}
@@ -459,15 +462,15 @@ body{font-family:-apple-system,'Segoe UI',system-ui,sans-serif;background:var(--
 .btn-danger:hover{background:var(--danger);color:#fff}
 .ht{position:fixed;top:16px;right:16px;z-index:10;background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:8px 12px;cursor:pointer;font-size:.8rem;color:var(--soft);z-index:100}
 /* Main */
-.main{padding:24px;overflow-y:auto;max-height:100vh}
+.main{padding:24px;overflow-y:auto;max-height:100vh;scrollbar-width:none;-ms-overflow-style:none}.main::-webkit-scrollbar{display:none}
 .main h2{font-size:1rem;font-weight:700;margin-bottom:12px;color:var(--soft);text-transform:uppercase;letter-spacing:.03em}
 /* Notice */
 .notice{padding:12px 16px;background:#fef3c7;border:1px solid #f59e0b;border-radius:10px;font-size:.82rem;color:#92400e;margin-bottom:16px;line-height:1.6}
-/* Progress — 2-row grid: row1=3 steps, row2=4 steps */
+/* Progress — 2-row grid: row1=3 steps, row2=3 steps */
 .progress{margin-bottom:16px}
 .progress-row{display:grid;gap:6px;margin-bottom:6px}
 .progress-row.r1{grid-template-columns:1fr 1fr 1fr}
-.progress-row.r2{grid-template-columns:1fr 1fr 1fr 1fr}
+.progress-row.r2{grid-template-columns:1fr 1fr 1fr}
 .progress-step{display:flex;flex-direction:column;align-items:center;justify-content:center;text-align:center;padding:8px 6px;background:var(--surface);border:1px solid var(--border);border-radius:6px;font-size:.75rem;min-height:48px}
 .progress-step .step-label{font-weight:600;line-height:1.3}
 .progress-step .step-msg{font-size:.7rem;color:var(--muted);margin-top:2px}
@@ -517,6 +520,11 @@ body{font-family:-apple-system,'Segoe UI',system-ui,sans-serif;background:var(--
 .mt{margin-top:12px}
 .gap-sm{gap:6px}
 
+/* Back-to-top */
+.back-to-top{position:fixed;bottom:24px;right:24px;width:40px;height:40px;border-radius:50%;background:var(--surface);border:1px solid var(--border);color:var(--soft);font-size:1.1rem;cursor:pointer;display:none;align-items:center;justify-content:center;z-index:50;box-shadow:var(--shadow-lg);transition:all .25s;opacity:0}
+.back-to-top.show{display:flex;opacity:1}
+.back-to-top:hover{background:var(--brand);color:#fff;border-color:var(--brand);transform:translateY(-2px)}
+
 /* Premium additions */
 .card{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);padding:20px;margin-bottom:16px;box-shadow:var(--shadow);transition:box-shadow .2s,transform .2s}
 .card:hover{box-shadow:var(--shadow-lg);transform:translateY(-1px)}
@@ -552,70 +560,74 @@ body{font-family:-apple-system,'Segoe UI',system-ui,sans-serif;background:var(--
 <div class="app" id="app">
   <!-- Sidebar -->
   <div class="sidebar">
-    <h1>🎬 B站AI摘要</h1>
+    <div class="sidebar-top">
+      <h1>🎬 B站AI摘要</h1>
 
-    <div class="notice" id="noR2Notice" style="display:none">
-      💡 结果通过<strong>邮件发送</strong>，收到后可在详情页手动添加总结内容。
+      <div class="notice" id="noR2Notice" style="display:none">
+        💡 结果通过<strong>邮件发送</strong>，收到后可在详情页手动添加总结内容。
+      </div>
+
+      <div class="form-group">
+        <label>B站视频链接或 BV 号</label>
+        <input id="urlInput" type="text" placeholder="bilibili.com/video/BVxxx 或直接输入BV号…"
+          onkeydown="if(event.key==='Enter')submitJob()" />
+      </div>
+
+      <details style="margin-bottom:16px">
+        <summary style="font-size:.82rem;color:var(--muted);cursor:pointer">⚙️ 高级配置</summary>
+        <div style="margin-top:10px">
+          <div class="form-group">
+            <label>API Key (硅基流动)</label>
+            <input id="apiKeyInput" type="password" placeholder="留空使用服务端配置" />
+          </div>
+          <div class="form-group">
+            <label>语音转文字模型</label>
+            <input id="sttModelSelect" type="text" list="sttModelList" placeholder="FunAudioLLM/SenseVoiceSmall (默认)" />
+            <datalist id="sttModelList">
+              <option value="FunAudioLLM/SenseVoiceSmall">SenseVoiceSmall (默认)</option>
+              <option value="FunAudioLLM/SenseVoiceLarge">SenseVoiceLarge</option>
+            </datalist>
+          </div>
+          <div class="form-group">
+            <label>AI 总结模型</label>
+            <input id="summaryModelSelect" type="text" list="summaryModelList" placeholder="Qwen/Qwen3-8B (默认)" />
+            <datalist id="summaryModelList">
+              <option value="Qwen/Qwen3-8B">Qwen3-8B (默认)</option>
+              <option value="Qwen/Qwen3-14B">Qwen3-14B</option>
+              <option value="deepseek-ai/DeepSeek-V3">DeepSeek V3</option>
+              <option value="Pro/Qwen/Qwen3-8B">Qwen3-8B (Pro)</option>
+            </datalist>
+          </div>
+          <div class="form-group">
+            <label>自定义总结模板（可选）</label>
+            <textarea id="summaryTemplateInput" rows="4" style="width:100%;padding:8px 10px;border:1px solid var(--border);border-radius:8px;background:var(--bg);color:var(--text);font-size:.82rem;line-height:1.5;resize:vertical;outline:0;font-family:inherit" placeholder="留空使用默认模板&#10;填入模板后，{content} 会被替换为字幕文本"></textarea>
+          </div>
+        </div>
+      </details>
+
+      <button class="btn btn-primary" id="submitBtn" onclick="submitJob()">
+        🚀 开始处理
+      </button>
+      <div id="submitStatus" style="margin-top:10px;font-size:.82rem"></div>
     </div>
 
-    <div class="form-group">
-      <label>B站视频链接或 BV 号</label>
-      <input id="urlInput" type="text" placeholder="bilibili.com/video/BVxxx 或直接输入BV号…"
-        onkeydown="if(event.key==='Enter')submitJob()" />
-    </div>
-
-    <details style="margin-bottom:16px">
-      <summary style="font-size:.82rem;color:var(--muted);cursor:pointer">⚙️ 高级配置</summary>
-      <div style="margin-top:10px">
-        <div class="form-group">
-          <label>API Key (硅基流动)</label>
-          <input id="apiKeyInput" type="password" placeholder="留空使用服务端配置" />
+    <div class="sidebar-history">
+      <div style="flex-shrink:0">
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
+          <span style="font-size:.82rem;font-weight:700;color:var(--soft)">📋 历史记录</span>
+          <div class="flex" style="gap:4px">
+            <button class="btn btn-sm btn-outline" onclick="toggleSelectAll()" style="font-size:.75rem;padding:4px 10px" title="全选">☑️ 全选</button>
+            <button class="btn btn-sm btn-outline" onclick="invertSelection()" style="font-size:.75rem;padding:4px 10px" title="反选">🔄 反选</button>
+            <button class="btn btn-sm btn-danger" onclick="deleteSelectedJobs()" style="font-size:.75rem;padding:4px 10px" title="删除选中/全选时删除全部">🗑 删除</button>
+            <span id="countBadge" class="badge"></span>
+          </div>
         </div>
-        <div class="form-group">
-          <label>语音转文字模型</label>
-          <input id="sttModelSelect" type="text" list="sttModelList" placeholder="FunAudioLLM/SenseVoiceSmall (默认)" />
-          <datalist id="sttModelList">
-            <option value="FunAudioLLM/SenseVoiceSmall">SenseVoiceSmall (默认)</option>
-            <option value="FunAudioLLM/SenseVoiceLarge">SenseVoiceLarge</option>
-          </datalist>
-        </div>
-        <div class="form-group">
-          <label>AI 总结模型</label>
-          <input id="summaryModelSelect" type="text" list="summaryModelList" placeholder="Qwen/Qwen3-8B (默认)" />
-          <datalist id="summaryModelList">
-            <option value="Qwen/Qwen3-8B">Qwen3-8B (默认)</option>
-            <option value="Qwen/Qwen3-14B">Qwen3-14B</option>
-            <option value="deepseek-ai/DeepSeek-V3">DeepSeek V3</option>
-            <option value="Pro/Qwen/Qwen3-8B">Qwen3-8B (Pro)</option>
-          </datalist>
-        </div>
-        <div class="form-group">
-          <label>自定义总结模板（可选）</label>
-          <textarea id="summaryTemplateInput" rows="4" style="width:100%;padding:8px 10px;border:1px solid var(--border);border-radius:8px;background:var(--bg);color:var(--text);font-size:.82rem;line-height:1.5;resize:vertical;outline:0;font-family:inherit" placeholder="留空使用默认模板&#10;填入模板后，{content} 会被替换为字幕文本"></textarea>
+        <div class="search-wrap">
+          <span class="icon">🔍</span>
+          <input class="search-box" id="searchInput" type="text" placeholder="搜索标题或BV号…" oninput="renderList()" />
         </div>
       </div>
-    </details>
-
-    <button class="btn btn-primary" id="submitBtn" onclick="submitJob()">
-      🚀 开始处理
-    </button>
-    <div id="submitStatus" style="margin-top:10px;font-size:.82rem"></div>
-
-    <div style="margin-top:20px;padding-top:16px;border-top:1px solid var(--border)">
-      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
-        <span style="font-size:.82rem;font-weight:700;color:var(--soft)">📋 历史记录</span>
-        <div class="flex" style="gap:4px">
-          <button class="btn btn-sm btn-outline" onclick="toggleSelectAll()" style="font-size:.75rem;padding:4px 10px" title="全选">☑️ 全选</button>
-          <button class="btn btn-sm btn-outline" onclick="invertSelection()" style="font-size:.75rem;padding:4px 10px" title="反选">🔄 反选</button>
-          <button class="btn btn-sm btn-danger" onclick="deleteSelectedJobs()" style="font-size:.75rem;padding:4px 10px" title="删除选中/全选时删除全部">🗑 删除</button>
-          <span id="countBadge" class="badge"></span>
-        </div>
-      </div>
-      <div class="search-wrap">
-        <span class="icon">🔍</span>
-        <input class="search-box" id="searchInput" type="text" placeholder="搜索标题或BV号…" oninput="renderList()" />
-      </div>
-      <div id="historyList" style="max-height:490px;overflow-y:auto"></div>
+      <div class="history-inner" id="historyList"></div>
     </div>
   </div>
 
@@ -681,6 +693,8 @@ body{font-family:-apple-system,'Segoe UI',system-ui,sans-serif;background:var(--
     </div>  </div>
 </div>
 
+<button class="back-to-top" id="backToTop" onclick="scrollToTop()" title="回到顶部">↑</button>
+
 <script>
 // ═══════════════════════════════════════════════════════
 // Data
@@ -742,7 +756,6 @@ async function submitJob() {
         {name:'任务创建', done:true, active:false, msg:'已提交至处理队列'},
         {name:'下载视频音频', done:false, active:false, msg:'等待处理…'},
         {name:'语音转录', done:false, active:false, msg:''},
-        {name:'生成 Markdown', done:false, active:false, msg:''},
         {name:'LLM 整理总结', done:false, active:false, msg:''},
         {name:'后处理及文件导出', done:false, active:false, msg:''},
         {name:'处理完成', done:false, active:false, msg:''},
@@ -838,11 +851,11 @@ function renderDetail(id) {
   const job=getJobs().find(j=>j.id===id);
   if(!job) return;
 
-  // Progress steps — 2-row layout: row1[0,1,2] row2[3,4,5,6]
+  // Progress steps — 2-row layout: row1[0,1,2] row2[3,4,5]
   const pe=document.getElementById('progressSteps');
   if(pe){
     const row1=job.steps.slice(0,3);
-    const row2=job.steps.slice(3,7);
+    const row2=job.steps.slice(3,6);
     const renderRow=arr=>arr.map(s=>{
       const cls=s.done?'done':s.active?'active':'pending';
       const msg=s.msg?'<div class="step-msg">'+escHtml(s.msg)+'</div>':'';
@@ -930,8 +943,8 @@ async function pollJobStatus(jobId) {
     job.steps = job.steps.map((s, i) => {
       let msg = '';
       if (i === 1 && timings.stt) msg = formatTime(timings.stt);
-      else if (i === 4 && timings.summary) msg = formatTime(timings.summary);
-      else if (i === 6 && timings.total) msg = formatTime(timings.total);
+      else if (i === 3 && timings.summary) msg = formatTime(timings.summary);
+      else if (i === 5 && timings.total) msg = formatTime(timings.total);
       return {...s, done: true, active: false, msg: msg || '✅ 完成'};
     });
     
@@ -975,9 +988,9 @@ function downloadTranscript() {
 function downloadSummary() {
   const job=getSelectedJob();
   if(!job||!job.summary) return;
-  const blob=new Blob([job.summary],{type:'text/plain;charset=utf-8'});
+  const blob=new Blob([job.summary],{type:'text/markdown;charset=utf-8'});
   const a=document.createElement('a');a.href=URL.createObjectURL(blob);
-  a.download=\`\${job.bvid}_summary.txt\`;a.click();
+  a.download=\`\${job.bvid}_summary.md\`;a.click();
 }
 
 function downloadTranscriptMD() {
@@ -1117,6 +1130,21 @@ function updateBadge() {
   const jobs=getJobs();
   document.getElementById('countBadge').textContent=\`\${jobs.length} 条\`;
 }
+
+// Back to top
+function scrollToTop() {
+  const main=document.getElementById('mainContent');
+  main.scrollTo({top:0,behavior:'smooth'});
+}
+(function(){
+  const main=document.getElementById('mainContent');
+  const btn=document.getElementById('backToTop');
+  if(main&&btn){
+    main.addEventListener('scroll',function(){
+      btn.classList.toggle('show',main.scrollTop>300);
+    });
+  }
+})();
 
 function formatPubDate(ts) {
   if(!ts) return '';
