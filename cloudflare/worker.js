@@ -210,8 +210,8 @@ async function handlePostHistory(request, env) {
   try {
     const body = await request.json();
     const jobs = body.jobs || [];
-    // Keep max 30 items to stay within R2 free tier (~30kb)
-    const trimmed = jobs.slice(0, 30);
+    // Keep max 100 items to stay within R2 free tier (~100kb)
+    const trimmed = jobs.slice(0, 100);
     await env.BILIBILI_BUCKET.put(HISTORY_KEY, JSON.stringify({ jobs: trimmed, updated_at: nowISO() }),
       { httpMetadata: { contentType: 'application/json' } }
     );
@@ -668,7 +668,7 @@ html,body{overflow:auto!important;height:auto!important}
       <div class="form-group">
         <label>B站视频链接或 BV/AV 号</label>
         <div style="display:flex;gap:6px">
-        <input id="urlInput" type="text" placeholder="直接粘贴链接（含标题），系统自动提取…"
+        <input id="urlInput" type="text" placeholder="可直接粘贴链接（含标题），系统自动提取…"
           onkeydown="if(event.key==='Enter')submitJob()" style="flex:1" />
         <button class="btn btn-sm btn-outline" onclick="pasteUrl()" title="从剪贴板粘贴" style="padding:4px 10px;font-size:.9rem">📋</button>
         </div>
@@ -753,7 +753,7 @@ html,body{overflow:auto!important;height:auto!important}
       <div class="layout-bar">
         <span class="lbl">排版:</span>
         <button class="layout-btn active" data-layout="v" onclick="setLayout('v')" title="垂直排版">↕ 垂直</button>
-        <button class="layout-btn" data-layout="h" onclick="setLayout('h')" title="水平分列（可拖拽）">↔ 水平/分列</button>
+        <button class="layout-btn" data-layout="h" onclick="setLayout('h')" title="水平分列（可拖拽）">↔水平</button>
       </div>
 
       <div class="detail-body" id="detailBody">
@@ -1103,7 +1103,7 @@ function renderList() {
     const checked=selSet.has(j.id)?'checked':'';
     const ago=timeAgo(j.created_at);
     const meta=[];
-    if(j.bvid) meta.push('<span class="meta-tag"><a href="https://www.bilibili.com/video/'+j.bvid+'" target="_blank" onclick="event.stopPropagation()" class="meta-link">BV'+escHtml(j.bvid)+' ↗</a></span>');
+    if(j.bvid) meta.push('<span class="meta-tag"><a href="https://www.bilibili.com/video/'+j.bvid+'" target="_blank" onclick="event.stopPropagation()" class="meta-link">'+escHtml(j.bvid)+' ↗</a></span>');
     if(j.owner) meta.push('<span class="meta-tag">👤 '+escHtml(j.owner)+'</span>');
     if(j.timings&&j.timings.total) meta.push('<span class="meta-tag">⏱️ '+formatTime(j.timings.total)+'</span>');
     return '<div class="job-item '+sel+'" onclick="selectJob('+Q+j.id+Q+')">'+
