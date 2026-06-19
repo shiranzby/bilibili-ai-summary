@@ -109,14 +109,16 @@ UP主UID获取：打开UP主主页，URL末尾的数字。
 
 部署 Worker 后访问其 URL 即可打开 Web UI：
 
-- 🚀 输入BV号手动触发处理
-- 📊 **实时进度** — 轮询 GitHub Actions 运行状态，显示中间步骤
-- 📝 **转录文本** — 手风琴展开查看
-- 🤖 **AI 总结** — 内联查看 + 编辑切换
-- 📧 **邮件预览** — HTML 邮件样式预览
-- 🔍 **历史搜索** — 按标题/BV号搜索历史记录
-- 🗑 **清除全部** — 一键清空历史
+- 🚀 输入BV/av号或直接粘贴链接手动触发处理
+- 📊 **实时进度** — 轮询 GitHub Actions 运行状态，显示 6 步进度箭头流程图
+- 📝 **转录文本** — 手风琴展开查看，支持 TXT / MD 下载
+- 🤖 **AI 总结** — 支持 MD / TXT / HTML 下载
+- 🎨 **排版布局** — 垂直 / 水平（可拖拽分列）双模式切换
+- 🔍 **历史搜索** — 按标题、BV号、UP主名、日期搜索
+- 🔄 **跨设备同步** — 历史记录通过 R2 同步，多设备共享
+- 🗑 **批量管理** — 全选/反选/批量删除
 - 🌓 **深色模式** — 切换深色/浅色主题
+- 📐 **拖拽分隔** — Sidebar 宽度可自由拖拽调整
 
 ---
 
@@ -135,7 +137,6 @@ bilibili_summary/
 ├── send_result_email.py   # 单条结果邮件发送
 ├── inject_config.py       # Secrets 注入
 ├── requirements.txt       # 仅 requests + openai
-├── state.json             # 已处理视频记录
 └── .github/workflows/
     └── summary.yml        # GitHub Actions 工作流
 
