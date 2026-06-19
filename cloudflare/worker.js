@@ -463,12 +463,14 @@ body{font-family:-apple-system,'Segoe UI',system-ui,sans-serif;background:var(--
 .main h2{font-size:1rem;font-weight:700;margin-bottom:12px;color:var(--soft);text-transform:uppercase;letter-spacing:.03em}
 /* Notice */
 .notice{padding:12px 16px;background:#fef3c7;border:1px solid #f59e0b;border-radius:10px;font-size:.82rem;color:#92400e;margin-bottom:16px;line-height:1.6}
-/* Progress — horizontal compact */
-.progress{display:flex;flex-wrap:wrap;gap:6px;margin-bottom:16px}
-.progress-step{display:flex;align-items:center;gap:6px;padding:6px 10px;background:var(--surface);border:1px solid var(--border);border-radius:6px;font-size:.78rem;white-space:nowrap}
-.progress-step .icon{font-size:.8rem}
-.progress-step .step-label{font-weight:600}
-.progress-step .step-msg{font-size:.7rem;color:var(--muted)}
+/* Progress — 2-row grid: row1=3 steps, row2=4 steps */
+.progress{margin-bottom:16px}
+.progress-row{display:grid;gap:6px;margin-bottom:6px}
+.progress-row.r1{grid-template-columns:1fr 1fr 1fr}
+.progress-row.r2{grid-template-columns:1fr 1fr 1fr 1fr}
+.progress-step{display:flex;flex-direction:column;align-items:center;justify-content:center;text-align:center;padding:8px 6px;background:var(--surface);border:1px solid var(--border);border-radius:6px;font-size:.75rem;min-height:48px}
+.progress-step .step-label{font-weight:600;line-height:1.3}
+.progress-step .step-msg{font-size:.7rem;color:var(--muted);margin-top:2px}
 .progress-step.done{border-color:var(--success);background:#f0fdf4;opacity:.85}
 .progress-step.active{border-color:var(--accent);background:#eff6ff;animation:pulse 2s ease-in-out infinite}
 .progress-step.pending{opacity:.5}
@@ -605,8 +607,7 @@ body{font-family:-apple-system,'Segoe UI',system-ui,sans-serif;background:var(--
         <div class="flex" style="gap:4px">
           <button class="btn btn-sm btn-outline" onclick="toggleSelectAll()" style="font-size:.75rem;padding:4px 10px" title="全选">☑️ 全选</button>
           <button class="btn btn-sm btn-outline" onclick="invertSelection()" style="font-size:.75rem;padding:4px 10px" title="反选">🔄 反选</button>
-          <button class="btn btn-sm btn-danger" onclick="deleteSelectedJobs()" style="font-size:.75rem;padding:4px 10px" title="删除选中">🗑 删除</button>
-          <button class="btn btn-sm btn-outline" onclick="clearAllJobs()" style="font-size:.75rem;padding:4px 10px" title="清除全部">🗑 全部</button>
+          <button class="btn btn-sm btn-danger" onclick="deleteSelectedJobs()" style="font-size:.75rem;padding:4px 10px" title="删除选中/全选时删除全部">🗑 删除</button>
           <span id="countBadge" class="badge"></span>
         </div>
       </div>
@@ -614,7 +615,7 @@ body{font-family:-apple-system,'Segoe UI',system-ui,sans-serif;background:var(--
         <span class="icon">🔍</span>
         <input class="search-box" id="searchInput" type="text" placeholder="搜索标题或BV号…" oninput="renderList()" />
       </div>
-      <div id="historyList"></div>
+      <div id="historyList" style="max-height:490px;overflow-y:auto"></div>
     </div>
   </div>
 
@@ -638,7 +639,9 @@ body{font-family:-apple-system,'Segoe UI',system-ui,sans-serif;background:var(--
           <span class="status-icon">📝</span>
           <span class="label">转录文本</span>
           <span style="flex:1"></span>
-          <button class="btn btn-sm btn-outline" onclick="event.stopPropagation();downloadTranscript()">⬇ 下载</button>
+          <button class="btn btn-sm btn-outline" onclick="event.stopPropagation();downloadTranscript()" title="TXT">⬇ TXT</button>
+          <button class="btn btn-sm btn-outline" onclick="event.stopPropagation();downloadTranscriptMD()" title="Markdown">📄 MD</button>
+          <button class="btn btn-sm btn-outline" onclick="event.stopPropagation();previewTranscript()" title="HTML预览">👁 预览</button>
           <button class="btn btn-sm btn-outline" onclick="event.stopPropagation();copyTranscript()">📋 复制</button>
         </div>
         <div class="accordion-body">
@@ -653,7 +656,10 @@ body{font-family:-apple-system,'Segoe UI',system-ui,sans-serif;background:var(--
           <span class="status-icon">🤖</span>
           <span class="label">AI 总结</span>
           <span style="flex:1"></span>
-          <button class="btn btn-sm btn-outline" onclick="event.stopPropagation();downloadSummary()">⬇ 下载</button>
+          <button class="btn btn-sm btn-outline" onclick="event.stopPropagation();downloadSummary()" title="Markdown">📄 MD</button>
+          <button class="btn btn-sm btn-outline" onclick="event.stopPropagation();downloadSummaryHTML()" title="Fancy HTML">🌐 HTML</button>
+          <button class="btn btn-sm btn-outline" onclick="event.stopPropagation();previewSummary()" title="打开预览">👁 预览</button>
+          <button class="btn btn-sm btn-outline" onclick="event.stopPropagation();printSummary()" title="打印/导出PDF">🖨 PDF</button>
           <button class="btn btn-sm btn-outline" onclick="event.stopPropagation();copySummary()">📋 复制</button>
         </div>
         <div class="accordion-body">
@@ -798,7 +804,7 @@ function renderList() {
     const checked=selSet.has(j.id)?'checked':'';
     const ago=timeAgo(j.created_at);
     const meta=[];
-    if(j.bvid) meta.push('<a href="https://www.bilibili.com/video/'+j.bvid+'" target="_blank" onclick="event.stopPropagation()" class="meta-link">BV'+escHtml((j.bvid.length>2?j.bvid.substring(2):j.bvid))+' ↗</a>');
+    if(j.bvid) meta.push('<span class="meta-tag"><a href="https://www.bilibili.com/video/'+j.bvid+'" target="_blank" onclick="event.stopPropagation()" class="meta-link">BV'+escHtml(j.bvid)+' ↗</a></span>');
     if(j.owner) meta.push('<span class="meta-tag">👤 '+escHtml(j.owner)+'</span>');
     if(j.pubdate) meta.push('<span class="meta-tag">📅 '+formatPubDate(j.pubdate)+'</span>');
     if(j.timings&&j.timings.total) meta.push('<span class="meta-tag">⏱️ '+formatTime(j.timings.total)+'</span>');
@@ -806,7 +812,7 @@ function renderList() {
       '<input type="checkbox" class="job-check" '+checked+' onclick="event.stopPropagation();toggleJobCheck('+Q+j.id+Q+',this.checked)" />'+
       '<div class="status '+cls+'">'+icon+'</div>'+
       '<div class="job-info">'+
-        '<div class="job-title">'+(j.title ? '<a href="https://www.bilibili.com/video/'+j.bvid+'" target="_blank" onclick="event.stopPropagation()">'+escHtml(j.title)+' <span class="link-icon">↗</span></a>' : escHtml(j.bvid))+'</div>'+
+        '<div class="job-title">'+escHtml(j.title||j.bvid)+'</div>'+
         '<div class="job-meta">'+meta.join('')+'</div>'+
         '<div class="job-time">'+ago+'</div>'+
       '</div>'+
@@ -832,15 +838,18 @@ function renderDetail(id) {
   const job=getJobs().find(j=>j.id===id);
   if(!job) return;
 
-  // Progress steps — compact horizontal
+  // Progress steps — 2-row layout: row1[0,1,2] row2[3,4,5,6]
   const pe=document.getElementById('progressSteps');
-  if(pe) pe.innerHTML=job.steps.map(s=>{
-    const cls=s.done?'done':s.active?'active':'pending';
-    const msg=s.msg?'<span class="step-msg">'+escHtml(s.msg)+'</span>':'';
-    return '<div class="progress-step '+cls+'" title="'+escHtml(s.msg||'')+'">'+
-      '<span class="step-label">'+s.name+'</span>'+msg+
-    '</div>';
-  }).join('');
+  if(pe){
+    const row1=job.steps.slice(0,3);
+    const row2=job.steps.slice(3,7);
+    const renderRow=arr=>arr.map(s=>{
+      const cls=s.done?'done':s.active?'active':'pending';
+      const msg=s.msg?'<div class="step-msg">'+escHtml(s.msg)+'</div>':'';
+      return '<div class="progress-step '+cls+'"><span class="step-label">'+s.name+'</span>'+msg+'</div>';
+    }).join('');
+    pe.innerHTML='<div class="progress-row r1">'+renderRow(row1)+'</div><div class="progress-row r2">'+renderRow(row2)+'</div>';
+  }
 
   // Transcript
   const tc=document.getElementById('transcriptContent');
@@ -868,8 +877,6 @@ function toggleAccordion(header) {
   body.classList.toggle('hidden');
 }
 
-// ═══════════════════════════════════════════════════════
-// Summary Edit Toggle
 // ═══════════════════════════════════════════════════════
 // Polling: Refresh job status from R2
 // ═══════════════════════════════════════════════════════
@@ -973,6 +980,45 @@ function downloadSummary() {
   a.download=\`\${job.bvid}_summary.txt\`;a.click();
 }
 
+function downloadTranscriptMD() {
+  const job=getSelectedJob();
+  if(!job||!job.transcript) return;
+  const NL=String.fromCharCode(10);
+  const md='# 转录文本'+NL+NL+'**视频**: '+job.bvid+NL+NL+job.transcript.split(NL).map(l=>'> '+l).join(NL);
+  const blob=new Blob([md],{type:'text/markdown;charset=utf-8'});
+  const a=document.createElement('a');a.href=URL.createObjectURL(blob);
+  a.download=job.bvid+'_transcript.md';a.click();
+}
+function downloadSummaryHTML() {
+  const job=getSelectedJob();
+  if(!job||!job.summary) return;
+  const html=buildEmailHTML(job.bvid, job.summary);
+  const blob=new Blob(['<!DOCTYPE html><html><head><meta charset="UTF-8"><title>'+escHtml(job.title||job.bvid)+'</title></head><body>'+html+'</body></html>'],{type:'text/html;charset=utf-8'});
+  const a=document.createElement('a');a.href=URL.createObjectURL(blob);
+  a.download=\`\${job.bvid}_summary.html\`;a.click();
+}
+function previewTranscript() {
+  const job=getSelectedJob();
+  if(!job||!job.transcript) return;
+  const html='<!DOCTYPE html><html><head><meta charset="UTF-8"><title>转录文本 - '+escHtml(job.bvid)+'</title><style>body{font-family:-apple-system,sans-serif;max-width:800px;margin:40px auto;padding:20px;line-height:1.8;color:#333;background:#fafafa}h2{color:#0891b2}.content{white-space:pre-wrap;background:#fff;padding:24px;border-radius:12px;box-shadow:0 1px 3px rgba(0,0,0,.1)}</style></head><body><h2>转录文本</h2><p>BV: '+escHtml(job.bvid)+'</p><div class="content">'+escHtml(job.transcript)+'</div></body></html>';
+  const w=window.open('','_blank');
+  w.document.write(html);w.document.close();
+}
+function previewSummary() {
+  const job=getSelectedJob();
+  if(!job||!job.summary) return;
+  const w=window.open('','_blank');
+  w.document.write('<!DOCTYPE html><html><head><meta charset="UTF-8"><title>'+escHtml(job.title||job.bvid)+'</title></head><body>'+buildEmailHTML(job.bvid,job.summary)+'</body></html>');
+  w.document.close();
+}
+function printSummary() {
+  const job=getSelectedJob();
+  if(!job||!job.summary) return;
+  const w=window.open('','_blank');
+  w.document.write('<!DOCTYPE html><html><head><meta charset="UTF-8"><title>'+escHtml(job.title||job.bvid)+'</title><style>@media print{body{margin:0;padding:20px}}</style></head><body>'+buildEmailHTML(job.bvid,job.summary)+'<'+'/script><script>setTimeout(function(){window.print();window.close()},500);<'+'/script></body></html>');
+  w.document.close();
+}
+
 // ═══════════════════════════════════════════════════════
 // Delete
 // ═══════════════════════════════════════════════════════
@@ -1067,6 +1113,11 @@ function timeAgo(iso) {
   return new Date(iso).toLocaleDateString('zh-CN',{month:'short',day:'numeric'});
 }
 
+function updateBadge() {
+  const jobs=getJobs();
+  document.getElementById('countBadge').textContent=\`\${jobs.length} 条\`;
+}
+
 function formatPubDate(ts) {
   if(!ts) return '';
   return new Date(ts*1000).toLocaleDateString('zh-CN',{year:'numeric',month:'2-digit',day:'2-digit'});
@@ -1107,7 +1158,20 @@ function invertSelection() {
 }
 function deleteSelectedJobs() {
   if(!selectedIds||selectedIds.length===0) { showStatus('请先勾选记录','error'); return; }
-  if(!confirm('确定删除已勾选的 '+selectedIds.length+' 条记录？')) return;
+  const total=getJobs().length;
+  const isAll=selectedIds.length>=total;
+  const msg=isAll?'确定清除所有 '+total+' 条历史记录？此操作不可撤销！':'确定删除已勾选的 '+selectedIds.length+' 条记录？';
+  if(!confirm(msg)) return;
+  if(isAll){
+    localStorage.removeItem(LS_JOBS);
+    selectedJobId=null;
+    selectedIds=[];
+    document.getElementById('emptyState').classList.remove('hidden');
+    document.getElementById('detailView').classList.add('hidden');
+    renderList();
+    updateBadge();
+    return;
+  }
   const ids=new Set(selectedIds);
   const jobs=getJobs().filter(j=>!ids.has(j.id));
   if(ids.has(selectedJobId)){
