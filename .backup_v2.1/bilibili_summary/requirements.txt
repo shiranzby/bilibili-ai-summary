@@ -1,5 +1,0 @@
-# Bilibili Monitor 最低依赖 (极致精简版)
-# 使用: pip install -r requirements.txt
-
-requests>=2.28.0
-openai>=1.0.0

@@ -26,11 +26,15 @@
 
 ### 手动提交模式（Web UI）
 
-![手动提交工作流](images/workflow1.png)
+<p align="center">
+  <img src="images/workflow1.png" alt="手动提交工作流" width="75%" />
+</p>
 
 ### 定时监控模式
 
-![定时监控工作流](images/workflow2.png)
+<p align="center">
+  <img src="images/workflow2.png" alt="定时监控工作流" width="75%" />
+</p>
 
 > **关键优化**: .m4s 本身是 AAC 音频容器，直接改名 .m4a 上传，**无需 ffmpeg 转码**。
 > 依赖仅 2 个 pip 包 (requests + openai)，安装只需 12 秒。
