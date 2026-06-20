@@ -2,3 +2,7 @@ cloudflare/.wrangler/
 .wrangler/
 __pycache__/
 *.pyc
+.backup_*
+v*.md
+tmp_*
+.workbuddy/
