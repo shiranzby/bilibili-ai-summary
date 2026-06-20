@@ -155,9 +155,6 @@ bilibili-ai-summary/
 ├── images/
 │   ├── workflow1.png          # 手动提交工作流示意图
 │   └── workflow2.png          # 定时监控工作流示意图
-├── PROJECT_MEMORY.md          # 🧠 项目长期记忆（架构/设计/踩坑记录）
-├── SOUL.md                    # 🔥 AI 工作经验（输出规范/常见失误/技术模式）
-├── LESSONS_LEARNED.md         # 📖 经验教训库（每次问题的根因与解决）
 ├── bilibili_summary/
 │   ├── config.py              # 🔑 配置文件
 │   ├── bili_api.py            # B站API封装
