@@ -504,10 +504,9 @@ html{height:100%;overflow:hidden}
 .app{grid-template-columns:1fr;height:auto;min-height:100vh}
 html,body{overflow:auto!important;height:auto!important}
 .sidebar{height:auto;overflow:visible}
-.sidebar-history .history-inner{min-height:260px}
+.sidebar-history .history-inner{max-height:260px;min-height:0}
 .main{max-height:none;overflow-y:visible}
 .divider{display:none}
-.back-to-top{display:none!important}
 .detail-body.layout-h .detail-pair{display:block}
 .detail-body.layout-h .detail-pair .detail-panel{width:100%}
 .detail-body.layout-h .pair-divider{display:none}
@@ -784,9 +783,8 @@ html,body{overflow:auto!important;height:auto!important}
             <span class="status-icon">🤖</span>
             <span class="label">AI 总结</span>
             <span style="flex:1"></span>
-            <button class="btn btn-sm btn-outline" onclick="event.stopPropagation();downloadSummary()" title="Markdown">📄 MD</button>
             <button class="btn btn-sm btn-outline" onclick="event.stopPropagation();downloadSummaryTXT()" title="TXT">⬇ TXT</button>
-            <button class="btn btn-sm btn-outline" onclick="event.stopPropagation();downloadSummaryHTML()" title="Fancy HTML">🌐 HTML</button>
+            <button class="btn btn-sm btn-outline" onclick="event.stopPropagation();downloadSummary()" title="Markdown">📄 MD</button>
             <button class="btn btn-sm btn-outline" onclick="event.stopPropagation();copySummary()">📋 复制</button>
           </div>
           <div class="accordion-body">
@@ -1297,14 +1295,6 @@ function downloadTranscriptMD() {
   const a=document.createElement('a');a.href=URL.createObjectURL(blob);
   a.download=job.bvid+'_transcript.md';a.click();
 }
-function downloadSummaryHTML() {
-  const job=getSelectedJob();
-  if(!job||!job.summary) return;
-  const html=buildEmailHTML(job.bvid, job.summary);
-  const blob=new Blob(['<!DOCTYPE html><html><head><meta charset="UTF-8"><title>'+escHtml(job.title||job.bvid)+'</title></head><body>'+html+'</body></html>'],{type:'text/html;charset=utf-8'});
-  const a=document.createElement('a');a.href=URL.createObjectURL(blob);
-  a.download=\`\${job.bvid}_summary.html\`;a.click();
-}
 
 // ═══════════════════════════════════════════════════════
 // Delete
@@ -1372,23 +1362,6 @@ document.getElementById('emailInput').addEventListener('change', function(){
   if(keys.summaryTemplate) document.getElementById('summaryTemplateInput').value=keys.summaryTemplate;
   if(keys.email) document.getElementById('emailInput').value=keys.email;
 })();
-
-// ═══════════════════════════════════════════════════════
-// HTML Email Builder
-// ═══════════════════════════════════════════════════════
-function buildEmailHTML(bvid, summary) {
-  const html=summary.replace(/\\n/g, '<br>');
-  return \`<div style="font-family:-apple-system,'Segoe UI',sans-serif;max-width:600px;margin:0 auto;padding:24px;background:#f8fafc;border-radius:16px">
-<div style="background:linear-gradient(135deg,#0d9488,#0891b2);color:white;padding:28px 24px;border-radius:12px;margin-bottom:24px;box-shadow:0 4px 12px rgba(13,148,136,.2)">
-<div style="font-size:2rem;margin-bottom:8px">🎬</div>
-<h2 style="margin:0;font-size:1.3rem;font-weight:800">B站视频摘要</h2>
-<p style="margin:6px 0 0;opacity:.85;font-size:.9rem">\${bvid}</p>
-<a href="https://www.bilibili.com/video/\${bvid}" style="display:inline-block;margin-top:12px;padding:8px 20px;background:rgba(255,255,255,.2);border-radius:8px;color:white;text-decoration:none;font-weight:600;font-size:.85rem">🔗 前往B站观看 →</a>
-</div>
-<div style="background:white;border-radius:12px;padding:24px;box-shadow:0 1px 3px rgba(0,0,0,.06);line-height:1.8;font-size:.95rem;color:#334155">\${html}</div>
-<p style="margin-top:20px;text-align:center;font-size:.8rem;color:#94a3b8">由 B站AI摘要 自动生成</p>
-</div>\`;
-}
 
 // ═══════════════════════════════════════════════════════
 // Utils
