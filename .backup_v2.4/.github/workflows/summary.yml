@@ -1,0 +1,120 @@
+# B站AI摘要 - GitHub Actions 工作流
+# 定时监控: 每天 08:00 / 20:00 (北京时间 = UTC+8, cron 用 UTC)
+# Web触发: 通过 workflow_dispatch 处理单条视频
+# Secrets: SILICONFLOW_API_KEY / SMTP_USER / SMTP_PASS / SMTP_TO
+name: B站AI摘要
+
+on:
+  schedule:
+    - cron: '0 0,12 * * *'   # UTC 0:00/12:00 = 北京时间 8:00/20:00
+  workflow_dispatch:
+    inputs:
+      bvid:
+        description: 'B站视频 BV 号 (留空则运行自动监控)'
+        required: false
+        default: ''
+        type: string
+      job_id:
+        description: '任务 ID (可选)'
+        required: false
+        type: string
+      summary_template:
+        description: '自定义总结模板 (可选)'
+        required: false
+        default: ''
+        type: string
+
+permissions:
+  contents: write
+
+env:
+  PYTHONUNBUFFERED: 1
+
+jobs:
+  monitor:
+    if: ${{ inputs.bvid == '' || inputs.bvid == null }}
+    name: UP主监控
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+          cache: 'pip'
+          cache-dependency-path: bilibili_summary/requirements.txt
+      - name: 安装依赖
+        run: pip install -r bilibili_summary/requirements.txt
+
+      - name: 注入配置
+        env:
+          SILICONFLOW_API_KEY: ${{ secrets.SILICONFLOW_API_KEY }}
+          SMTP_USER: ${{ secrets.SMTP_USER }}
+          SMTP_PASS: ${{ secrets.SMTP_PASS }}
+          SMTP_TO: ${{ secrets.SMTP_TO }}
+        run: python bilibili_summary/inject_config.py
+      - name: 运行监控
+        run: |
+          cd bilibili_summary
+          [ ! -f state.json ] && echo '{"processed":{}}' > state.json
+          python monitor.py 2>&1
+      - name: 保存状态
+        if: success() || failure()
+        run: |
+          cd bilibili_summary
+          if [ -f state.json ] && ! git diff --quiet HEAD -- state.json 2>/dev/null; then
+            git config user.name "bilibili-bot"
+            git config user.email "bot@bilibili-summary.local"
+            git add state.json
+            git commit -m "chore: update state [skip ci]"
+            git push
+            echo "state.json updated"
+          else
+            echo "state.json unchanged, skip"
+          fi
+  process_single:
+    if: ${{ inputs.bvid != '' && inputs.bvid != null }}
+    name: 处理单条视频
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+          cache: 'pip'
+          cache-dependency-path: bilibili_summary/requirements.txt
+      - name: 安装依赖
+        run: pip install -r bilibili_summary/requirements.txt
+
+      - name: 注入配置
+        env:
+          SILICONFLOW_API_KEY: ${{ secrets.SILICONFLOW_API_KEY }}
+          SILICONFLOW_STT_MODEL: ${{ secrets.SILICONFLOW_STT_MODEL || 'FunAudioLLM/SenseVoiceSmall' }}
+          SILICONFLOW_SUMMARY_MODEL: ${{ secrets.SILICONFLOW_SUMMARY_MODEL || 'Qwen/Qwen3-8B' }}
+          SMTP_USER: ${{ secrets.SMTP_USER }}
+          SMTP_PASS: ${{ secrets.SMTP_PASS }}
+          SMTP_TO: ${{ secrets.SMTP_TO }}
+        run: python bilibili_summary/inject_config.py
+      - name: 处理视频 (音频 -> 语音识别 -> AI总结)
+        id: process
+        env:
+          BVID: ${{ inputs.bvid }}
+          SUMMARY_TEMPLATE: ${{ inputs.summary_template }}
+        run: |
+          cd bilibili_summary
+          python process_single.py "$BVID" --job-id "${{ inputs.job_id }}"
+      - name: 发送邮件通知
+        if: success() || failure()
+        env:
+          SMTP_USER: ${{ secrets.SMTP_USER }}
+          SMTP_PASS: ${{ secrets.SMTP_PASS }}
+          SMTP_TO: ${{ secrets.SMTP_TO }}
+        run: |
+          cd bilibili_summary
+          python send_result_email.py result.json 2>&1 || echo "[邮件] 发送失败（非致命）"
+      - name: 回调 Worker (写回 R2)
+        if: ${{ always() && inputs.job_id != '' && inputs.job_id != null }}
+        run: |
+          cd bilibili_summary
+          python callback_worker.py result.json "${{ inputs.job_id }}" "https://bilibili-ai-summary-api.shy2958779577.workers.dev" 2>&1 || echo "[回调] 失败（非致命）"

@@ -1,0 +1,16 @@
+name = "bilibili-ai-summary-api"
+main = "worker.js"
+compatibility_date = "2025-02-01"
+
+# ─── R2 Bucket 绑定 ────────────────────────────
+[[r2_buckets]]
+binding = "BILIBILI_BUCKET"
+bucket_name = "bilibili-summary"
+
+# ──────────────────────────────────────────────
+# Environment Variables (set via wrangler secret)
+# ──────────────────────────────────────────────
+# GH_OWNER   — GitHub repo owner (e.g. shiranzby)
+# GH_REPO    — GitHub repo name (e.g. bilibili-ai-summary)
+# GH_TOKEN   — GitHub Personal Access Token with repo & workflow scope
+# GH_REF     — Git branch (default: main)
