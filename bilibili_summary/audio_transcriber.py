@@ -113,6 +113,17 @@ def download_from_cdn(audio_url: str, output_path: str, timeout: int = 60) -> bo
 
 # ==================== 硅基流动 语音识别 ====================
 
+def _sf_err_detail(e: Exception) -> str:
+    """提取 SiliconFlow API 错误的详细消息"""
+    msg = str(e)
+    # openai.APIStatusError 含 response body
+    if hasattr(e, "response") and hasattr(e.response, "text"):
+        body = e.response.text[:500]
+        msg += f" | body: {body}"
+    elif hasattr(e, "body"):
+        msg += f" | body: {str(e.body)[:500]}"
+    return msg
+
 def transcribe_with_siliconflow(audio_path: str, api_key: str = "", model: str = "") -> Optional[str]:
     if not api_key:
         print(f"    [SiFlow] 未配置 API_KEY")
@@ -120,22 +131,39 @@ def transcribe_with_siliconflow(audio_path: str, api_key: str = "", model: str =
     model = model or "FunAudioLLM/SenseVoiceSmall"
     file_size = os.path.getsize(audio_path) / 1024 / 1024
     print(f"    [SiFlow] 上传 ({file_size:.1f} MB)...")
-    try:
-        from openai import OpenAI
-        client = OpenAI(api_key=api_key, base_url="https://api.siliconflow.cn/v1")
-        with open(audio_path, "rb") as f:
-            resp = client.audio.transcriptions.create(
-                model=model, file=f, language="zh", response_format="text",
-            )
-        text = resp if isinstance(resp, str) else getattr(resp, "text", str(resp))
-        if text and text.strip():
-            print(f"    [SiFlow] 转录成功 ({len(text)} 字符)")
-            return text
-        print(f"    [SiFlow] 返回文本为空")
+
+    # 检查文件大小：SiliconFlow 免费版限制通常为 25MB
+    if file_size > 25:
+        print(f"    [SiFlow] ❌ 文件过大 ({file_size:.1f}MB > 25MB)，跳过")
         return None
-    except Exception as e:
-        print(f"    [SiFlow] 失败: {e}")
-        return None
+
+    for attempt in range(3):
+        try:
+            from openai import OpenAI
+            client = OpenAI(api_key=api_key, base_url="https://api.siliconflow.cn/v1")
+            with open(audio_path, "rb") as f:
+                # 注意: 不加 language 参数（SiliconFlow 兼容 API 可能不支持）
+                # 使用 json 格式更兼容，手动提取 text
+                resp = client.audio.transcriptions.create(
+                    model=model,
+                    file=f,
+                    response_format="json",
+                )
+            text = resp.text if hasattr(resp, "text") else (resp if isinstance(resp, str) else "")
+            if text and text.strip():
+                print(f"    [SiFlow] 转录成功 ({len(text)} 字符, 尝试 {attempt+1})")
+                return text
+            print(f"    [SiFlow] 返回文本为空")
+            return None
+        except Exception as e:
+            detail = _sf_err_detail(e)
+            if attempt < 2:
+                import time; time.sleep(2 ** attempt)
+                print(f"    [SiFlow] 重试 {attempt+1}/3: {detail[:120]}...")
+            else:
+                print(f"    [SiFlow] 失败 (3次重试): {detail}")
+                return None
+    return None
 
 
 # ==================== 一站式入口 ====================

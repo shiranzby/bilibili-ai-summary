@@ -3,3 +3,5 @@
 
 requests>=2.28.0
 openai>=1.0.0
+# 注意: openai SDK v2+ 使用 client.audio.transcriptions.create()
+# response_format="json" 兼容性优于 "text"（部分兼容API不支持后者）
