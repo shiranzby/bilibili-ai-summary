@@ -61,7 +61,7 @@ def get_audio_urls_from_playurl(bvid: str, cid: int) -> Optional[list]:
             print(f"    [playurl] 未找到音频流")
             return None
 
-        best = dash["audio"][-1]
+        best = dash["audio"][0]
         urls = []
         if best.get("baseUrl"):
             urls.append(best["baseUrl"])
@@ -113,63 +113,29 @@ def download_from_cdn(audio_url: str, output_path: str, timeout: int = 60) -> bo
 
 # ==================== 硅基流动 语音识别 ====================
 
-
 def transcribe_with_siliconflow(audio_path: str, api_key: str = "", model: str = "") -> Optional[str]:
     if not api_key:
         print(f"    [SiFlow] 未配置 API_KEY")
         return None
     model = model or "FunAudioLLM/SenseVoiceSmall"
     file_size = os.path.getsize(audio_path) / 1024 / 1024
-    print(f"    [SiFlow] 上传 ({file_size:.1f} MB) 模型={model}...")
-
-    # 后端模型列表（按优先级）：SenseVoiceSmall 优先，TeleSpeechASR 备用
-    # SiliconFlow 500 错误通常与模型/文件兼容性有关，尝试自动切换
-    models_to_try = [model, "TeleAI/TeleSpeechASR"]
-    if model != "FunAudioLLM/SenseVoiceSmall":
-        models_to_try.insert(0, "FunAudioLLM/SenseVoiceSmall")
-
-    url = "https://api.siliconflow.cn/v1/audio/transcriptions"
-    headers = {"Authorization": f"Bearer {api_key}"}
-    # 使用直接 requests 方式（不用 OpenAI SDK，避免 SDK 版本兼容问题）
-
-    for m in models_to_try:
-        for attempt in range(2):
-            try:
-                with open(audio_path, "rb") as f:
-                    files = {"file": (os.path.basename(audio_path), f, "audio/mp4")}
-                    data = {"model": m}
-                    resp = requests.post(url, headers=headers, files=files, data=data, timeout=180)
-                if resp.status_code == 200:
-                    rj = resp.json()
-                    text = rj.get("text", "")
-                    if text and text.strip():
-                        print(f"    [SiFlow] 转录成功 ({len(text)} 字符, 模型={m})")
-                        return text
-                    print(f"    [SiFlow] 返回文本为空 (模型={m})")
-                    return None
-                else:
-                    msg = f"HTTP {resp.status_code}"
-                    body = resp.text[:300]
-                    if body:
-                        msg += f" | {body}"
-                    if attempt == 0 and m == models_to_try[-1]:
-                        # 最后一个模型的最后一次尝试
-                        pass
-                    if attempt == 0:
-                        import time; time.sleep(2)
-                        print(f"    [SiFlow] 模型={m} 重试: {msg}...")
-                    else:
-                        if m != models_to_try[-1]:
-                            print(f"    [SiFlow] 模型={m} 失败, 切换到备用模型...")
-                        else:
-                            print(f"    [SiFlow] 模型={m} 失败: {msg}")
-            except Exception as e:
-                if attempt == 0:
-                    import time; time.sleep(2)
-                    print(f"    [SiFlow] 模型={m} 重试: {e}...")
-                else:
-                    print(f"    [SiFlow] 模型={m} 失败: {e}")
-    return None
+    print(f"    [SiFlow] 上传 ({file_size:.1f} MB)...")
+    try:
+        from openai import OpenAI
+        client = OpenAI(api_key=api_key, base_url="https://api.siliconflow.cn/v1")
+        with open(audio_path, "rb") as f:
+            resp = client.audio.transcriptions.create(
+                model=model, file=f, language="zh", response_format="text",
+            )
+        text = resp if isinstance(resp, str) else getattr(resp, "text", str(resp))
+        if text and text.strip():
+            print(f"    [SiFlow] 转录成功 ({len(text)} 字符)")
+            return text
+        print(f"    [SiFlow] 返回文本为空")
+        return None
+    except Exception as e:
+        print(f"    [SiFlow] 失败: {e}")
+        return None
 
 
 # ==================== 一站式入口 ====================
