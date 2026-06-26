@@ -132,11 +132,6 @@ def transcribe_with_siliconflow(audio_path: str, api_key: str = "", model: str =
     file_size = os.path.getsize(audio_path) / 1024 / 1024
     print(f"    [SiFlow] 上传 ({file_size:.1f} MB)...")
 
-    # 检查文件大小：SiliconFlow 免费版限制通常为 25MB
-    if file_size > 25:
-        print(f"    [SiFlow] ❌ 文件过大 ({file_size:.1f}MB > 25MB)，跳过")
-        return None
-
     for attempt in range(3):
         try:
             from openai import OpenAI

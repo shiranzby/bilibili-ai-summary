@@ -70,15 +70,28 @@ def process(bvid: str, job_id: str = "", summary_template: str = "") -> dict:
     t_stt = round(time.time() - t1, 1)
     result["timings"]["stt"] = t_stt
 
-    if not audio_text:
-        result["status"] = "failed"
-        result["error"] = "语音识别失败"
-        result["timings"]["total"] = round(time.time() - t0, 1)
-        return result
+    # 语音识别失败时回退到视频描述（与 monitor.py 逻辑一致）
+    subtitle_text = audio_text
+    transcript_source = "stt"
+    if not subtitle_text:
+        desc = (info or {}).get("desc", "").strip()
+        if desc and len(desc) > 20:
+            print(f"[处理] ✅ 使用视频描述 ({len(desc)} 字符)", file=sys.stderr)
+            subtitle_text = f"[视频描述] {desc[:3000]}"
+            transcript_source = "desc"
+        else:
+            print(f"[处理] ⚠ 语音识别失败且无视频描述", file=sys.stderr)
+            result["status"] = "failed"
+            result["error"] = "语音识别失败，无视频描述可回退"
+            result["timings"]["total"] = round(time.time() - t0, 1)
+            return result
 
     # 清洗转录文本（去掉🎼等音乐符号）
-    result["transcript"] = clean_transcript(audio_text)
-    print(f"[处理] 转录完成 ({len(result['transcript'])} 字符, {t_stt}s)", file=sys.stderr)
+    if transcript_source == "stt":
+        result["transcript"] = clean_transcript(subtitle_text)
+    else:
+        result["transcript"] = subtitle_text
+    print(f"[处理] 转录完成{'（视频描述）' if transcript_source == 'desc' else ''} ({len(result['transcript'])} 字符, {t_stt}s)", file=sys.stderr)
 
     # Step 2: AI 总结（带自定义模板）
     template = summary_template or ""
