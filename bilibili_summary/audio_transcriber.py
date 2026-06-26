@@ -61,7 +61,7 @@ def get_audio_urls_from_playurl(bvid: str, cid: int) -> Optional[list]:
             print(f"    [playurl] 未找到音频流")
             return None
 
-        best = dash["audio"][0]
+        best = dash["audio"][-1]
         urls = []
         if best.get("baseUrl"):
             urls.append(best["baseUrl"])

@@ -2,6 +2,4 @@
 # 使用: pip install -r requirements.txt
 
 requests>=2.28.0
-openai>=1.0.0
-# 注意: openai SDK v2+ 使用 client.audio.transcriptions.create()
-# response_format="json" 兼容性优于 "text"（部分兼容API不支持后者）
+openai>=1.0.0,<2.44.0  # 2.44.0+ 破坏 SiliconFlow 兼容 API
