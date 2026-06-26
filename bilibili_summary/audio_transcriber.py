@@ -122,43 +122,53 @@ def transcribe_with_siliconflow(audio_path: str, api_key: str = "", model: str =
     file_size = os.path.getsize(audio_path) / 1024 / 1024
     print(f"    [SiFlow] 上传 ({file_size:.1f} MB) 模型={model}...")
 
+    # 后端模型列表（按优先级）：SenseVoiceSmall 优先，TeleSpeechASR 备用
+    # SiliconFlow 500 错误通常与模型/文件兼容性有关，尝试自动切换
+    models_to_try = [model, "TeleAI/TeleSpeechASR"]
+    if model != "FunAudioLLM/SenseVoiceSmall":
+        models_to_try.insert(0, "FunAudioLLM/SenseVoiceSmall")
+
     url = "https://api.siliconflow.cn/v1/audio/transcriptions"
     headers = {"Authorization": f"Bearer {api_key}"}
-    # 用一个较小的 2MB 文件先测试连通性，大文件再完整上传
     # 使用直接 requests 方式（不用 OpenAI SDK，避免 SDK 版本兼容问题）
 
-    for attempt in range(3):
-        try:
-            with open(audio_path, "rb") as f:
-                files = {"file": (os.path.basename(audio_path), f, "audio/mp4")}
-                data = {"model": model}
-                resp = requests.post(url, headers=headers, files=files, data=data, timeout=180)
-            if resp.status_code == 200:
-                rj = resp.json()
-                text = rj.get("text", "")
-                if text and text.strip():
-                    print(f"    [SiFlow] 转录成功 ({len(text)} 字符, 尝试 {attempt+1})")
-                    return text
-                print(f"    [SiFlow] 返回文本为空")
-                return None
-            else:
-                msg = f"HTTP {resp.status_code}"
-                body = resp.text[:300]
-                if body:
-                    msg += f" | {body}"
-                if attempt < 2:
-                    import time; time.sleep(2 ** attempt)
-                    print(f"    [SiFlow] 重试 {attempt+1}/3: {msg}...")
-                else:
-                    print(f"    [SiFlow] 失败 (3次重试): {msg}")
+    for m in models_to_try:
+        for attempt in range(2):
+            try:
+                with open(audio_path, "rb") as f:
+                    files = {"file": (os.path.basename(audio_path), f, "audio/mp4")}
+                    data = {"model": m}
+                    resp = requests.post(url, headers=headers, files=files, data=data, timeout=180)
+                if resp.status_code == 200:
+                    rj = resp.json()
+                    text = rj.get("text", "")
+                    if text and text.strip():
+                        print(f"    [SiFlow] 转录成功 ({len(text)} 字符, 模型={m})")
+                        return text
+                    print(f"    [SiFlow] 返回文本为空 (模型={m})")
                     return None
-        except Exception as e:
-            if attempt < 2:
-                import time; time.sleep(2 ** attempt)
-                print(f"    [SiFlow] 重试 {attempt+1}/3: {e}...")
-            else:
-                print(f"    [SiFlow] 失败 (3次重试): {e}")
-                return None
+                else:
+                    msg = f"HTTP {resp.status_code}"
+                    body = resp.text[:300]
+                    if body:
+                        msg += f" | {body}"
+                    if attempt == 0 and m == models_to_try[-1]:
+                        # 最后一个模型的最后一次尝试
+                        pass
+                    if attempt == 0:
+                        import time; time.sleep(2)
+                        print(f"    [SiFlow] 模型={m} 重试: {msg}...")
+                    else:
+                        if m != models_to_try[-1]:
+                            print(f"    [SiFlow] 模型={m} 失败, 切换到备用模型...")
+                        else:
+                            print(f"    [SiFlow] 模型={m} 失败: {msg}")
+            except Exception as e:
+                if attempt == 0:
+                    import time; time.sleep(2)
+                    print(f"    [SiFlow] 模型={m} 重试: {e}...")
+                else:
+                    print(f"    [SiFlow] 模型={m} 失败: {e}")
     return None
 
 
