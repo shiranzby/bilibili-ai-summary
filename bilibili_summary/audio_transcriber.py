@@ -11,6 +11,7 @@
 """
 
 import os
+import re
 import time
 import requests
 import tempfile
@@ -20,6 +21,7 @@ from bili_api import (
     _make_headers,
     _sign_wbi,
     fetch_video_bundle_from_proxy,
+    get_bili_proxy_url,
 )
 
 # 语音识别兜底模型列表 (主模型失败时依次尝试)
@@ -186,6 +188,80 @@ def download_from_cdn(audio_url: str, output_path: str, timeout: int = 60) -> bo
         return False
 
 
+def download_via_proxy(audio_url: str, output_path: str, chunk_size: int = 3 * 1024 * 1024) -> bool:
+    """
+    通过 Vercel 中继按 HTTP Range 分片下载音频 (每片 <= 3MB，绕过 4.5MB 响应体限制与 GHA CDN 567/403 封禁)
+    """
+    proxy = get_bili_proxy_url()
+    if not proxy:
+        return False
+
+    endpoint = f"{proxy}/api/bili-audio"
+    start = 0
+    total_size = None
+    written = 0
+
+    try:
+        with open(output_path, "wb") as f:
+            while True:
+                end = start + chunk_size - 1
+                if total_size is not None:
+                    end = min(end, total_size - 1)
+                    if start > end:
+                        break
+
+                resp = None
+                for attempt in range(1, 3):
+                    try:
+                        r = requests.get(
+                            endpoint,
+                            params={"url": audio_url, "range": f"bytes={start}-{end}"},
+                            timeout=30,
+                        )
+                        if r.status_code in (200, 206):
+                            resp = r
+                            break
+                        print(f"    [中继CDN] 分片 {start}-{end} HTTP {r.status_code} (attempt {attempt})")
+                        if r.status_code in (403, 404, 410):
+                            return False
+                    except Exception as e:
+                        print(f"    [中继CDN] 分片 {start}-{end} 异常 (attempt {attempt}): {e}")
+                    time.sleep(1)
+
+                if resp is None:
+                    return False
+
+                chunk = resp.content
+                if not chunk:
+                    break
+
+                f.write(chunk)
+                written += len(chunk)
+
+                # 从 Content-Range: bytes 0-3145727/5550813 解析总大小
+                cr = resp.headers.get("Content-Range", "")
+                m = re.search(r"/(\d+)$", cr)
+                if m:
+                    total_size = int(m.group(1))
+                    if start == 0:
+                        print(f"    [中继CDN] 文件大小: {total_size/1024/1024:.1f} MB")
+                elif resp.status_code == 200:
+                    # 一次性返回了完整文件
+                    break
+
+                start += len(chunk)
+                if total_size is not None and start >= total_size:
+                    break
+                if len(chunk) < chunk_size and total_size is None:
+                    break
+
+        print(f"    [中继CDN] ✅ 下载完成 ({written/1024/1024:.1f} MB)")
+        return written > 1000
+    except Exception as e:
+        print(f"    [中继CDN] 异常: {e}")
+        return False
+
+
 # ==================== 硅基流动 语音识别 ====================
 
 def _call_siliconflow_stt_once(audio_path: str, api_key: str, model: str, timeout: int = 180) -> tuple:
@@ -277,22 +353,31 @@ def get_text_from_audio(
             return None
 
         download_ok = False
-        for idx, url in enumerate(all_urls):
-            print(f"    [CDN] #{idx+1}/{len(all_urls)} (60s)...")
+        # 1. 先尝试直连 CDN (最多试前 2 条，避免 GHA 封禁时浪费时间)
+        for idx, url in enumerate(all_urls[:2]):
+            print(f"    [CDN] 直连 #{idx+1}/{min(len(all_urls), 2)} (60s)...")
             if download_from_cdn(url, m4s_path, timeout=60):
                 download_ok = True
                 break
 
-        if not download_ok:
-            print("    [CDN] 全部直链下载失败, 刷新直链重试一次...")
-            time.sleep(1)
-            new_urls = get_audio_urls_from_playurl(bvid, force_refresh=True)
-            if new_urls:
-                for idx, url in enumerate(new_urls):
-                    print(f"    [CDN] 重试 #{idx+1}/{len(new_urls)} (60s)...")
-                    if download_from_cdn(url, m4s_path, timeout=60):
-                        download_ok = True
-                        break
+        # 2. 直连被拒 (如 GHA 返回 567/403) 时，自动通过中继获取同源直链并分片下载
+        if not download_ok and get_bili_proxy_url():
+            print("    [CDN] 直连失败，切换中继分片下载...")
+            bundle = fetch_video_bundle_from_proxy(bvid, force_refresh=True)
+            proxy_urls = (bundle or {}).get("audio_urls") or all_urls
+            for idx, url in enumerate(proxy_urls[:3]):
+                print(f"    [中继CDN] #{idx+1}/{min(len(proxy_urls), 3)}...")
+                if download_via_proxy(url, m4s_path):
+                    download_ok = True
+                    break
+
+        # 3. 兜底再试剩余直连 URL
+        if not download_ok and len(all_urls) > 2:
+            for idx, url in enumerate(all_urls[2:], start=3):
+                print(f"    [CDN] 备选直连 #{idx}/{len(all_urls)} (60s)...")
+                if download_from_cdn(url, m4s_path, timeout=60):
+                    download_ok = True
+                    break
 
         if not download_ok:
             print("    [音频] ❌ 下载失败")

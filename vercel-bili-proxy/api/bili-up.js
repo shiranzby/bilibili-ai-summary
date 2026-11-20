@@ -1,4 +1,4 @@
-const BILI_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36';
+const BILI_MOBILE_UA = 'Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Mobile Safari/537.36';
 
 export default async function handler(req, res) {
   res.setHeader('Access-Control-Allow-Origin', '*');
@@ -12,7 +12,7 @@ export default async function handler(req, res) {
   let cookie = (process.env.BILI_COOKIE || '').trim();
   try {
     const spiResp = await fetch('https://api.bilibili.com/x/frontend/finger/spi', {
-      headers: { 'User-Agent': BILI_UA, 'Referer': 'https://www.bilibili.com/' },
+      headers: { 'User-Agent': BILI_MOBILE_UA, 'Referer': 'https://m.bilibili.com/' },
     });
     if (spiResp.ok) {
       const spi = await spiResp.json();
@@ -25,9 +25,8 @@ export default async function handler(req, res) {
   } catch (_) {}
 
   const headers = {
-    'User-Agent': BILI_UA,
-    'Referer': 'https://space.bilibili.com/',
-    'Origin': 'https://space.bilibili.com',
+    'User-Agent': BILI_MOBILE_UA,
+    'Referer': 'https://m.bilibili.com/',
     'Accept': 'application/json, text/plain, */*',
     'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
   };
