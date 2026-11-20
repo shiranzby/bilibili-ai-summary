@@ -23,6 +23,11 @@ on:
         required: false
         default: ''
         type: string
+      email:
+        description: '自定义接收邮箱 (可选)'
+        required: false
+        default: ''
+        type: string
 
 permissions:
   contents: write
@@ -49,11 +54,16 @@ jobs:
       - name: 注入配置
         env:
           SILICONFLOW_API_KEY: ${{ secrets.SILICONFLOW_API_KEY }}
+          SILICONFLOW_STT_MODEL: ${{ secrets.SILICONFLOW_STT_MODEL || 'FunAudioLLM/SenseVoiceSmall' }}
+          SILICONFLOW_SUMMARY_MODEL: ${{ secrets.SILICONFLOW_SUMMARY_MODEL || 'Qwen/Qwen3-8B' }}
           SMTP_USER: ${{ secrets.SMTP_USER }}
           SMTP_PASS: ${{ secrets.SMTP_PASS }}
           SMTP_TO: ${{ secrets.SMTP_TO }}
         run: python bilibili_summary/inject_config.py
       - name: 运行监控
+        env:
+          BILI_COOKIE: ${{ secrets.BILI_COOKIE }}
+          BILI_PROXY_URL: ${{ secrets.BILI_PROXY_URL || 'https://bilisum-bili-proxy.vercel.app' }}
         run: |
           cd bilibili_summary
           [ ! -f state.json ] && echo '{"processed":{}}' > state.json
@@ -94,13 +104,15 @@ jobs:
           SILICONFLOW_SUMMARY_MODEL: ${{ secrets.SILICONFLOW_SUMMARY_MODEL || 'Qwen/Qwen3-8B' }}
           SMTP_USER: ${{ secrets.SMTP_USER }}
           SMTP_PASS: ${{ secrets.SMTP_PASS }}
-          SMTP_TO: ${{ secrets.SMTP_TO }}
+          SMTP_TO: ${{ inputs.email || secrets.SMTP_TO }}
         run: python bilibili_summary/inject_config.py
       - name: 处理视频 (音频 -> 语音识别 -> AI总结)
         id: process
         env:
           BVID: ${{ inputs.bvid }}
           SUMMARY_TEMPLATE: ${{ inputs.summary_template }}
+          BILI_COOKIE: ${{ secrets.BILI_COOKIE }}
+          BILI_PROXY_URL: ${{ secrets.BILI_PROXY_URL || 'https://bilisum-bili-proxy.vercel.app' }}
         run: |
           cd bilibili_summary
           python process_single.py "$BVID" --job-id "${{ inputs.job_id }}"
@@ -109,7 +121,7 @@ jobs:
         env:
           SMTP_USER: ${{ secrets.SMTP_USER }}
           SMTP_PASS: ${{ secrets.SMTP_PASS }}
-          SMTP_TO: ${{ secrets.SMTP_TO }}
+          SMTP_TO: ${{ inputs.email || secrets.SMTP_TO }}
         run: |
           cd bilibili_summary
           python send_result_email.py result.json 2>&1 || echo "[邮件] 发送失败（非致命）"

@@ -71,10 +71,15 @@ def process(bvid: str, job_id: str = "", summary_template: str = "") -> dict:
     result["timings"]["stt"] = t_stt
 
     if not audio_text:
-        result["status"] = "failed"
-        result["error"] = "语音识别失败"
-        result["timings"]["total"] = round(time.time() - t0, 1)
-        return result
+        desc = ((info or {}).get("desc") or "").strip()
+        if desc and len(desc) > 20:
+            print(f"[处理] ⚠ 语音识别失败，回退使用视频描述 ({len(desc)} 字符)", file=sys.stderr)
+            audio_text = f"[视频描述] {desc[:3000]}"
+        else:
+            result["status"] = "failed"
+            result["error"] = "语音识别失败且无可用视频描述"
+            result["timings"]["total"] = round(time.time() - t0, 1)
+            return result
 
     # 清洗转录文本（去掉🎼等音乐符号）
     result["transcript"] = clean_transcript(audio_text)

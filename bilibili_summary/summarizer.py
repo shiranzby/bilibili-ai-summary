@@ -6,6 +6,7 @@ AI视频总结模块
 Key 与语音识别共用 SILICONFLOW_API_KEY。
 """
 
+import time
 from typing import Optional
 
 try:
@@ -16,7 +17,6 @@ except ImportError:
 
 def _build_summary_prompt(subtitle_text: str, video_title: str = "", custom_template: str = "") -> tuple:
     if custom_template:
-        # 使用自定义模板，{content} 替换为字幕文本
         user_prompt = custom_template.replace("{content}", subtitle_text)
         system_prompt = "你是一个专业的视频内容分析师。请严格按照用户指定的模板处理转录文本。"
         if len(user_prompt) > 15000:
@@ -25,7 +25,7 @@ def _build_summary_prompt(subtitle_text: str, video_title: str = "", custom_temp
 
     title_info = f"（视频标题: {video_title}）" if video_title else ""
 
-    system_prompt = f"""你是一个专业的视频内容分析师。你的任务是根据视频字幕文本，提取视频的核心内容和关键信息。
+    system_prompt = """你是一个专业的视频内容分析师。你的任务是根据视频字幕文本，提取视频的核心内容和关键信息。
 
 要求:
 1. 用中文输出 (无论字幕是什么语言)
@@ -65,20 +65,40 @@ def _call_siliconflow(
         return None
 
     system_prompt, user_prompt = _build_summary_prompt(subtitle_text, video_title, custom_template)
-    try:
-        client = OpenAI(api_key=api_key, base_url="https://api.siliconflow.cn/v1")
-        response = client.chat.completions.create(
-            model=model,
-            messages=[{"role": "system", "content": system_prompt}, {"role": "user", "content": user_prompt}],
-            temperature=0.3,
-            max_tokens=2048,
-        )
-        summary = response.choices[0].message.content.strip()
-        print(f"    [AI总结] ✅ 硅基流动 生成 {len(summary)} 字符")
-        return summary
-    except Exception as e:
-        print(f"    [AI总结] ❌ 硅基流动 调用失败: {e}")
-        return None
+    client = OpenAI(api_key=api_key, base_url="https://api.siliconflow.cn/v1")
+
+    # Qwen3 系列默认开启思考模式，关闭 thinking 避免耗尽 max_tokens 且速度更快
+    use_no_think = "qwen3" in (model or "").lower()
+
+    for attempt in range(1, 3):
+        try:
+            kwargs = {
+                "model": model,
+                "messages": [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
+                "temperature": 0.3,
+                "max_tokens": 2048,
+            }
+            if use_no_think:
+                kwargs["extra_body"] = {"enable_thinking": False}
+
+            response = client.chat.completions.create(**kwargs)
+            summary = (response.choices[0].message.content or "").strip()
+            if summary:
+                print(f"    [AI总结] ✅ 硅基流动 生成 {len(summary)} 字符")
+                return summary
+            print(f"    [AI总结] ⚠ 返回内容为空 (attempt {attempt})")
+        except Exception as e:
+            err_str = str(e)
+            if use_no_think and "enable_thinking" in err_str:
+                use_no_think = False
+                continue
+            print(f"    [AI总结] ❌ 硅基流动 调用失败 (attempt {attempt}): {e}")
+            if attempt < 2:
+                time.sleep(2)
+    return None
 
 
 def summarize_subtitle(
@@ -90,14 +110,5 @@ def summarize_subtitle(
 ) -> Optional[str]:
     """
     使用硅基流动对视频字幕进行 AI 总结。
-
-    参数:
-        subtitle_text: 字幕文本
-        video_title: 视频标题 (可选，用于提示)
-        api_key: 硅基流动 API Key
-        model: 模型名 (默认 Qwen/Qwen3-8B)
-        custom_template: 自定义总结模板（含 {content} 占位符）
-
-    返回: 总结文本或 None
     """
     return _call_siliconflow(api_key, model, subtitle_text, video_title, custom_template)

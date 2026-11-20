@@ -4,84 +4,159 @@
 当B站视频需要转录时，下载音频并转为文字。
 
 方案:
-  1. playurl API → CDN直链下载 .m4s
-  2. 直接改名 .m4s → .m4a (AAC容器，无需ffmpeg)
-  3. 硅基流动 SenseVoiceSmall → 语音转文字
+  1. 获取 cid + 音频直链 (直连 WBI playurl → 直连 playurl → Vercel 中继兜底)
+  2. 优先选取低码率清晰 AAC 音轨 (如 64kbps，体积小 2.5 倍、下载/上传更快更稳)
+  3. CDN 直链下载 .m4s，直接改名 .m4a (AAC容器，无需ffmpeg)
+  4. 硅基流动语音识别 (SenseVoiceSmall 重试3次 → 兜底 Qwen/Qwen3-ASR-1.7B)
 """
 
 import os
+import time
 import requests
 import tempfile
 from typing import Optional
 
+from bili_api import (
+    _make_headers,
+    _sign_wbi,
+    fetch_video_bundle_from_proxy,
+)
 
-def _get_play_headers() -> dict:
-    return {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-        "Referer": "https://www.bilibili.com/",
-    }
+# 语音识别兜底模型列表 (主模型失败时依次尝试)
+FALLBACK_STT_MODELS = [
+    "FunAudioLLM/SenseVoiceSmall",
+    "Qwen/Qwen3-ASR-1.7B",
+]
+
+
+def _extract_sorted_audio_urls(dash: dict) -> list:
+    """从 DASH 信息提取音频直链，按码率升序排列 (优先最小清晰音轨，适合 STT)"""
+    audios = (dash or {}).get("audio") or []
+    if not audios:
+        return []
+    sorted_tracks = sorted(audios, key=lambda x: x.get("bandwidth") or 0)
+    urls = []
+    for tr in sorted_tracks:
+        if tr.get("baseUrl"):
+            urls.append(tr["baseUrl"])
+        for bk in tr.get("backupUrl") or []:
+            if bk:
+                urls.append(bk)
+    return urls
 
 
 def get_cid(bvid: str) -> Optional[int]:
-    """获取视频第一P的cid"""
+    """获取视频第一P的 cid (直连 → pagelist → 中继兜底)"""
+    # 先看中继缓存里是否已有
+    bundle = fetch_video_bundle_from_proxy(bvid) if _has_proxy_cache(bvid) else None
+    if bundle and bundle.get("cid"):
+        return bundle["cid"]
+
+    # 1. 直连 x/web-interface/wbi/view
     try:
         resp = requests.get(
-            "https://api.bilibili.com/x/web-interface/view",
-            params={"bvid": bvid},
-            headers={"User-Agent": "Mozilla/5.0", "Referer": "https://m.bilibili.com/"},
+            "https://api.bilibili.com/x/web-interface/wbi/view",
+            params=_sign_wbi({"bvid": bvid}),
+            headers=_make_headers(mobile=False),
             timeout=15,
         )
         data = resp.json()
-        if data.get("code") != 0:
-            return None
-        pages = data.get("data", {}).get("pages", [])
-        return pages[0].get("cid") if pages else None
+        if data.get("code") == 0:
+            d = data.get("data") or {}
+            cid = d.get("cid") or (d.get("pages") or [{}])[0].get("cid")
+            if cid:
+                return cid
     except Exception:
-        return None
+        pass
 
-
-# ==================== playurl CDN 方案 (优先) ====================
-
-def get_audio_urls_from_playurl(bvid: str, cid: int) -> Optional[list]:
-    """从B站 playurl API 获取所有可用音频直链"""
+    # 2. 直连 x/player/pagelist
     try:
         resp = requests.get(
-            "https://api.bilibili.com/x/player/playurl",
-            params={"bvid": bvid, "cid": cid, "fnval": 16, "qn": 16, "fourk": 1},
-            headers=_get_play_headers(),
+            "https://api.bilibili.com/x/player/pagelist",
+            params={"bvid": bvid},
+            headers=_make_headers(mobile=True),
             timeout=15,
         )
         data = resp.json()
-        if data.get("code") != 0:
-            print(f"    [playurl] API错误: code={data.get('code')} msg={data.get('message')}")
-            return None
+        if data.get("code") == 0 and data.get("data"):
+            return data["data"][0].get("cid")
+    except Exception:
+        pass
 
-        dash = data.get("data", {}).get("dash")
-        if not dash or not dash.get("audio"):
-            print(f"    [playurl] 未找到音频流")
-            return None
+    # 3. 中继兜底
+    bundle = fetch_video_bundle_from_proxy(bvid)
+    if bundle and bundle.get("cid"):
+        return bundle["cid"]
 
-        best = dash["audio"][-1]
-        urls = []
-        if best.get("baseUrl"):
-            urls.append(best["baseUrl"])
-        for bk in best.get("backupUrl") or []:
-            if bk:
-                urls.append(bk)
+    return None
 
-        if urls:
-            print(f"    [playurl] 获取到 {len(urls)} 条音频直链")
+
+def _has_proxy_cache(bvid: str) -> bool:
+    import bili_api
+    return bvid in bili_api._proxy_info_cache
+
+
+# ==================== playurl CDN 方案 ====================
+
+def get_audio_urls_from_playurl(bvid: str, cid: Optional[int] = None, force_refresh: bool = False) -> Optional[list]:
+    """获取所有可用音频直链 (优先复用中继缓存，其次直连 wbi/playurl & playurl，再回退中继)"""
+    # 如果之前 get_video_info 已经走了中继，直接复用拿到的 audio_urls（免二次请求）
+    if not force_refresh and _has_proxy_cache(bvid):
+        bundle = fetch_video_bundle_from_proxy(bvid)
+        if bundle and bundle.get("audio_urls"):
+            urls = bundle["audio_urls"]
+            print(f"    [playurl] 复用中继缓存的 {len(urls)} 条音频直链")
             return urls
-        return None
-    except Exception as e:
-        print(f"    [playurl] 异常: {e}")
-        return None
+
+    if not cid:
+        cid = get_cid(bvid)
+
+    # 1. 直连 WBI playurl / 普通 playurl
+    if cid:
+        for endpoint, use_wbi in [
+            ("https://api.bilibili.com/x/player/wbi/playurl", True),
+            ("https://api.bilibili.com/x/player/playurl", False),
+        ]:
+            try:
+                params = {"bvid": bvid, "cid": cid, "fnval": 16, "qn": 16, "fourk": 1}
+                if use_wbi:
+                    params = _sign_wbi(params)
+                resp = requests.get(
+                    endpoint,
+                    params=params,
+                    headers=_make_headers(mobile=False),
+                    timeout=15,
+                )
+                data = resp.json()
+                if data.get("code") == 0:
+                    urls = _extract_sorted_audio_urls(data.get("data", {}).get("dash"))
+                    if urls:
+                        print(f"    [playurl] 直连获取到 {len(urls)} 条音频直链")
+                        return urls
+                else:
+                    print(f"    [playurl] 直连错误: code={data.get('code')} msg={data.get('message')}")
+            except Exception as e:
+                print(f"    [playurl] 直连异常: {e}")
+
+    # 2. Vercel 中继兜底
+    print(f"    [playurl] 切换中继获取音频直链...")
+    bundle = fetch_video_bundle_from_proxy(bvid, force_refresh=force_refresh)
+    if bundle and bundle.get("audio_urls"):
+        urls = bundle["audio_urls"]
+        print(f"    [playurl] ✅ 中继获取到 {len(urls)} 条音频直链")
+        return urls
+
+    return None
 
 
 def download_from_cdn(audio_url: str, output_path: str, timeout: int = 60) -> bool:
     """从B站CDN下载音频 (m4s/AAC)，timeout=60秒"""
     headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/126.0.0.0 Safari/537.36"
+        ),
         "Referer": "https://www.bilibili.com/",
         "Origin": "https://www.bilibili.com",
     }
@@ -97,7 +172,7 @@ def download_from_cdn(audio_url: str, output_path: str, timeout: int = 60) -> bo
 
         total = 0
         with open(output_path, "wb") as f:
-            for chunk in resp.iter_content(chunk_size=8192):
+            for chunk in resp.iter_content(chunk_size=16384):
                 if chunk:
                     f.write(chunk)
                     total += len(chunk)
@@ -113,29 +188,72 @@ def download_from_cdn(audio_url: str, output_path: str, timeout: int = 60) -> bo
 
 # ==================== 硅基流动 语音识别 ====================
 
+def _call_siliconflow_stt_once(audio_path: str, api_key: str, model: str, timeout: int = 180) -> tuple:
+    """单次调用硅基流动音频转录 REST 接口，返回 (text_or_None, retryable_bool)"""
+    url = "https://api.siliconflow.cn/v1/audio/transcriptions"
+    filename = os.path.basename(audio_path)
+    try:
+        with open(audio_path, "rb") as f:
+            resp = requests.post(
+                url,
+                headers={"Authorization": f"Bearer {api_key}"},
+                files={"file": (filename, f, "audio/mp4")},
+                data={"model": model},
+                timeout=timeout,
+            )
+        if resp.status_code == 200:
+            try:
+                j = resp.json()
+                text = j.get("text", "") if isinstance(j, dict) else str(j)
+            except Exception:
+                text = resp.text
+            if text and text.strip():
+                return text.strip(), False
+            print(f"    [SiFlow] ({model}) 返回文本为空")
+            return None, True
+
+        preview = resp.text[:200].replace("\n", " ")
+        print(f"    [SiFlow] ({model}) HTTP {resp.status_code}: {preview}")
+        # 401/403 为鉴权失败，无需同 key 反复重试
+        retryable = resp.status_code in (429, 500, 502, 503, 504)
+        return None, retryable
+    except requests.exceptions.Timeout:
+        print(f"    [SiFlow] ({model}) 请求超时 ({timeout}s)")
+        return None, True
+    except Exception as e:
+        print(f"    [SiFlow] ({model}) 异常: {e}")
+        return None, True
+
+
 def transcribe_with_siliconflow(audio_path: str, api_key: str = "", model: str = "") -> Optional[str]:
     if not api_key:
-        print(f"    [SiFlow] 未配置 API_KEY")
+        print("    [SiFlow] 未配置 API_KEY")
         return None
-    model = model or "FunAudioLLM/SenseVoiceSmall"
+
+    primary = (model or "FunAudioLLM/SenseVoiceSmall").strip()
+    models_to_try = [primary] + [m for m in FALLBACK_STT_MODELS if m != primary]
+
     file_size = os.path.getsize(audio_path) / 1024 / 1024
     print(f"    [SiFlow] 上传 ({file_size:.1f} MB)...")
-    try:
-        from openai import OpenAI
-        client = OpenAI(api_key=api_key, base_url="https://api.siliconflow.cn/v1")
-        with open(audio_path, "rb") as f:
-            resp = client.audio.transcriptions.create(
-                model=model, file=f, language="zh", response_format="text",
-            )
-        text = resp if isinstance(resp, str) else getattr(resp, "text", str(resp))
-        if text and text.strip():
-            print(f"    [SiFlow] 转录成功 ({len(text)} 字符)")
-            return text
-        print(f"    [SiFlow] 返回文本为空")
-        return None
-    except Exception as e:
-        print(f"    [SiFlow] 失败: {e}")
-        return None
+
+    for m_idx, current_model in enumerate(models_to_try):
+        max_attempts = 3 if m_idx == 0 else 2
+        for attempt in range(1, max_attempts + 1):
+            if attempt > 1 or m_idx > 0:
+                print(f"    [SiFlow] 尝试模型 {current_model} (第 {attempt}/{max_attempts} 次)...")
+            text, retryable = _call_siliconflow_stt_once(audio_path, api_key, current_model)
+            if text:
+                print(f"    [SiFlow] ✅ 转录成功 ({current_model}, {len(text)} 字符)")
+                return text
+            if not retryable:
+                break
+            if attempt < max_attempts:
+                wait_s = 2 ** attempt
+                print(f"    [SiFlow] {wait_s}s 后重试...")
+                time.sleep(wait_s)
+
+    print("    [SiFlow] ❌ 全部语音识别尝试均失败")
+    return None
 
 
 # ==================== 一站式入口 ====================
@@ -147,29 +265,15 @@ def get_text_from_audio(
 ) -> Optional[str]:
     """
     一站式: B站音频下载 → 直接上传硅基流动语音识别
-
-    流程:
-      1. playurl API 获取音频 CDN 直链
-      2. 下载 .m4s (AAC容器，直接改名 .m4a)
-      3. 上传到硅基流动语音识别 API
-
-    > 不需要 ffmpeg: .m4s 本身就是 AAC 音频，改后缀即可
-    > 不需要 yt-dlp: playurl CDN 方案已验证每次都能成功
     """
     with tempfile.TemporaryDirectory() as tmpdir:
         m4s_path = os.path.join(tmpdir, f"{bvid}.m4s")
         m4a_path = os.path.join(tmpdir, f"{bvid}.m4a")
 
-        # ---- playurl CDN ----
-        print(f"    [音频] 获取视频信息...")
-        cid = get_cid(bvid)
-        if not cid:
-            print(f"    [音频] ❌ 无法获取 cid")
-            return None
-
-        all_urls = get_audio_urls_from_playurl(bvid, cid)
+        print("    [音频] 获取视频音频直链...")
+        all_urls = get_audio_urls_from_playurl(bvid)
         if not all_urls:
-            print(f"    [音频] ❌ 无法获取音频直链")
+            print("    [音频] ❌ 无法获取音频直链")
             return None
 
         download_ok = False
@@ -180,17 +284,18 @@ def get_text_from_audio(
                 break
 
         if not download_ok:
-            print(f"    [CDN] 全部直链下载失败, 重试一次...")
-            import time; time.sleep(1)
-            new_urls = get_audio_urls_from_playurl(bvid, cid)
+            print("    [CDN] 全部直链下载失败, 刷新直链重试一次...")
+            time.sleep(1)
+            new_urls = get_audio_urls_from_playurl(bvid, force_refresh=True)
             if new_urls:
                 for idx, url in enumerate(new_urls):
+                    print(f"    [CDN] 重试 #{idx+1}/{len(new_urls)} (60s)...")
                     if download_from_cdn(url, m4s_path, timeout=60):
                         download_ok = True
                         break
 
         if not download_ok:
-            print(f"    [音频] ❌ 下载失败")
+            print("    [音频] ❌ 下载失败")
             return None
 
         # .m4s = AAC/M4A 容器，直接改名即可
@@ -201,4 +306,3 @@ def get_text_from_audio(
                 m4a_path, api_key=siliconflow_api_key, model=siliconflow_stt_model,
             )
         return None
-
