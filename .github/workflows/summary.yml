@@ -33,6 +33,11 @@ on:
         required: false
         default: ''
         type: string
+      send_email:
+        description: '单条摘要完成后是否发送邮件 (true / false)'
+        required: false
+        default: 'true'
+        type: string
 
 permissions:
   contents: write
@@ -127,7 +132,7 @@ jobs:
           cd bilibili_summary
           python process_single.py "$BVID" --job-id "${{ inputs.job_id }}"
       - name: 发送邮件通知
-        if: success() || failure()
+        if: ${{ (success() || failure()) && inputs.send_email != 'false' }}
         env:
           SMTP_USER: ${{ secrets.SMTP_USER }}
           SMTP_PASS: ${{ secrets.SMTP_PASS }}

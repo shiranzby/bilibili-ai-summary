@@ -763,12 +763,23 @@ async function handleDeleteHistory(request, env) {
   return jsonResponse({ ok: true });
 }
 
+function formatSecDuration(sec) {
+  const s = parseInt(sec, 10) || 0;
+  if (s <= 0) return '';
+  const h = Math.floor(s / 3600);
+  const m = Math.floor((s % 3600) / 60);
+  const r = s % 60;
+  const pad = n => String(n).padStart(2, '0');
+  return h > 0 ? `${h}:${pad(m)}:${pad(r)}` : `${m}:${pad(r)}`;
+}
+
 async function handleSubmit(request, env, ctx) {
   const body = await request.json().catch(() => ({}));
   const url = body.url;
   const summary_template = body.summary_template || '';
   const custom_email = body.email || '';
   const email_style = body.email_style || 'editorial';
+  const send_email = body.send_email === false ? false : true;
   if (!url || typeof url !== 'string') {
     return errorResponse('请提供 B站视频 URL 或 BV 号');
   }
@@ -788,11 +799,35 @@ async function handleSubmit(request, env, ctx) {
     return errorResponse('无法解析视频 ID，请输入 B站视频链接或 BV 号');
   }
 
+  // Resolve real video title / owner / duration immediately so pending card never shows bare BV id
+  let title = String(body.title || '').trim();
+  let owner = String(body.owner || '').trim();
+  let duration = String(body.duration || '').trim();
+  if (!title && /^BV/i.test(bvid)) {
+    try {
+      const ctrl = new AbortController();
+      const timer = setTimeout(() => ctrl.abort(), 3200);
+      const proxyBase = (env.BILI_PROXY_URL || BILI_PROXY_DEF).replace(/\/+$/, '');
+      const ir = await fetch(`${proxyBase}/api/bili-info?bvid=${encodeURIComponent(bvid)}`, { signal: ctrl.signal });
+      clearTimeout(timer);
+      if (ir.ok) {
+        const idata = await ir.json();
+        const info = idata?.info;
+        if (info) {
+          title = info.title || '';
+          owner = info.owner?.name || '';
+          duration = formatSecDuration(info.duration);
+        }
+      }
+    } catch {}
+  }
+
   const jobId = uuid();
   const job = {
     id: jobId, bvid, url: bvid, status: 'pending',
     created_at: nowISO(), updated_at: nowISO(),
-    summary: null, title: '', error: '', email_style,
+    summary: null, title: title || bvid, owner, duration,
+    error: '', email_style, send_email,
   };
 
   if (env.BILIBILI_BUCKET) {
@@ -801,7 +836,7 @@ async function handleSubmit(request, env, ctx) {
     }).catch(() => {});
   }
 
-  const inputs = { bvid, job_id: jobId };
+  const inputs = { bvid, job_id: jobId, send_email: send_email ? 'true' : 'false' };
   if (summary_template) inputs.summary_template = summary_template;
   if (custom_email) inputs.email = custom_email;
   if (email_style) inputs.email_style = email_style;
@@ -811,7 +846,7 @@ async function handleSubmit(request, env, ctx) {
     if (ghResp.status !== 204 && ghResp.status !== 201 && ghResp.status !== 200) {
       if (env.BILIBILI_BUCKET) cleanupExcessResults(env.BILIBILI_BUCKET).catch(() => {});
       return jsonResponse({
-        job_id: jobId, bvid, status: 'pending',
+        job_id: jobId, bvid, title: job.title, owner, duration, status: 'pending',
         warning: 'GitHub Actions 触发可能失败: HTTP ' + ghResp.status,
       }, 201);
     }
@@ -821,7 +856,7 @@ async function handleSubmit(request, env, ctx) {
   }
 
   if (env.BILIBILI_BUCKET) cleanupExcessResults(env.BILIBILI_BUCKET).catch(() => {});
-  return jsonResponse({ job_id: jobId, bvid, status: 'pending' }, 201);
+  return jsonResponse({ job_id: jobId, bvid, title: job.title, owner, duration, status: 'pending' }, 201);
 }
 
 async function handleListJobs(request, env) {
@@ -1441,6 +1476,10 @@ textarea.ctrl{height:auto;min-height:78px;padding:9px 12px;resize:vertical;line-
       </div>
 
       <div class="topbar-actions">
+        <button class="pill-btn" id="settingsBtn" onclick="openSettingsModal()">
+          <svg class="ic" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
+          <span>设置</span>
+        </button>
         <button class="pill-btn" id="monitorBtn" onclick="openMonitorEntry()">
           <span id="monitorBtnIcon"></span>
           <span id="monitorBtnText">登录管理</span>
@@ -1547,6 +1586,97 @@ textarea.ctrl{height:auto;min-height:78px;padding:9px 12px;resize:vertical;line-
       <div style="display:flex;gap:8px">
         <button class="btn" id="smCopyBtn" onclick="copyModalSummary()">复制摘要</button>
         <button class="btn btn-primary" onclick="closeModal('summaryModal')">关闭</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- SETTINGS MODAL (PREFERENCES + SINGLE-VIDEO EMAIL TOGGLE) -->
+<div class="modal-backdrop hidden" id="settingsModal" onclick="if(event.target===this)closeModal('settingsModal')">
+  <div class="modal reader">
+    <div class="modal-head">
+      <div>
+        <h2>偏好与系统设置</h2>
+        <div style="font-size:12px;color:var(--muted);margin-top:2px">配置保存在当前浏览器，即时生效于后续单条视频摘要任务</div>
+      </div>
+      <button class="icon-btn" onclick="closeModal('settingsModal')" aria-label="关闭">
+        <svg class="ic" viewBox="0 0 24 24"><path d="M18 6L6 18M6 6l12 12"/></svg>
+      </button>
+    </div>
+    <div class="modal-body">
+      <div class="form-section">
+        <div class="sec-head">
+          <h4>单条摘要邮件通知</h4>
+        </div>
+        <div class="switch-row" style="margin-bottom:14px">
+          <div>
+            <div style="font-size:13.5px;font-weight:700">单条视频总结完成后发送邮件</div>
+            <div style="font-size:12px;color:var(--muted);margin-top:2px">关闭后，网页端手动提交的单条视频总结仅保存在页面与 R2，不再发送邮箱提醒</div>
+          </div>
+          <label class="tog-switch">
+            <input type="checkbox" id="prefSendEmail">
+            <span class="tog-track"></span>
+            <span class="tog-thumb"></span>
+          </label>
+        </div>
+        <div class="form-row">
+          <div class="field">
+            <label>默认单条邮件样式</label>
+            <select class="ctrl" id="prefEmailStyle">
+              <option value="editorial">编辑部日报（深色报头 · 默认）</option>
+              <option value="minimal">极简纸刊（纯白 Notion 风）</option>
+              <option value="bilibili">B站元气粉（樱花粉渐变）</option>
+              <option value="compact">极速速览（高密度紧凑）</option>
+            </select>
+          </div>
+          <div class="field">
+            <label>默认单条接收邮箱（可选）</label>
+            <input class="ctrl" id="prefDefaultEmail" type="email" placeholder="留空则使用服务端默认邮箱">
+          </div>
+        </div>
+      </div>
+
+      <div class="form-section">
+        <div class="sec-head">
+          <h4>摘要与阅读偏好</h4>
+        </div>
+        <div class="form-row">
+          <div class="field">
+            <label>默认总结模板</label>
+            <select class="ctrl" id="prefDefaultTpl">
+              <option value="">默认精炼日报模板</option>
+              <option value="notes">深度结构化笔记</option>
+              <option value="quotes">金句与核心观点提取</option>
+            </select>
+          </div>
+          <div class="field">
+            <label>默认阅读视图</label>
+            <select class="ctrl" id="prefDefaultView">
+              <option value="summary">AI 总结</option>
+              <option value="transcript">完整转录</option>
+              <option value="split">分栏对照</option>
+            </select>
+          </div>
+        </div>
+      </div>
+
+      <div class="form-section" style="margin-bottom:0">
+        <div class="sec-head">
+          <h4>缓存与运行状态</h4>
+          <span class="cron-badge" id="sysStatsBadge">读取中...</span>
+        </div>
+        <div style="display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap">
+          <span style="font-size:12.5px;color:var(--soft)">如发现 UP 主动态未及时更新，可清空本地动态缓存重新拉取</span>
+          <button class="btn btn-sm" type="button" onclick="clearAllFeedCacheFromSettings()">清空 UP 主动态缓存</button>
+        </div>
+      </div>
+      <div class="sb-toast" id="settingsToast"></div>
+    </div>
+    <div class="modal-foot">
+      <button class="btn" type="button" onclick="resetUserPrefs()">恢复默认</button>
+      <div style="display:flex;gap:8px">
+        <button class="btn" type="button" onclick="closeModal('settingsModal')">取消</button>
+        <button class="btn btn-brand" type="button" onclick="saveUserPrefs()">保存设置</button>
       </div>
     </div>
   </div>
@@ -2091,29 +2221,122 @@ async function syncFromR2() {
   } catch {}
 }
 
+// ── User Preferences (Settings Page) ──
+const LS_PREFS = 'bilisum_prefs_v1';
+const DEFAULT_PREFS = {
+  send_email_on_single: true,
+  default_email_style: 'editorial',
+  default_email: '',
+  default_tpl: '',
+  default_view: 'summary',
+};
+
+function getUserPrefs() {
+  try {
+    return { ...DEFAULT_PREFS, ...JSON.parse(localStorage.getItem(LS_PREFS) || '{}') };
+  } catch {
+    return { ...DEFAULT_PREFS };
+  }
+}
+
+function applyUserPrefsToUi() {
+  const p = getUserPrefs();
+  const stEl = document.getElementById('singleEmailStyle');
+  const emEl = document.getElementById('customEmail');
+  const tplEl = document.getElementById('tplPreset');
+  if (stEl) { stEl.value = p.default_email_style || 'editorial'; syncCustomSelect(stEl); }
+  if (emEl && !emEl.value) emEl.value = p.default_email || '';
+  if (tplEl) { tplEl.value = p.default_tpl || ''; syncCustomSelect(tplEl); onTplPreset(); }
+  if (p.default_view && ['summary', 'transcript', 'split'].includes(p.default_view)) {
+    viewMode = p.default_view;
+    document.querySelectorAll('#segTabs .seg-tab').forEach(b => b.classList.toggle('active', b.dataset.mode === viewMode));
+  }
+}
+
+async function openSettingsModal() {
+  const p = getUserPrefs();
+  document.getElementById('prefSendEmail').checked = p.send_email_on_single !== false;
+  document.getElementById('prefEmailStyle').value = p.default_email_style || 'editorial';
+  document.getElementById('prefDefaultEmail').value = p.default_email || '';
+  document.getElementById('prefDefaultTpl').value = p.default_tpl || '';
+  document.getElementById('prefDefaultView').value = p.default_view || 'summary';
+  syncAllCustomSelects();
+  openModal('settingsModal');
+  const badge = document.getElementById('sysStatsBadge');
+  badge.textContent = '读取中...';
+  try {
+    const s = await fetch('/api/stats').then(r => r.json());
+    badge.textContent = '存储: ' + String(s.mode || 'r2').toUpperCase() + ' · 待处理 ' + (s.pending_jobs || 0) + ' · 已归档 ' + (s.completed_jobs || 0);
+  } catch {
+    badge.textContent = '状态读取失败';
+  }
+}
+
+function saveUserPrefs() {
+  const prefs = {
+    send_email_on_single: document.getElementById('prefSendEmail').checked,
+    default_email_style: document.getElementById('prefEmailStyle').value || 'editorial',
+    default_email: document.getElementById('prefDefaultEmail').value.trim(),
+    default_tpl: document.getElementById('prefDefaultTpl').value || '',
+    default_view: document.getElementById('prefDefaultView').value || 'summary',
+  };
+  localStorage.setItem(LS_PREFS, JSON.stringify(prefs));
+  applyUserPrefsToUi();
+  applyViewMode();
+  requestAnimationFrame(() => moveSlider('segTabs', true));
+  showToast('settingsToast', '偏好设置已保存并立即生效', 'ok');
+  setTimeout(() => closeModal('settingsModal'), 600);
+}
+
+function resetUserPrefs() {
+  localStorage.removeItem(LS_PREFS);
+  applyUserPrefsToUi();
+  openSettingsModal();
+  showToast('settingsToast', '已恢复默认设置', 'info');
+}
+
+function clearAllFeedCacheFromSettings() {
+  clearFeedCache(null);
+  prefetchDone = false;
+  showToast('settingsToast', '已清空所有 UP 主动态本地缓存', 'ok');
+}
+
 // ── Submit Video ──
-async function submitVideo(overrideUrl) {
+async function submitVideo(overrideUrl, meta) {
   const input = document.getElementById('videoUrl');
   const raw = (overrideUrl !== undefined ? String(overrideUrl) : input.value).trim();
   if (!raw) { showToast('sbToast', '请输入 B 站视频链接或 BV 号', 'err'); return; }
 
+  const prefs = getUserPrefs();
   const preset = document.getElementById('tplPreset').value;
   let tpl = '';
   if (preset === 'custom') tpl = document.getElementById('customTpl').value.trim();
   else if (TPL_PRESETS[preset]) tpl = TPL_PRESETS[preset];
 
-  const email = document.getElementById('customEmail').value.trim();
-  const email_style = document.getElementById('singleEmailStyle').value || 'editorial';
+  const email = document.getElementById('customEmail').value.trim() || prefs.default_email || '';
+  const email_style = document.getElementById('singleEmailStyle').value || prefs.default_email_style || 'editorial';
+  const send_email = prefs.send_email_on_single !== false;
 
   const btn = document.getElementById('submitBtn');
   btn.disabled = true;
   btn.textContent = '提交中...';
 
   try {
+    const reqBody = {
+      url: raw,
+      summary_template: tpl,
+      email,
+      email_style,
+      send_email,
+    };
+    if (meta && meta.title) reqBody.title = meta.title;
+    if (meta && meta.owner) reqBody.owner = meta.owner;
+    if (meta && meta.duration) reqBody.duration = meta.duration;
+
     const resp = await fetch('/api/submit', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ url: raw, summary_template: tpl, email, email_style }),
+      body: JSON.stringify(reqBody),
     });
     const data = await resp.json();
     if (!resp.ok) {
@@ -2123,7 +2346,9 @@ async function submitVideo(overrideUrl) {
     const newJob = {
       id: data.job_id,
       bvid: data.bvid,
-      title: data.bvid,
+      title: data.title || (meta && meta.title) || data.bvid,
+      owner: data.owner || (meta && meta.owner) || '',
+      duration: data.duration || (meta && meta.duration) || '',
       status: 'pending',
       created_at: new Date().toISOString(),
       video_url: 'https://www.bilibili.com/video/' + data.bvid,
@@ -2131,7 +2356,7 @@ async function submitVideo(overrideUrl) {
     const jobs = [newJob, ...getJobs().filter(j => j.id !== newJob.id)];
     saveJobs(jobs);
     if (overrideUrl === undefined) input.value = '';
-    showToast('sbToast', '已提交处理队列，约 30~60 秒完成', 'ok');
+    showToast('sbToast', send_email ? '已提交处理队列（完成后将同步发邮件）' : '已提交处理队列（已按设置关闭单条邮件通知）', 'ok');
     if (currentPage !== 'workspace') await switchPage('workspace');
     selectJob(newJob.id);
     startPolling(newJob.id);
@@ -2141,6 +2366,12 @@ async function submitVideo(overrideUrl) {
     btn.disabled = false;
     btn.textContent = '开始总结';
   }
+}
+
+function submitVideoFromFeed(idx) {
+  const v = currentFeedVideos[idx];
+  if (!v) return;
+  submitVideo(v.bvid, { title: v.title || '', owner: v.author || '', duration: v.duration || '' });
 }
 
 function startPolling(jobId) {
@@ -2289,10 +2520,12 @@ function inlineMd(text) {
 
 function detectSectionKind(line) {
   const c = line.replace(/^[#\s\-*•]+/, '').replace(/\*\*/g, '').replace(/[:：]+$/, '').trim();
-  if (c.length <= 18) {
+  // Never treat failure notices like "（AI总结失败，仅完成语音识别）" as section headings
+  if (!c || c.startsWith('（') || c.startsWith('(') || c.includes('失败') || c.includes('无法')) return null;
+  if (c.length <= 16) {
     if (c.includes('核心主题') || c.includes('核心观点') || c.includes('一句话总结')) return 'theme';
     if (c.includes('要点提炼') || c.includes('核心要点') || c.includes('关键要点')) return 'points';
-    if (c.includes('总结') || c.includes('结语')) return 'conclusion';
+    if (c === '总结' || c === '结语' || c === '总结洞察' || c.endsWith('总结')) return 'conclusion';
   }
   return null;
 }
@@ -2453,19 +2686,33 @@ function renderDetail(job) {
   document.getElementById('dPills').innerHTML = pills.map(p => '<span class="meta-pill">' + esc(p) + '</span>').join('');
 
   const st = normStatus(job.status);
+  const rawSummary = (job.summary || '').trim();
+  const isSummaryFailed = job.error_stage === 'summarize' || rawSummary.startsWith('（AI总结失败') || rawSummary.startsWith('(AI总结失败');
+
   if (st === 'pending') {
     document.getElementById('summaryContent').innerHTML = '<div class="pending-banner">GitHub Actions 正在提取音频、免费语音转文字并生成 AI 摘要，页面会自动刷新...</div>';
     document.getElementById('transcriptContent').textContent = '等待转录完成...';
   } else if (st === 'failed') {
     document.getElementById('summaryContent').innerHTML = renderFailureDiagnostics(job);
     document.getElementById('transcriptContent').textContent = job.transcript || '无转录内容';
+  } else if (isSummaryFailed) {
+    const tLen = (job.transcript || '').length;
+    const sumDiagJob = {
+      ...job,
+      error_stage: 'summarize',
+      error: job.error || 'AI 总结阶段失败（大概率因长视频文本量触发硅基流动免费模型 TPM 每分钟 Token 限流 429）',
+      error_hint: job.error_hint || ('好消息：完整语音转录（共 ' + tLen + ' 字符）已成功保存，你可以直接点击上方「完整转录」查看；后端现已升级自动采样与多免费模型切换，点击右侧「重新处理此视频」即可生成总结。'),
+    };
+    document.getElementById('summaryContent').innerHTML = renderFailureDiagnostics(sumDiagJob);
+    document.getElementById('transcriptContent').textContent = job.transcript || '（该任务无语音转录文本）';
   } else {
     let notice = '';
     if (job.error_hint) notice = '<div class="sb-toast show info" style="margin:0 0 14px 0">' + esc(job.error_hint) + '</div>';
-    document.getElementById('summaryContent').innerHTML = notice + renderRichSummary(job.summary || '');
+    document.getElementById('summaryContent').innerHTML = notice + renderRichSummary(rawSummary);
     document.getElementById('transcriptContent').textContent = job.transcript || '（该任务无语音转录文本）';
   }
   applyViewMode();
+  requestAnimationFrame(() => moveSlider('segTabs', true));
 }
 
 function setViewMode(mode) {
@@ -2485,7 +2732,6 @@ function applyViewMode() {
   sp.classList.toggle('hidden', viewMode === 'transcript');
   tp.classList.toggle('hidden', viewMode === 'summary');
   spLbl.classList.toggle('hidden', viewMode !== 'split');
-  requestAnimationFrame(() => moveSlider('segTabs', true));
 }
 
 function copyCurrent() {
@@ -2824,7 +3070,7 @@ function renderFeedCards(vids) {
             (relTime ? '<span class="v-time-pill">' + esc(relTime) + '</span>' : '<span></span>') +
             '<div class="v-act-row">' +
               (hasSum ? '<button class="v-act-btn" onclick="openFeedSummaryModal(' + idx + ')">查看摘要</button>' : '') +
-              '<button class="v-act-btn primary" onclick="submitVideo(\'' + esc(v.bvid) + '\')">' + (hasSum ? '重算' : '一键总结') + '</button>' +
+              '<button class="v-act-btn primary" onclick="submitVideoFromFeed(' + idx + ')">' + (hasSum ? '重算' : '一键总结') + '</button>' +
             '</div>' +
           '</div>' +
         '</div>' +
@@ -3192,6 +3438,7 @@ async function triggerMonitorNow(toastId) {
 // ── Init ──
 initTheme();
 initCustomSelects();
+applyUserPrefsToUi();
 checkAuth();
 renderList();
 const initJobs = getJobs();

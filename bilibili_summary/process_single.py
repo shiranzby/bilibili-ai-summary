@@ -25,7 +25,7 @@ from config import (
 )
 from audio_transcriber import get_text_from_audio, get_last_diagnostics
 from bili_api import get_video_info, format_duration
-from summarizer import summarize_subtitle
+from summarizer import summarize_subtitle, get_last_summary_error
 
 
 def clean_transcript(text: str) -> str:
@@ -109,7 +109,14 @@ def process(bvid: str, job_id: str = "", summary_template: str = "") -> dict:
     )
     t_summary = round(time.time() - t2, 1)
     result["timings"]["summary"] = t_summary
-    result["summary"] = summary or "（AI总结失败，仅完成语音识别）"
+    if summary:
+        result["summary"] = summary
+    else:
+        sum_err = get_last_summary_error()
+        result["summary"] = "（AI总结失败，仅完成语音识别）"
+        result["error_stage"] = "summarize"
+        result["error"] = sum_err.get("error") or "AI 总结接口返回为空或失败"
+        result["error_hint"] = sum_err.get("hint") or "语音转录已完整保存，可切换到「完整转录」查看或稍后点击重试"
     result["timings"]["total"] = round(time.time() - t0, 1)
 
     print(f"[处理] ✅ 完成 (总计 {result['timings']['total']}s)", file=sys.stderr)
