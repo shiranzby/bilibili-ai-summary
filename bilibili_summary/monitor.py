@@ -134,6 +134,7 @@ def get_new_videos(mid: int, processed_set: set, window: int) -> list:
         new_videos.append({
             "bvid": bvid,
             "title": v.get("title", "").strip(),
+            "pic": (v.get("pic") or "").replace("http://", "https://"),
             "created": created,
             "play": v.get("play", 0),
             "duration": v.get("length", ""),
@@ -189,9 +190,11 @@ def process_video(video: dict, up_name: str) -> dict:
     else:
         print("  [处理] ⚠ 无法获取视频文字内容，跳过总结")
 
+    pic_url = (video.get("pic") or (info or {}).get("pic") or "").replace("http://", "https://")
     return {
         "bvid": bvid,
         "title": title,
+        "pic": pic_url,
         "summary": summary or f"（该视频无法获取文字内容，无法生成总结{diag_msg}）",
         "url": f"https://www.bilibili.com/video/{bvid}",
         "pub_time": pub_time_display,

@@ -28,6 +28,7 @@ video_payload = {
     "bvid": bvid,
     "title": title,
     "up_name": owner,
+    "pic": (data.get("pic") or "").replace("http://", "https://"),
     "summary": summary,
     "url": data.get("video_url") or f"https://www.bilibili.com/video/{bvid}",
     "pub_time": pub_time,

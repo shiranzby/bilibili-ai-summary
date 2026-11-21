@@ -211,23 +211,44 @@ def _strip_section_heading(line: str) -> Optional[str]:
     return None
 
 
-def render_summary_html(summary: str, theme: Optional[Dict] = None) -> str:
-    """将 AI 生成的 Markdown 总结渲染为精美、邮件客户端兼容的 HTML"""
+def _format_cover_url(raw_pic: str) -> str:
+    """规范化 B 站封面地址为邮件客户端通用 JPEG 缩略图 (640x360)"""
+    pic = (raw_pic or "").strip()
+    if not pic:
+        return ""
+    if pic.startswith("//"):
+        pic = "https:" + pic
+    elif pic.startswith("http://"):
+        pic = "https://" + pic[7:]
+    if "hdslb.com" in pic and "@" not in pic:
+        pic = pic + "@640w_360h_1c.jpg"
+    return pic
+
+
+def _parse_summary_blocks(summary: str, theme: Optional[Dict] = None) -> Dict[str, str]:
+    """
+    将 AI 生成的 Markdown 总结拆分为:
+      - theme_html: 「核心主题」高亮块（可置于桌面端封面右侧）
+      - rest_html:  「要点提炼」「总结洞察」及正文块
+    """
     th = theme or EMAIL_THEMES["editorial"]
     accent = th["accent"]
     is_compact = th["compact"]
-    font_size = "13px" if is_compact else "13.5px"
-    line_h = "1.55" if is_compact else "1.7"
+    font_size = "13.5px" if is_compact else "14px"
+    line_h = "1.6" if is_compact else "1.75"
 
     if not summary or not summary.strip():
-        return '<p style="margin:0;color:#9ca3af;font-size:13px;">（暂无摘要内容）</p>'
+        return {"theme_html": "", "rest_html": '<p style="margin:0;color:#9ca3af;font-size:13px;">（暂无摘要内容）</p>'}
 
     stripped = summary.strip()
     if stripped.startswith("（") and "无法" in stripped and "\n" not in stripped:
-        return (
-            f'<div style="background:#fef2f2;border:1px solid #fecaca;border-radius:8px;'
-            f'padding:10px 14px;color:#b91c1c;font-size:13px;">{html_lib.escape(stripped)}</div>'
-        )
+        return {
+            "theme_html": "",
+            "rest_html": (
+                f'<div style="background:#fef2f2;border:1px solid #fecaca;border-radius:8px;'
+                f'padding:10px 14px;color:#b91c1c;font-size:13px;">{html_lib.escape(stripped)}</div>'
+            ),
+        }
 
     lines = summary.replace("\r\n", "\n").split("\n")
     sections = []
@@ -270,18 +291,18 @@ def render_summary_html(summary: str, theme: Optional[Dict] = None) -> str:
 
     flush()
 
-    blocks = []
+    theme_html = ""
+    rest_blocks = []
     for kind, title_text, sec_lines in sections:
         if not sec_lines:
             continue
 
-        if kind == "theme":
+        if kind == "theme" and not theme_html:
             body = "<br>".join(_inline_md_to_html(l, accent) for l in sec_lines)
-            pad = "9px 12px" if is_compact else "12px 15px"
-            mb = "11px" if is_compact else "16px"
-            blocks.append(
-                f'<div style="background:{th["theme_box_bg"]};border-left:3px solid {th["theme_box_border"]};'
-                f'border-radius:0 8px 8px 0;padding:{pad};margin:0 0 {mb} 0;">'
+            pad = "9px 12px" if is_compact else "11px 15px"
+            theme_html = (
+                f'<div style="background:{th["theme_box_bg"]};border-left:3.5px solid {th["theme_box_border"]};'
+                f'border-radius:0 8px 8px 0;padding:{pad};margin:0;">'
                 f'<div style="font-size:11px;font-weight:700;letter-spacing:0.6px;color:{th["accent_dark"]};'
                 f'text-transform:uppercase;margin-bottom:4px;">核心主题</div>'
                 f'<div style="font-size:{font_size};line-height:{line_h};color:#1f2937;font-weight:500;">{body}</div>'
@@ -289,7 +310,7 @@ def render_summary_html(summary: str, theme: Optional[Dict] = None) -> str:
             )
         elif kind == "points":
             items_html = []
-            pb = "5px" if is_compact else "9px"
+            pb = "6px" if is_compact else "10px"
             for l in sec_lines:
                 m_num = re.match(r"^(\d+)[.、)]\s*(.+)$", l)
                 m_bul = re.match(r"^[-*•]\s+(.+)$", l)
@@ -298,8 +319,8 @@ def render_summary_html(summary: str, theme: Optional[Dict] = None) -> str:
                     item_text = _inline_md_to_html(m_num.group(2), accent)
                     items_html.append(
                         f'<tr>'
-                        f'<td valign="top" style="width:24px;padding:0 8px {pb} 0;">'
-                        f'<span style="display:inline-block;min-width:18px;height:18px;line-height:18px;'
+                        f'<td valign="top" style="width:26px;padding:1px 8px {pb} 0;">'
+                        f'<span style="display:inline-block;min-width:20px;height:20px;line-height:20px;'
                         f'text-align:center;background:#f3f4f6;color:{accent};border-radius:50%;'
                         f'font-size:11px;font-weight:700;">{num_label}</span>'
                         f'</td>'
@@ -324,10 +345,10 @@ def render_summary_html(summary: str, theme: Optional[Dict] = None) -> str:
                         f'{_inline_md_to_html(l, accent)}</td></tr>'
                     )
             mb = "10px" if is_compact else "16px"
-            blocks.append(
+            rest_blocks.append(
                 f'<div style="margin:0 0 {mb} 0;">'
                 f'<div style="font-size:11.5px;font-weight:700;letter-spacing:0.5px;color:#6b7280;'
-                f'margin-bottom:8px;">要点提炼</div>'
+                f'margin-bottom:9px;">要点提炼</div>'
                 f'<table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0">'
                 f'{"".join(items_html)}'
                 f'</table>'
@@ -347,8 +368,8 @@ def render_summary_html(summary: str, theme: Optional[Dict] = None) -> str:
                 if note_parts
                 else ""
             )
-            pad = "9px 12px" if is_compact else "12px 15px"
-            blocks.append(
+            pad = "9px 12px" if is_compact else "13px 16px"
+            rest_blocks.append(
                 f'<div style="background:#f9fafb;border:1px solid #eef0f3;border-radius:8px;padding:{pad};margin:0;">'
                 f'<div style="font-size:11px;font-weight:700;letter-spacing:0.6px;color:#4b5563;'
                 f'margin-bottom:4px;">总结洞察</div>'
@@ -362,7 +383,7 @@ def render_summary_html(summary: str, theme: Optional[Dict] = None) -> str:
                 if re.match(r"^#{2,4}\s+", l):
                     h_txt = re.sub(r"^#{2,4}\s+", "", l)
                     para_html.append(
-                        f'<div style="font-size:14px;font-weight:700;color:#111827;margin:10px 0 5px 0;">'
+                        f'<div style="font-size:14.5px;font-weight:700;color:#111827;margin:10px 0 5px 0;">'
                         f'{_inline_md_to_html(h_txt, accent)}</div>'
                     )
                 elif re.match(r"^[-*•]\s+", l):
@@ -376,22 +397,45 @@ def render_summary_html(summary: str, theme: Optional[Dict] = None) -> str:
                         f'<p style="margin:0 0 7px 0;font-size:{font_size};line-height:{line_h};color:#374151;">'
                         f'{_inline_md_to_html(l, accent)}</p>'
                     )
-            blocks.append(f'<div style="margin:0 0 10px 0;">{"".join(para_html)}</div>')
+            rest_blocks.append(f'<div style="margin:0 0 10px 0;">{"".join(para_html)}</div>')
 
-    return "".join(blocks)
+    return {"theme_html": theme_html, "rest_html": "".join(rest_blocks)}
 
 
-# ==================== 日报 HTML 模板 ====================
+def render_summary_html(summary: str, theme: Optional[Dict] = None) -> str:
+    """兼容旧调用：将 AI Markdown 总结渲染为完整 HTML"""
+    parts = _parse_summary_blocks(summary, theme)
+    t_html = f'<div style="margin-bottom:16px;">{parts["theme_html"]}</div>' if parts["theme_html"] else ""
+    return t_html + parts["rest_html"]
+
+
+# ==================== 宽屏桌面优先 + 视频封面 日报 HTML 模板 ====================
+
+RESPONSIVE_EMAIL_STYLE = """
+  <style type="text/css">
+    @media only screen and (max-width: 640px) {
+      .outer-pad { padding: 10px 6px !important; }
+      .header-pad { padding: 18px 16px !important; }
+      .body-pad { padding: 14px 10px 6px 10px !important; }
+      .card-box { padding: 14px 14px !important; }
+      .cover-col { display: block !important; width: 100% !important; padding: 0 0 12px 0 !important; }
+      .hero-col { display: block !important; width: 100% !important; padding: 0 !important; }
+      .cover-img { width: 100% !important; height: auto !important; max-width: 100% !important; }
+    }
+  </style>
+"""
+
 
 def _render_video_card(index: int, video: Dict, theme: Dict) -> str:
-    """渲染单支视频的日报卡片"""
+    """渲染单支视频的宽屏杂志风卡片（左侧 16:9 封面 + 右侧标题/元数据/核心主题 + 下方要点提炼）"""
     title = html_lib.escape(video.get("title") or video.get("bvid", ""))
     bvid = html_lib.escape(video.get("bvid", ""))
     up_name = html_lib.escape(video.get("up_name") or video.get("owner") or "")
     video_url = html_lib.escape(video.get("url") or f"https://www.bilibili.com/video/{bvid}")
     duration = html_lib.escape(str(video.get("duration") or ""))
     pub_time = html_lib.escape(str(video.get("pub_time") or ""))
-    summary_html = render_summary_html(video.get("summary") or "", theme)
+    cover_url = html_lib.escape(_format_cover_url(video.get("pic") or ""))
+    parts = _parse_summary_blocks(video.get("summary") or "", theme)
     is_compact = theme["compact"]
 
     meta_parts = []
@@ -403,44 +447,78 @@ def _render_video_card(index: int, video: Dict, theme: Dict) -> str:
 
     up_badge = (
         f'<span style="display:inline-block;background:{theme["badge_bg"]};color:{theme["badge_color"]};'
-        f'border:1px solid {theme["badge_border"]};border-radius:999px;padding:2px 9px;'
+        f'border:1px solid {theme["badge_border"]};border-radius:999px;padding:2px 10px;'
         f'font-size:11.5px;font-weight:600;margin-right:8px;">{up_name}</span>'
         if up_name
         else ""
     )
 
-    title_size = "15.5px" if is_compact else "17px"
-    card_mb = "12px" if is_compact else "18px"
+    title_size = "16.5px" if is_compact else "18.5px"
+    card_mb = "14px" if is_compact else "20px"
     idx_str = f"{index:02d}"
+    cover_w = 200 if is_compact else 264
 
-    return f"""
-    <div id="video-{index}" style="background:#ffffff;border:1px solid #e5e7eb;border-radius:12px;padding:{theme['card_pad']};margin-bottom:{card_mb};">
+    meta_header = f"""
       <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="margin-bottom:8px;">
         <tr>
           <td style="vertical-align:middle;">
-            <span style="display:inline-block;font-family:Consolas,monospace;font-size:11px;font-weight:700;color:#9ca3af;margin-right:8px;">#{idx_str}</span>
+            <span style="display:inline-block;font-family:Consolas,monospace;font-size:11.5px;font-weight:700;color:#9ca3af;margin-right:8px;">#{idx_str}</span>
             {up_badge}
             <span style="font-size:12px;color:#9ca3af;">{meta_str}</span>
+          </td>
+          <td align="right" style="vertical-align:middle;font-family:Consolas,monospace;font-size:11.5px;color:#9ca3af;white-space:nowrap;">
+            {bvid}
           </td>
         </tr>
       </table>
       <div style="margin:0 0 12px 0;">
-        <a href="{video_url}" target="_blank" style="font-size:{title_size};font-weight:700;line-height:1.45;color:#111827;text-decoration:none;">
+        <a href="{video_url}" target="_blank" style="font-size:{title_size};font-weight:800;line-height:1.42;color:#111827;text-decoration:none;">
           {title}
         </a>
       </div>
-      <div style="border-top:1px solid #f3f4f6;padding-top:12px;">
-        {summary_html}
-      </div>
-      <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="margin-top:12px;padding-top:10px;border-top:1px dashed #e5e7eb;">
+      {parts["theme_html"]}
+    """
+
+    if cover_url:
+        hero_html = f"""
+      <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="margin-bottom:14px;">
         <tr>
-          <td style="vertical-align:middle;">
-            <a href="{video_url}" target="_blank" style="display:inline-block;background:{theme['btn_bg']};color:{theme['btn_color']};font-size:12px;font-weight:600;text-decoration:none;padding:6px 13px;border-radius:7px;">
-              ▶ 前往 B 站观看
+          <td class="cover-col" valign="top" width="{cover_w}" style="width:{cover_w}px;padding-right:20px;">
+            <a href="{video_url}" target="_blank" style="display:block;text-decoration:none;border-radius:10px;overflow:hidden;border:1px solid #e5e7eb;background:#f3f4f6;">
+              <img class="cover-img" src="{cover_url}" alt="{title}" width="{cover_w}" style="display:block;width:{cover_w}px;max-width:100%;height:auto;border:0;border-radius:9px;">
             </a>
           </td>
-          <td align="right" style="vertical-align:middle;font-family:Consolas,monospace;font-size:11.5px;color:#9ca3af;">
-            {bvid}
+          <td class="hero-col" valign="top">
+            {meta_header}
+          </td>
+        </tr>
+      </table>
+        """
+    else:
+        hero_html = f'<div style="margin-bottom:14px;">{meta_header}</div>'
+
+    rest_section = (
+        f'<div style="border-top:1px solid #f3f4f6;padding-top:14px;">{parts["rest_html"]}</div>'
+        if parts["rest_html"]
+        else ""
+    )
+
+    return f"""
+    <div id="video-{index}" class="card-box" style="background:#ffffff;border:1px solid #e5e7eb;border-radius:14px;padding:{theme['card_pad']};margin-bottom:{card_mb};">
+      {hero_html}
+      {rest_section}
+      <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="margin-top:14px;padding-top:12px;border-top:1px dashed #e5e7eb;">
+        <tr>
+          <td style="vertical-align:middle;">
+            <a href="{video_url}" target="_blank" style="display:inline-block;background:{theme['btn_bg']};color:{theme['btn_color']};font-size:12.5px;font-weight:600;text-decoration:none;padding:7px 15px;border-radius:8px;margin-right:10px;">
+              前往 B 站观看 ↗
+            </a>
+            <a href="https://bilisum.cc.cd" target="_blank" style="display:inline-block;background:#f9fafb;color:#374151;border:1px solid #e5e7eb;font-size:12px;font-weight:600;text-decoration:none;padding:6px 13px;border-radius:8px;">
+              在知识工作台深度追问
+            </a>
+          </td>
+          <td align="right" style="vertical-align:middle;font-size:11.5px;color:#9ca3af;">
+            {up_name}
           </td>
         </tr>
       </table>
@@ -450,7 +528,7 @@ def _render_video_card(index: int, video: Dict, theme: Dict) -> str:
 
 def build_daily_briefing_email(videos: List[Dict], date_str: str = "", style: str = "editorial") -> str:
     """
-    构建合并后的「B站视频 AI 日报」单封汇总邮件，支持 4 种可选样式。
+    构建合并后的「B站视频 AI 日报」单封汇总邮件，桌面宽屏自适应 (max-width: 1080px) + 视频封面。
     """
     th = _get_theme(style)
     if not date_str:
@@ -469,20 +547,20 @@ def build_daily_briefing_email(videos: List[Dict], date_str: str = "", style: st
         v_url = html_lib.escape(v.get("url") or f"https://www.bilibili.com/video/{bvid_i}")
         up = html_lib.escape(v.get("up_name") or "")
         dur = html_lib.escape(str(v.get("duration") or ""))
-        dur_html = f'<span style="color:#9ca3af;font-size:11.5px;margin-left:6px;">({dur})</span>' if dur else ""
+        dur_html = f'<span style="color:#9ca3af;font-size:12px;margin-left:8px;">{dur}</span>' if dur else ""
         up_html = f'<span style="color:{th["accent_dark"]};font-weight:600;margin-right:6px;">[{up}]</span>' if up else ""
         toc_rows.append(
             f'<tr>'
-            f'<td valign="top" style="width:26px;padding:3px 6px 3px 0;font-family:Consolas,monospace;font-size:12px;color:{th["accent"]};font-weight:700;">{i:02d}</td>'
-            f'<td valign="top" style="padding:3px 0;font-size:13px;line-height:1.5;color:#374151;">'
+            f'<td valign="top" style="width:28px;padding:4px 8px 4px 0;font-family:Consolas,monospace;font-size:12.5px;color:{th["accent"]};font-weight:700;">{i:02d}</td>'
+            f'<td valign="top" style="padding:4px 0;font-size:13.5px;line-height:1.55;color:#374151;">'
             f'<a href="{v_url}" target="_blank" style="color:#1f2937;text-decoration:none;border-bottom:1px solid #e5e7eb;">{up_html}{t}</a>{dur_html}'
             f'</td>'
             f'</tr>'
         )
 
     toc_html = f"""
-    <div style="background:#f9fafb;border:1px solid #e5e7eb;border-radius:10px;padding:12px 16px;margin-bottom:18px;">
-      <div style="font-size:11px;font-weight:700;letter-spacing:0.8px;color:#6b7280;margin-bottom:7px;">
+    <div style="background:#ffffff;border:1px solid #e5e7eb;border-radius:12px;padding:14px 18px;margin-bottom:20px;">
+      <div style="font-size:11.5px;font-weight:700;letter-spacing:0.8px;color:#6b7280;margin-bottom:8px;">
         本期速览 · TABLE OF CONTENTS
       </div>
       <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0">
@@ -500,38 +578,45 @@ def build_daily_briefing_email(videos: List[Dict], date_str: str = "", style: st
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1.0">
+  {RESPONSIVE_EMAIL_STYLE}
 </head>
 <body style="margin:0;padding:0;background-color:{th['page_bg']};font-family:-apple-system,BlinkMacSystemFont,'PingFang SC','Microsoft YaHei','Segoe UI',sans-serif;color:#111827;-webkit-font-smoothing:antialiased;">
-  <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="background-color:{th['page_bg']};padding:24px 12px;">
+  <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" class="outer-pad" style="background-color:{th['page_bg']};padding:18px 20px;">
     <tr>
       <td align="center">
-        <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="max-width:680px;">
+        <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="width:100%;max-width:1080px;">
           <tr>
-            <td style="background:{th['header_bg']};border-top:{th['header_top_border']};border-left:1px solid #e5e7eb;border-right:1px solid #e5e7eb;{header_border_bottom}border-radius:14px 14px 0 0;padding:24px 26px 20px 26px;">
-              <div style="font-size:11px;font-weight:600;letter-spacing:1.4px;color:{th['header_meta_color']};text-transform:uppercase;margin-bottom:8px;">
-                BILIBILI AI DAILY BRIEFING &nbsp;·&nbsp; {html_lib.escape(date_str)}
-              </div>
-              <div style="font-size:22px;font-weight:800;color:{th['header_title_color']};letter-spacing:0.3px;margin-bottom:12px;">
-                B站视频 AI 日报
-              </div>
-              <div>
-                <span style="display:inline-block;background:{th['pill1_bg']};color:{th['pill1_color']};border:1px solid {th['pill1_border']};border-radius:999px;padding:3px 11px;font-size:12px;font-weight:600;margin-right:8px;">
-                  {up_count_text}
-                </span>
-                <span style="display:inline-block;background:{th['pill2_bg']};color:{th['pill2_color']};border:1px solid {th['pill2_border']};border-radius:999px;padding:3px 11px;font-size:12px;">
-                  共 {len(videos)} 支新视频
-                </span>
-              </div>
+            <td class="header-pad" style="background:{th['header_bg']};border-top:{th['header_top_border']};border-left:1px solid #e5e7eb;border-right:1px solid #e5e7eb;{header_border_bottom}border-radius:14px 14px 0 0;padding:24px 30px 22px 30px;">
+              <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0">
+                <tr>
+                  <td valign="middle">
+                    <div style="font-size:11.5px;font-weight:600;letter-spacing:1.4px;color:{th['header_meta_color']};text-transform:uppercase;margin-bottom:6px;">
+                      BILIBILI AI DAILY BRIEFING &nbsp;·&nbsp; {html_lib.escape(date_str)}
+                    </div>
+                    <div style="font-size:24px;font-weight:800;color:{th['header_title_color']};letter-spacing:0.3px;">
+                      B站视频 AI 日报
+                    </div>
+                  </td>
+                  <td align="right" valign="bottom" style="white-space:nowrap;">
+                    <span style="display:inline-block;background:{th['pill1_bg']};color:{th['pill1_color']};border:1px solid {th['pill1_border']};border-radius:999px;padding:4px 12px;font-size:12px;font-weight:600;margin-right:8px;">
+                      {up_count_text}
+                    </span>
+                    <span style="display:inline-block;background:{th['pill2_bg']};color:{th['pill2_color']};border:1px solid {th['pill2_border']};border-radius:999px;padding:4px 12px;font-size:12px;">
+                      共 {len(videos)} 支新视频
+                    </span>
+                  </td>
+                </tr>
+              </table>
             </td>
           </tr>
           <tr>
-            <td style="background:{th['body_bg']};border-left:1px solid #e5e7eb;border-right:1px solid #e5e7eb;padding:20px 18px 8px 18px;">
+            <td class="body-pad" style="background:{th['body_bg']};border-left:1px solid #e5e7eb;border-right:1px solid #e5e7eb;padding:22px 26px 8px 26px;">
               {toc_html}
               {cards_html}
             </td>
           </tr>
           <tr>
-            <td style="background:#ffffff;border:1px solid #e5e7eb;border-top:none;border-radius:0 0 14px 14px;padding:15px 24px;text-align:center;">
+            <td style="background:#ffffff;border:1px solid #e5e7eb;border-top:none;border-radius:0 0 14px 14px;padding:15px 26px;text-align:center;">
               <div style="font-size:12px;color:#9ca3af;line-height:1.6;">
                 本邮件由 <a href="https://bilisum.cc.cd" target="_blank" style="color:{th['accent']};text-decoration:none;font-weight:600;">B站AI摘要 (bilisum.cc.cd)</a> 自动生成 · 样式：{th['name']}
               </div>
@@ -546,7 +631,7 @@ def build_daily_briefing_email(videos: List[Dict], date_str: str = "", style: st
 
 
 def build_single_video_email(video: Dict, style: str = "editorial") -> str:
-    """构建单条视频处理完成的精美简报邮件，支持 4 种可选样式"""
+    """构建单条视频处理完成的宽屏桌面简报邮件，附带视频封面与 4 种可选样式"""
     th = _get_theme(style)
     date_str = time.strftime("%Y年%m月%d日 %H:%M", time.localtime())
     card_html = _render_video_card(1, video, th)
@@ -561,29 +646,30 @@ def build_single_video_email(video: Dict, style: str = "editorial") -> str:
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1.0">
+  {RESPONSIVE_EMAIL_STYLE}
 </head>
 <body style="margin:0;padding:0;background-color:{th['page_bg']};font-family:-apple-system,BlinkMacSystemFont,'PingFang SC','Microsoft YaHei','Segoe UI',sans-serif;color:#111827;">
-  <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="background-color:{th['page_bg']};padding:24px 12px;">
+  <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" class="outer-pad" style="background-color:{th['page_bg']};padding:18px 20px;">
     <tr>
       <td align="center">
-        <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="max-width:680px;">
+        <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="width:100%;max-width:1080px;">
           <tr>
-            <td style="background:{th['header_bg']};border-top:{th['header_top_border']};border-left:1px solid #e5e7eb;border-right:1px solid #e5e7eb;{header_border_bottom}border-radius:14px 14px 0 0;padding:20px 24px;">
-              <div style="font-size:11px;font-weight:600;letter-spacing:1.3px;color:{th['header_meta_color']};text-transform:uppercase;margin-bottom:6px;">
+            <td class="header-pad" style="background:{th['header_bg']};border-top:{th['header_top_border']};border-left:1px solid #e5e7eb;border-right:1px solid #e5e7eb;{header_border_bottom}border-radius:14px 14px 0 0;padding:22px 28px;">
+              <div style="font-size:11.5px;font-weight:600;letter-spacing:1.3px;color:{th['header_meta_color']};text-transform:uppercase;margin-bottom:6px;">
                 BILIBILI AI SUMMARY &nbsp;·&nbsp; {html_lib.escape(date_str)}{html_lib.escape(elapsed)}
               </div>
-              <div style="font-size:20px;font-weight:800;color:{th['header_title_color']};">
+              <div style="font-size:22px;font-weight:800;color:{th['header_title_color']};">
                 B站视频 AI 简报
               </div>
             </td>
           </tr>
           <tr>
-            <td style="background:{th['body_bg']};border-left:1px solid #e5e7eb;border-right:1px solid #e5e7eb;padding:18px 18px 6px 18px;">
+            <td class="body-pad" style="background:{th['body_bg']};border-left:1px solid #e5e7eb;border-right:1px solid #e5e7eb;padding:20px 26px 8px 26px;">
               {card_html}
             </td>
           </tr>
           <tr>
-            <td style="background:#ffffff;border:1px solid #e5e7eb;border-top:none;border-radius:0 0 14px 14px;padding:14px 24px;text-align:center;">
+            <td style="background:#ffffff;border:1px solid #e5e7eb;border-top:none;border-radius:0 0 14px 14px;padding:14px 26px;text-align:center;">
               <div style="font-size:12px;color:#9ca3af;">
                 由 <a href="https://bilisum.cc.cd" target="_blank" style="color:{th['accent']};text-decoration:none;font-weight:600;">B站AI摘要 (bilisum.cc.cd)</a> 生成 · 样式：{th['name']}
               </div>

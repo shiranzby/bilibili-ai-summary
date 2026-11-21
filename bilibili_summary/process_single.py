@@ -41,6 +41,7 @@ def process(bvid: str, job_id: str = "", summary_template: str = "") -> dict:
     info = get_video_info(bvid)
     title = (info.get("title") if info else None) or bvid
     owner = (info.get("owner", {}).get("name") if info else None) or ""
+    pic = ((info.get("pic") if info else None) or "").replace("http://", "https://")
     pubdate = (info.get("pubdate") if info else None)
     duration_sec = (info.get("duration") if info else 0) or 0
     duration_str = format_duration(duration_sec) if duration_sec else ""
@@ -52,6 +53,7 @@ def process(bvid: str, job_id: str = "", summary_template: str = "") -> dict:
         "job_id": job_id,
         "title": title,
         "owner": owner,
+        "pic": pic,
         "pubdate": pubdate,
         "duration": duration_str,
         "status": "completed",

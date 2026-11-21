@@ -104,6 +104,7 @@ export default async function handler(req, res) {
     cid: cid || info.cid,
     title: info.title || '',
     desc: info.desc || '',
+    pic: (info.pic || '').replace(/^http:\/\//, 'https://'),
     duration: info.duration || 0,
     pubdate: info.pubdate || null,
     owner: info.owner || {},
