@@ -412,11 +412,17 @@ def get_text_from_audio(
     bvid: str,
     siliconflow_api_key: str = "",
     siliconflow_stt_model: str = "",
+    on_stage=None,
 ) -> Optional[str]:
     """
     一站式: B站音频下载 → 直接上传硅基流动语音识别
     """
     _set_diag("", "", "")
+    if callable(on_stage):
+        try:
+            on_stage("downloading")
+        except Exception:
+            pass
     with tempfile.TemporaryDirectory() as tmpdir:
         m4s_path = os.path.join(tmpdir, f"{bvid}.m4s")
         m4a_path = os.path.join(tmpdir, f"{bvid}.m4a")
@@ -463,6 +469,11 @@ def get_text_from_audio(
 
         # .m4s = AAC/M4A 容器，直接改名即可
         os.rename(m4s_path, m4a_path)
+        if callable(on_stage):
+            try:
+                on_stage("transcribing")
+            except Exception:
+                pass
 
         # 如果配置了免费的 GROQ_API_KEY，优先尝试高精度免费的 Groq Whisper (<=24MB)，失败回退免费硅基流动 SenseVoiceSmall
         groq_key = os.environ.get("GROQ_API_KEY", "").strip()

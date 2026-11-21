@@ -286,7 +286,7 @@ async function dispatchWorkflow(env, inputs) {
   return ghResp;
 }
 
-async function fetchGHRunId(env) {
+async function fetchGHRunId(env, minCreatedMs = 0) {
   const owner = env.GH_OWNER || GH_OWNER_DEF;
   const repo = env.GH_REPO || GH_REPO_DEF;
   const token = env.GH_TOKEN || '';
@@ -303,15 +303,23 @@ async function fetchGHRunId(env) {
     if (!resp.ok) return null;
     const data = await resp.json();
     const runs = data.workflow_runs || [];
-    return runs.length > 0 ? runs[0].id : null;
+    for (const r of runs) {
+      const rMs = r.created_at ? new Date(r.created_at).getTime() : 0;
+      if (!minCreatedMs || rMs >= minCreatedMs - 8000) {
+        if (r.status !== 'completed') return r.id;
+      }
+    }
+    return null;
   } catch {
     return null;
   }
 }
 
-async function captureRunId(env, jobId) {
+async function captureRunId(env, jobId, createdAtIso) {
   if (!env.BILIBILI_BUCKET || !env.GH_TOKEN) return;
-  const runId = await fetchGHRunId(env);
+  const minMs = createdAtIso ? new Date(createdAtIso).getTime() : Date.now();
+  await new Promise(res => setTimeout(res, 2600));
+  const runId = await fetchGHRunId(env, minMs);
   if (runId) {
     try {
       const existing = await env.BILIBILI_BUCKET.get(`pending/${jobId}.json`);
@@ -346,28 +354,45 @@ async function fetchGHRunStatus(env, runId) {
   }
 }
 
-function ghStatusToSteps(ghStatus, ghConclusion, startedAt) {
+function ghStatusToSteps(ghStatus, ghConclusion, startedAt, realStage, isPending) {
   const steps = [
     { name: '任务创建', done: true, active: false },
     { name: '下载音频', done: false, active: false },
     { name: '语音转录', done: false, active: false },
-    { name: 'AI总结', done: false, active: false },
-    { name: '完成', done: false, active: false },
+    { name: 'AI 总结', done: false, active: false },
   ];
-  if (ghStatus === 'queued') {
-    steps[0].active = true;
-  } else if (ghStatus === 'in_progress') {
+  if (realStage === 'summarizing') {
+    steps[1].done = true;
+    steps[2].done = true;
+    steps[3].active = true;
+    return steps;
+  }
+  if (realStage === 'transcribing') {
+    steps[1].done = true;
+    steps[2].active = true;
+    return steps;
+  }
+  if (realStage === 'downloading') {
+    steps[1].active = true;
+    return steps;
+  }
+  if (isPending) {
+    // While job is still pending in R2, never mark all 4 steps done!
     const elapsed = startedAt ? (Date.now() - new Date(startedAt).getTime()) / 1000 : 0;
-    const doneCount = elapsed < 15 ? 0 : elapsed < 35 ? 1 : elapsed < 75 ? 2 : 3;
-    for (let i = 1; i <= doneCount && i < 5; i++) steps[i].done = true;
-    const next = Math.min(doneCount + 1, 4);
-    if (next < 5) steps[next].active = true;
-  } else if (ghStatus === 'completed') {
-    if (ghConclusion === 'success') {
-      steps.forEach(s => { s.done = true; s.active = false; });
+    if (elapsed < 22) {
+      steps[1].active = true;
+    } else if (elapsed < 48) {
+      steps[1].done = true;
+      steps[2].active = true;
     } else {
-      steps[4].failed = true;
+      steps[1].done = true;
+      steps[2].done = true;
+      steps[3].active = true;
     }
+    return steps;
+  }
+  if (ghStatus === 'completed' && ghConclusion === 'success') {
+    steps.forEach(s => { s.done = true; s.active = false; });
   }
   return steps;
 }
@@ -1156,7 +1181,7 @@ async function handleSubmit(request, env, ctx) {
         warning: 'GitHub Actions 触发可能失败: HTTP ' + ghResp.status,
       }, 201);
     }
-    ctx.waitUntil(captureRunId(env, jobId));
+    ctx.waitUntil(captureRunId(env, jobId, job.created_at));
   } catch (err) {
     console.error('GitHub dispatch error:', err.message);
   }
@@ -1195,19 +1220,44 @@ async function handleListJobs(request, env) {
 async function handleGetJob(request, env, jobId) {
   if (!env.BILIBILI_BUCKET) return errorResponse('R2 未配置', 503);
   let raw = await env.BILIBILI_BUCKET.get(`pending/${jobId}.json`);
+  const isPending = Boolean(raw);
   if (!raw) raw = await env.BILIBILI_BUCKET.get(`results/${jobId}.json`);
   if (!raw) return errorResponse('任务不存在', 404);
   const job = await raw.json();
-  if (job.status !== 'completed' && job.status !== 'failed' && job.run_id) {
-    const ghRun = await fetchGHRunStatus(env, job.run_id);
-    if (ghRun) {
-      job.gh_status = ghRun.status;
-      job.gh_conclusion = ghRun.conclusion;
-      job.gh_html_url = ghRun.html_url;
-      job.gh_steps = ghStatusToSteps(ghRun.status, ghRun.conclusion, job.created_at);
+  if (job.status !== 'completed' && job.status !== 'failed') {
+    if (job.run_id) {
+      const ghRun = await fetchGHRunStatus(env, job.run_id);
+      if (ghRun) {
+        job.gh_status = ghRun.status;
+        job.gh_conclusion = ghRun.conclusion;
+        job.gh_html_url = ghRun.html_url;
+      }
     }
+    job.gh_steps = ghStatusToSteps(job.gh_status || '', job.gh_conclusion || '', job.created_at, job.stage || '', isPending);
   }
   return jsonResponse(job);
+}
+
+async function handleProgress(request, env) {
+  if (!env.BILIBILI_BUCKET) return jsonResponse({ ok: false }, 503);
+  const body = await request.json().catch(() => ({}));
+  const jobId = String(body.job_id || '').trim();
+  const stage = String(body.stage || '').trim();
+  if (!jobId || !['downloading', 'transcribing', 'summarizing'].includes(stage)) {
+    return errorResponse('invalid progress payload', 400);
+  }
+  try {
+    const existing = await env.BILIBILI_BUCKET.get(`pending/${jobId}.json`);
+    if (existing) {
+      const jobData = await existing.json();
+      jobData.stage = stage;
+      jobData.updated_at = nowISO();
+      await env.BILIBILI_BUCKET.put(`pending/${jobId}.json`, JSON.stringify(jobData), {
+        httpMetadata: { contentType: 'application/json' },
+      });
+    }
+  } catch {}
+  return jsonResponse({ ok: true, job_id: jobId, stage });
 }
 
 async function handleDeleteJob(request, env, jobId) {
@@ -1475,6 +1525,9 @@ function generateFrontendPage() {
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1.0">
 <title>B站AI摘要 · Bilibili AI Summary</title>
+<link rel="icon" type="image/svg+xml" href="/favicon.svg">
+<link rel="shortcut icon" href="/favicon.svg">
+<link rel="apple-touch-icon" href="/favicon.svg">
 <style>
 *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
 :root{
@@ -2227,6 +2280,23 @@ theme-button{flex-shrink:0}
 .pick-chip:hover{border-color:var(--border-strong);color:var(--text)}
 .pick-chip.selected{border-color:var(--brand);background:var(--brand-soft);color:var(--brand-dark)}
 
+/* Summary Workspace Secondary Sidebar Card */
+.ws-side-card{
+  padding:9px 11px;border:1px solid var(--border);border-radius:10px;background:var(--surface);
+  cursor:pointer;transition:border-color .15s,background .15s;display:flex;align-items:flex-start;justify-content:space-between;gap:8px;
+}
+.ws-side-card:hover{background:var(--surface-hover);border-color:var(--border-strong)}
+.ws-side-card.active{border-color:var(--brand);background:var(--brand-soft)}
+.ws-side-body{flex:1;min-width:0}
+.ws-side-title{font-size:13px;font-weight:600;color:var(--text);line-height:1.4;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;margin-bottom:3px;word-break:break-word}
+.ws-side-meta{font-size:11px;color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.ws-side-right{display:flex;flex-direction:column;align-items:flex-end;gap:6px;flex-shrink:0;padding-top:2px}
+.ws-side-del{border:none;background:none;color:var(--muted);width:20px;height:20px;border-radius:5px;display:flex;align-items:center;justify-content:center;opacity:0;transition:all .15s}
+.ws-side-card:hover .ws-side-del{opacity:1}
+.ws-side-del:hover{color:var(--err);background:var(--err-soft)}
+@keyframes pulseDot{0%,100%{opacity:1;transform:scale(1)}50%{opacity:.45;transform:scale(1.25)}}
+.dot.pending{background:var(--warn);animation:pulseDot 1.4s infinite ease-in-out}
+.st-item.active .st-dot{border-color:var(--brand);background:var(--brand);color:#fff;font-weight:700;box-shadow:0 0 0 3px rgba(251,114,153,.22)}
 </style>
 </head>
 <body>
@@ -2378,21 +2448,36 @@ theme-button{flex-shrink:0}
     </header>
 
     <div class="route-host">
-      <!-- ROUTE 1: SUMMARY WORKSPACE -->
-      <section class="route-view" id="view-summary">
-        <div class="page-inner">
-          <div class="recent-strip" id="recentStrip"></div>
-
-          <div class="empty-ws-card" id="summaryEmptyState">
-            <h2>开始你的视频 AI 精读</h2>
-            <p>粘贴 B 站视频链接或 BV 号，自动完成免费语音转录与结构化摘要；支持秒速切换风格、可视化思维导图、全文检索与围绕视频多轮 AI 追问。</p>
-            <div class="quick-inline-bar">
-              <input class="ctrl" id="inlineVideoUrl" type="text" placeholder="粘贴 B 站视频链接或 BV 号，按 Enter 开始总结..." onkeydown="if(event.key==='Enter')submitInlineVideo()">
-              <button class="btn btn-primary" onclick="submitInlineVideo()">开始总结</button>
+      <!-- ROUTE 1: SUMMARY WORKSPACE (2-Pane Keep-Alive with Secondary History Nav) -->
+      <section class="route-view no-pad" id="view-summary">
+        <div class="monitor-split">
+          <div class="mon-aside">
+            <div class="search-box">
+              <span class="s-ic"><svg class="ic" viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4.3-4.3"/></svg></span>
+              <input class="ctrl" id="wsSearchInput" type="text" placeholder="搜索历史摘要..." oninput="renderWsSidebar()">
             </div>
+            <div class="quick-add-box">
+              <div class="quick-add-row">
+                <input class="ctrl" id="sideQuickVideoUrl" type="text" placeholder="粘贴视频链接或 BV 号..." onkeydown="if(event.key==='Enter')submitSideQuickVideo()">
+                <button class="btn btn-primary" type="button" onclick="submitSideQuickVideo()">总结</button>
+              </div>
+            </div>
+            <div class="folder-bar" id="wsFolderBar" style="margin-bottom:4px"></div>
+            <div class="mon-aside-scroll" id="wsSideList"></div>
           </div>
 
-          <div id="detailView" class="hidden">
+          <div class="mon-main" id="wsScrollArea">
+            <div class="page-inner">
+              <div class="empty-ws-card" id="summaryEmptyState">
+                <h2>开始你的视频 AI 精读</h2>
+                <p>粘贴 B 站视频链接或 BV 号，自动完成免费语音转录与结构化摘要；支持秒速切换风格、可视化思维导图、全文检索与围绕视频多轮 AI 追问。</p>
+                <div class="quick-inline-bar">
+                  <input class="ctrl" id="inlineVideoUrl" type="text" placeholder="粘贴 B 站视频链接或 BV 号，按 Enter 开始总结..." onkeydown="if(event.key==='Enter')submitInlineVideo()">
+                  <button class="btn btn-primary" onclick="submitInlineVideo()">开始总结</button>
+                </div>
+              </div>
+
+              <div id="detailView" class="hidden">
             <div class="stepper hidden" id="stepperBar"></div>
 
             <section class="video-head">
@@ -2512,6 +2597,8 @@ theme-button{flex-shrink:0}
                 </div>
               </div>
             </article>
+              </div>
+            </div>
           </div>
         </div>
       </section>
@@ -3813,6 +3900,7 @@ function refreshAllLibraryViews() {
     const cur = getJobs().find(j => j.id === selectedJobId);
     if (cur) { updateStarBtn(cur); updateWatchLaterBtn(cur); renderDetailTagBar(cur); }
   }
+  if (currentRoute === 'summary') { renderWsFolderBar(); renderWsSidebar(); }
   if (currentRoute === 'monitor') { renderMonitorFolderBar(); renderUpSidebar(); }
   if (currentRoute === 'watch-later') renderWatchLaterPage();
   if (currentRoute === 'favorites') renderFavoritesPage();
@@ -3820,23 +3908,35 @@ function refreshAllLibraryViews() {
   if (currentRoute === 'folder' && activeFolderId) renderFolderPage(activeFolderId, false);
 }
 
-// ── Jobs Storage & R2 Sync ──
+// ── In-Memory Jobs Cache & Non-Blocking R2 / LocalStorage Sync ──
+let jobsMemCache = null;
+let selectedWsFolder = '';
+
 function getJobs() {
-  try { return JSON.parse(localStorage.getItem(LS_JOBS) || '[]').map(j => ({ ...j, status: normStatus(j.status) })); }
-  catch { return []; }
+  if (jobsMemCache) return jobsMemCache;
+  try {
+    jobsMemCache = JSON.parse(localStorage.getItem(LS_JOBS) || '[]').map(j => ({ ...j, status: normStatus(j.status) }));
+  } catch {
+    jobsMemCache = [];
+  }
+  return jobsMemCache;
 }
 function saveJobs(jobs, skipSync) {
-  localStorage.setItem(LS_JOBS, JSON.stringify(jobs));
+  jobsMemCache = jobs.map(j => ({ ...j, status: normStatus(j.status) }));
   updateNavBadges();
   renderRailFolders();
-  renderRecentStrip();
+  if (currentRoute === 'summary') { renderWsFolderBar(); renderWsSidebar(); }
   if (currentRoute === 'history') renderHistoryPage();
   if (currentRoute === 'favorites') renderFavoritesPage();
   if (currentRoute === 'watch-later') renderWatchLaterPage();
   if (currentRoute === 'folder' && activeFolderId) renderFolderSummaries(activeFolderId);
-  if (!skipSync && authUser) {
-    apiFetch('/api/history', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ jobs: jobs.slice(0, 100) }) }).catch(() => {});
-  }
+  // Defer heavy JSON.stringify + localStorage write off the interactive click frame
+  setTimeout(() => {
+    try { localStorage.setItem(LS_JOBS, JSON.stringify(jobsMemCache)); } catch {}
+    if (!skipSync && authUser) {
+      apiFetch('/api/history', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ jobs: jobsMemCache.slice(0, 100) }) }).catch(() => {});
+    }
+  }, 0);
 }
 
 async function syncFromR2() {
@@ -3880,10 +3980,9 @@ function navigate(route, param) {
   toggleMobileNav(false);
   const newHash = param ? ('#/' + route + '/' + encodeURIComponent(param)) : ('#/' + route);
   if (window.location.hash !== newHash) {
-    window.location.hash = newHash;
-  } else {
-    activateRoute(route, param);
+    try { history.pushState(null, '', newHash); } catch {}
   }
+  activateRoute(route, param || '', false);
 }
 
 function handleHashRoute(isInit) {
@@ -3914,8 +4013,10 @@ function navigateFolder(scope, fid) {
   else activateRoute('folder', fid, false);
 }
 window.addEventListener('hashchange', () => { if (authUser) handleHashRoute(false); });
+window.addEventListener('popstate', () => { if (authUser) handleHashRoute(false); });
 
 function getRouteScrollEl(route) {
+  if (route === 'summary') return document.getElementById('wsScrollArea');
   if (route === 'monitor') return document.getElementById('monScrollArea');
   return document.getElementById('view-' + route);
 }
@@ -3953,7 +4054,8 @@ async function activateRoute(route, param, isInit) {
       const jobs = getJobs();
       if (jobs.length) selectedJobId = jobs[0].id;
     }
-    renderRecentStrip();
+    renderWsFolderBar();
+    renderWsSidebar();
     const curJob = getJobs().find(j => j.id === selectedJobId);
     if (curJob) {
       document.getElementById('summaryEmptyState').classList.add('hidden');
@@ -4171,8 +4273,15 @@ async function submitInlineVideo() {
   const inp = document.getElementById('inlineVideoUrl');
   const raw = inp.value.trim();
   if (!raw) { toast('请输入 B 站视频链接或 BV 号', true); return; }
-  const res = await submitVideo(raw);
-  if (res) inp.value = '';
+  inp.value = '';
+  await submitVideo(raw);
+}
+async function submitSideQuickVideo() {
+  const inp = document.getElementById('sideQuickVideoUrl');
+  const raw = inp.value.trim();
+  if (!raw) { toast('请输入 B 站视频链接或 BV 号', true); return; }
+  inp.value = '';
+  await submitVideo(raw);
 }
 
 async function submitVideo(overrideUrl, meta, stayOnPage) {
@@ -4609,18 +4718,68 @@ function deleteFolder(id, scope) {
   toast('已删除：' + f.name);
 }
 
-// ── PAGE 1: SUMMARY WORKSPACE ──
-function renderRecentStrip() {
-  const strip = document.getElementById('recentStrip');
-  if (!strip) return;
-  const jobs = getJobs().slice(0, 10);
-  if (!jobs.length) { strip.innerHTML = ''; return; }
-  strip.innerHTML = '<span class="recent-strip-label">最近任务</span>' + jobs.map(j => {
+// ── PAGE 1: SUMMARY WORKSPACE SECONDARY SIDEBAR ──
+function setWsFolder(fid) {
+  selectedWsFolder = selectedWsFolder === fid ? '' : fid;
+  renderWsFolderBar();
+  renderWsSidebar();
+}
+function renderWsFolderBar() {
+  const bar = document.getElementById('wsFolderBar');
+  if (!bar) return;
+  const jobs = getJobs(), folders = libraryState.summary_folders || [];
+  let html = '<button class="folder-chip' + (!selectedWsFolder ? ' active' : '') + '" onclick="setWsFolder(\'\')">全部</button>';
+  folders.forEach(f => {
+    const cnt = jobs.filter(j => getJobTagIds(j).includes(f.id)).length;
+    html += '<button class="folder-chip' + (selectedWsFolder === f.id ? ' active' : '') + '" onclick="setWsFolder(\'' + esc(f.id) + '\')"><span class="folder-dot" style="background:' + esc(f.color) + '"></span><span>' + esc(f.name) + '</span>' + (cnt ? '<span class="folder-cnt">' + cnt + '</span>' : '') + '</button>';
+  });
+  bar.innerHTML = html;
+}
+function renderWsSidebar() {
+  const listEl = document.getElementById('wsSideList');
+  if (!listEl) return;
+  const kw = ((document.getElementById('wsSearchInput') && document.getElementById('wsSearchInput').value) || '').trim().toLowerCase();
+  let jobs = getJobs();
+  if (selectedWsFolder) jobs = jobs.filter(j => getJobTagIds(j).includes(selectedWsFolder));
+  if (kw) jobs = jobs.filter(j => (j.title || '').toLowerCase().includes(kw) || (j.owner || '').toLowerCase().includes(kw) || (j.bvid || '').toLowerCase().includes(kw));
+
+  if (!jobs.length) {
+    listEl.innerHTML = '<div style="text-align:center;padding:24px 10px;color:var(--muted);font-size:12px">' + (selectedWsFolder ? '该分类下暂无历史摘要' : '暂无历史摘要，在上方输入链接开始总结') + '</div>';
+    return;
+  }
+  listEl.innerHTML = jobs.map(j => {
     const st = normStatus(j.status);
     const dotCls = st === 'completed' ? 'ok' : (st === 'failed' ? 'err' : 'pending');
     const active = j.id === selectedJobId ? ' active' : '';
-    return '<button class="rec-pill' + active + '" title="' + esc(j.title || j.bvid) + '" onclick="selectJob(\'' + esc(j.id) + '\',false)"><span class="dot ' + dotCls + '"></span><span>' + esc(j.title || j.bvid) + '</span></button>';
+    const meta = [j.owner, j.duration || (st === 'pending' ? '处理中' : ''), j.bvid].filter(Boolean).join(' · ');
+    const tagsHtml = getJobTagIds(j).map(tid => {
+      const f = getFolderById(tid, 'summary');
+      return f ? '<span class="mini-tag"><span class="folder-dot" style="width:5px;height:5px;background:' + esc(f.color) + '"></span>' + esc(f.name) + '</span>' : '';
+    }).join('');
+    return '<div class="ws-side-card' + active + '" onclick="selectJob(\'' + esc(j.id) + '\',false)">' +
+      '<div class="ws-side-body">' +
+        '<div class="ws-side-title">' + esc(j.title || j.bvid) + '</div>' +
+        '<div class="ws-side-meta">' + esc(meta) + '</div>' +
+        (tagsHtml ? '<div class="mini-tags">' + tagsHtml + '</div>' : '') +
+      '</div>' +
+      '<div class="ws-side-right">' +
+        '<span class="dot ' + dotCls + '"></span>' +
+        '<button type="button" class="ws-side-del" title="删除记录" onclick="event.stopPropagation();deleteOneJobFromWs(\'' + esc(j.id) + '\')">' + SVG_CLOSE_SM + '</button>' +
+      '</div>' +
+    '</div>';
   }).join('');
+}
+function deleteOneJobFromWs(id) {
+  const jobs = getJobs().filter(j => j.id !== id);
+  if (selectedJobId === id) selectedJobId = jobs[0] ? jobs[0].id : null;
+  saveJobs(jobs);
+  apiFetch('/api/jobs/' + encodeURIComponent(id), { method: 'DELETE' }).catch(() => {});
+  if (selectedJobId) selectJob(selectedJobId, false);
+  else {
+    document.getElementById('summaryEmptyState').classList.remove('hidden');
+    document.getElementById('detailView').classList.add('hidden');
+  }
+  toast('已删除记录');
 }
 
 function selectJob(id, goToSummaryRoute) {
@@ -4630,8 +4789,9 @@ function selectJob(id, goToSummaryRoute) {
     return;
   }
   const job = getJobs().find(j => j.id === id);
-  renderRecentStrip();
+  renderWsSidebar();
   if (!job) return;
+  try { history.replaceState(null, '', '#/summary/' + encodeURIComponent(id)); } catch {}
   document.getElementById('summaryEmptyState').classList.add('hidden');
   document.getElementById('detailView').classList.remove('hidden');
   renderDetail(job);
@@ -4901,12 +5061,37 @@ function renderStepper(job) {
   const bar = document.getElementById('stepperBar');
   bar.classList.remove('hidden');
   const st = normStatus(job.status);
-  const steps = job.gh_steps ? job.gh_steps.slice(0, 4) : [
-    { name: '任务创建', done: true, active: false },
-    { name: '下载音频', done: st === 'completed', active: st === 'pending' },
-    { name: '语音转录', done: st === 'completed', active: false },
-    { name: 'AI 总结', done: st === 'completed', active: false },
-  ];
+  let steps;
+  if (st === 'completed') {
+    steps = [
+      { name: '任务创建', done: true, active: false },
+      { name: '下载音频', done: true, active: false },
+      { name: '语音转录', done: true, active: false },
+      { name: 'AI 总结', done: true, active: false },
+    ];
+  } else if (st === 'failed') {
+    const es = job.error_stage || '';
+    const d1 = es !== 'id_parse' && es !== 'video_info' && es !== 'playurl';
+    const d2 = d1 && es !== 'cdn_download';
+    const d3 = d2 && es !== 'stt';
+    steps = [
+      { name: '任务创建', done: true, active: false },
+      { name: '下载音频', done: d2, active: !d2 },
+      { name: '语音转录', done: d3, active: d2 && !d3 },
+      { name: 'AI 总结', done: false, active: d3 },
+    ];
+  } else if (Array.isArray(job.gh_steps) && job.gh_steps.length >= 4) {
+    steps = job.gh_steps.slice(0, 4).map(s => ({ ...s }));
+    // Never show step 4 (AI 总结) as done while job is still pending!
+    if (steps[3].done) { steps[3].done = false; steps[3].active = true; }
+  } else {
+    steps = [
+      { name: '任务创建', done: true, active: false },
+      { name: '下载音频', done: false, active: true },
+      { name: '语音转录', done: false, active: false },
+      { name: 'AI 总结', done: false, active: false },
+    ];
+  }
   const badgeHtml = st === 'completed' ? '<span class="st-badge ok">已完成</span>' : (st === 'failed' ? '<span class="st-badge err">处理失败</span>' : '<span class="st-badge pending">处理中</span>');
   bar.innerHTML = steps.map((s, i) => '<span class="' + (s.done ? 'st-item done' : (s.active ? 'st-item active' : 'st-item')) + '"><span class="st-dot">' + (s.done ? '&#10003;' : (i + 1)) + '</span><span>' + esc(s.name) + '</span></span><span class="st-line' + (s.done ? ' done' : '') + '"></span>').join('') + badgeHtml;
 }
@@ -6017,6 +6202,11 @@ export default {
       if (path === '/api/monitor-run' && request.method === 'POST') return await handleManualMonitorRun(request, env);
       if (path === '/api/stats' && request.method === 'GET') return await handleStats(request, env);
       if (path === '/api/callback' && request.method === 'POST') return await handleCallback(request, env);
+      if (path === '/api/progress' && request.method === 'POST') return await handleProgress(request, env);
+      if (path === '/favicon.svg' || path === '/favicon.ico') {
+        const svg = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64"><rect width="64" height="64" rx="18" fill="#FB7299"/><g fill="none" stroke="#fff" stroke-width="5.2" stroke-linecap="round" stroke-linejoin="round" transform="translate(8,8)"><rect x="6" y="12" width="36" height="26" rx="6"/><path d="M16 6l6 6M32 6l-6 6"/><path d="M18 24v4M30 24v4"/></g></svg>';
+        return new Response(svg, { status: 200, headers: { ...CORS_HEADERS, 'Content-Type': 'image/svg+xml', 'Cache-Control': 'public, max-age=604800' } });
+      }
       if (path === '/' || path === '/index.html') return htmlResponse(generateFrontendPage());
 
       // Protected personal workspace APIs (require single-device persistent cookie or Bearer token)

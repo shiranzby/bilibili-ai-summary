@@ -128,6 +128,7 @@ jobs:
           BILI_COOKIE: ${{ secrets.BILI_COOKIE }}
           BILI_PROXY_URL: ${{ secrets.BILI_PROXY_URL || 'https://bilisum-bili-proxy.vercel.app' }}
           GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+          WORKER_URL: ${{ secrets.WORKER_URL || 'https://bilibili-ai-summary-api.shy2958779577.workers.dev' }}
         run: |
           cd bilibili_summary
           python process_single.py "$BVID" --job-id "${{ inputs.job_id }}"

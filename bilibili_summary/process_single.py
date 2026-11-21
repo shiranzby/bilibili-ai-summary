@@ -26,6 +26,25 @@ from config import (
 from audio_transcriber import get_text_from_audio, get_last_diagnostics
 from bili_api import get_video_info, format_duration
 from summarizer import summarize_subtitle, get_last_summary_error
+import requests
+
+
+def report_stage(job_id: str, stage: str) -> None:
+    """向 Cloudflare Worker 实时汇报真实处理阶段 (downloading / transcribing / summarizing)"""
+    if not job_id:
+        return
+    worker_url = (
+        os.environ.get("WORKER_URL", "").strip()
+        or "https://bilibili-ai-summary-api.shy2958779577.workers.dev"
+    ).rstrip("/")
+    try:
+        requests.post(
+            f"{worker_url}/api/progress",
+            json={"job_id": job_id, "stage": stage},
+            timeout=3,
+        )
+    except Exception:
+        pass
 
 
 def clean_transcript(text: str) -> str:
@@ -73,6 +92,7 @@ def process(bvid: str, job_id: str = "", summary_template: str = "") -> dict:
         bvid,
         siliconflow_api_key=SILICONFLOW_API_KEY,
         siliconflow_stt_model=SILICONFLOW_STT_MODEL,
+        on_stage=lambda st: report_stage(job_id, st),
     )
     t_stt = round(time.time() - t1, 1)
     result["timings"]["stt"] = t_stt
@@ -98,6 +118,7 @@ def process(bvid: str, job_id: str = "", summary_template: str = "") -> dict:
     print(f"[处理] 转录完成 ({len(result['transcript'])} 字符, {t_stt}s)", file=sys.stderr)
 
     # Step 2: AI 总结（带自定义模板）
+    report_stage(job_id, "summarizing")
     template = summary_template or ""
     t2 = time.time()
     if template:
