@@ -24,7 +24,7 @@ from config import (
     SILICONFLOW_SUMMARY_MODEL,
 )
 from audio_transcriber import get_text_from_audio
-from bili_api import get_video_info
+from bili_api import get_video_info, format_duration
 from summarizer import summarize_subtitle
 
 
@@ -42,6 +42,8 @@ def process(bvid: str, job_id: str = "", summary_template: str = "") -> dict:
     title = (info.get("title") if info else None) or bvid
     owner = (info.get("owner", {}).get("name") if info else None) or ""
     pubdate = (info.get("pubdate") if info else None)
+    duration_sec = (info.get("duration") if info else 0) or 0
+    duration_str = format_duration(duration_sec) if duration_sec else ""
     t_title = round(time.time() - t0, 1)
     print(f"[处理] 标题: {title} ({t_title}s)", file=sys.stderr)
 
@@ -51,6 +53,7 @@ def process(bvid: str, job_id: str = "", summary_template: str = "") -> dict:
         "title": title,
         "owner": owner,
         "pubdate": pubdate,
+        "duration": duration_str,
         "status": "completed",
         "summary": None,
         "transcript": "",

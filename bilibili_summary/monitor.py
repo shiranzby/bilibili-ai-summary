@@ -39,7 +39,7 @@ from bili_api import (
     format_timestamp,
 )
 from summarizer import summarize_subtitle
-from emailer import send_email, build_digest_email
+from emailer import send_email, build_daily_briefing_email
 from audio_transcriber import get_text_from_audio
 
 
@@ -202,6 +202,7 @@ def main():
             result = process_video(v, up_name)
             result["up_name"] = up_name
             result["mid"] = mid
+            result["created"] = v.get("created", 0)
             all_new_videos.append(result)
 
             processed_set.add(v["bvid"])
@@ -218,34 +219,30 @@ def main():
         return
 
     print(f"\n{'─' * 50}")
-    print(f"  📧 准备发送邮件 (共 {len(all_new_videos)} 个视频)")
+    print(f"  📧 准备发送合并日报邮件 (共 {len(all_new_videos)} 个视频)")
 
-    by_up = defaultdict(list)
+    # 按发布时间倒序排列，合并到同一封日报邮件中
+    all_new_videos.sort(key=lambda x: x.get("created", 0), reverse=True)
+    up_names = []
     for v in all_new_videos:
-        by_up[v["up_name"]].append(v)
+        if v["up_name"] not in up_names:
+            up_names.append(v["up_name"])
+    up_preview = "、".join(up_names[:3]) + (f" 等{len(up_names)}位UP" if len(up_names) > 3 else "")
+    date_tag = time.strftime("%m/%d", time.localtime())
 
-    email_sent = False
-    for up_name, videos in by_up.items():
-        videos_data = [
-            (v["title"], v["bvid"], v["summary"], v["url"], v["pub_time"], v["duration"])
-            for v in videos
-        ]
+    subject = f"{EMAIL_SUBJECT_PREFIX} ({date_tag}) · {len(all_new_videos)} 支新视频（{up_preview}）"
+    html_body = build_daily_briefing_email(all_new_videos)
 
-        subject = f"{EMAIL_SUBJECT_PREFIX} {up_name} - {len(videos)} 个新视频"
-        html_body = build_digest_email(up_name, videos_data)
-
-        print(f"\n  [邮件] 发送给 {SMTP_TO}...")
-        ok = send_email(
-            subject=subject,
-            html_body=html_body,
-            smtp_server=SMTP_SERVER,
-            smtp_port=SMTP_PORT,
-            smtp_user=SMTP_USER,
-            smtp_pass=SMTP_PASS,
-            to_addr=SMTP_TO,
-        )
-        if ok:
-            email_sent = True
+    print(f"\n  [邮件] 发送合并日报给 {SMTP_TO}...")
+    email_sent = send_email(
+        subject=subject,
+        html_body=html_body,
+        smtp_server=SMTP_SERVER,
+        smtp_port=SMTP_PORT,
+        smtp_user=SMTP_USER,
+        smtp_pass=SMTP_PASS,
+        to_addr=SMTP_TO,
+    )
 
     # ---------- 保存状态 ----------
     save_state(state, STATE_FILE)
