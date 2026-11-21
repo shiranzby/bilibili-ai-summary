@@ -35,7 +35,7 @@ video_payload = {
     "timings": data.get("timings") or {},
 }
 
-html_body = build_single_video_email(video_payload)
+html_body = build_single_video_email(video_payload, style=os.environ.get("EMAIL_STYLE", "editorial"))
 subject_title = title if len(title) <= 36 else title[:35] + "…"
 subject = f"🎬 B站AI简报 · {subject_title}"
 

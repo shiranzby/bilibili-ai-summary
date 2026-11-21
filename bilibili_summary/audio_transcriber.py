@@ -24,11 +24,10 @@ from bili_api import (
     get_bili_proxy_url,
 )
 
-# 语音识别兜底模型列表 (主模型失败时依次尝试)
-FALLBACK_STT_MODELS = [
-    "FunAudioLLM/SenseVoiceSmall",
-    "Qwen/Qwen3-ASR-1.7B",
-]
+# 仅保留 100% 免费模型，杜绝意外扣费
+FREE_SILICONFLOW_STT_MODEL = "FunAudioLLM/SenseVoiceSmall"
+GROQ_FREE_STT_MODEL = "whisper-large-v3-turbo"
+GROQ_MAX_BYTES = 24 * 1024 * 1024  # Groq 免费层单文件上限 25MB，留 1MB 安全余量
 
 
 def _extract_sorted_audio_urls(dash: dict) -> list:
@@ -301,34 +300,73 @@ def _call_siliconflow_stt_once(audio_path: str, api_key: str, model: str, timeou
         return None, True
 
 
+def transcribe_with_groq(audio_path: str, api_key: str = "", model: str = "") -> Optional[str]:
+    """
+    可选免费方案: Groq Cloud Whisper (免费层: 2000次/天, 8小时音频/天, 单文件<=25MB)
+    只需在 GitHub Secrets 配置 GROQ_API_KEY 即可自动启用，完全免费。
+    """
+    if not api_key:
+        return None
+    size_bytes = os.path.getsize(audio_path)
+    if size_bytes > GROQ_MAX_BYTES:
+        print(f"    [Groq] 文件 {size_bytes/1024/1024:.1f} MB 超过 24MB 限制，跳过转用硅基流动")
+        return None
+
+    model = (model or GROQ_FREE_STT_MODEL).strip()
+    url = "https://api.groq.com/openai/v1/audio/transcriptions"
+    filename = os.path.basename(audio_path)
+    print(f"    [Groq] 尝试免费 {model} ({size_bytes/1024/1024:.1f} MB)...")
+    for attempt in range(1, 3):
+        try:
+            with open(audio_path, "rb") as f:
+                resp = requests.post(
+                    url,
+                    headers={"Authorization": f"Bearer {api_key}"},
+                    files={"file": (filename, f, "audio/mp4")},
+                    data={"model": model, "language": "zh", "response_format": "json"},
+                    timeout=180,
+                )
+            if resp.status_code == 200:
+                text = (resp.json().get("text") or "").strip()
+                if text:
+                    print(f"    [Groq] ✅ 转录成功 ({model}, {len(text)} 字符)")
+                    return text
+            else:
+                print(f"    [Groq] HTTP {resp.status_code}: {resp.text[:160]}")
+                if resp.status_code in (401, 403):
+                    return None
+        except Exception as e:
+            print(f"    [Groq] 异常 (attempt {attempt}): {e}")
+        if attempt < 2:
+            time.sleep(2)
+    return None
+
+
 def transcribe_with_siliconflow(audio_path: str, api_key: str = "", model: str = "") -> Optional[str]:
     if not api_key:
         print("    [SiFlow] 未配置 API_KEY")
         return None
 
-    primary = (model or "FunAudioLLM/SenseVoiceSmall").strip()
-    models_to_try = [primary] + [m for m in FALLBACK_STT_MODELS if m != primary]
-
+    current_model = (model or FREE_SILICONFLOW_STT_MODEL).strip()
     file_size = os.path.getsize(audio_path) / 1024 / 1024
-    print(f"    [SiFlow] 上传 ({file_size:.1f} MB)...")
+    print(f"    [SiFlow] 上传至免费模型 {current_model} ({file_size:.1f} MB)...")
 
-    for m_idx, current_model in enumerate(models_to_try):
-        max_attempts = 3 if m_idx == 0 else 2
-        for attempt in range(1, max_attempts + 1):
-            if attempt > 1 or m_idx > 0:
-                print(f"    [SiFlow] 尝试模型 {current_model} (第 {attempt}/{max_attempts} 次)...")
-            text, retryable = _call_siliconflow_stt_once(audio_path, api_key, current_model)
-            if text:
-                print(f"    [SiFlow] ✅ 转录成功 ({current_model}, {len(text)} 字符)")
-                return text
-            if not retryable:
-                break
-            if attempt < max_attempts:
-                wait_s = 2 ** attempt
-                print(f"    [SiFlow] {wait_s}s 后重试...")
-                time.sleep(wait_s)
+    max_attempts = 3
+    for attempt in range(1, max_attempts + 1):
+        if attempt > 1:
+            print(f"    [SiFlow] 第 {attempt}/{max_attempts} 次尝试 ({current_model})...")
+        text, retryable = _call_siliconflow_stt_once(audio_path, api_key, current_model)
+        if text:
+            print(f"    [SiFlow] ✅ 转录成功 ({current_model}, {len(text)} 字符)")
+            return text
+        if not retryable:
+            break
+        if attempt < max_attempts:
+            wait_s = 2 ** attempt
+            print(f"    [SiFlow] {wait_s}s 后重试...")
+            time.sleep(wait_s)
 
-    print("    [SiFlow] ❌ 全部语音识别尝试均失败")
+    print("    [SiFlow] ❌ 语音识别失败")
     return None
 
 
@@ -385,6 +423,13 @@ def get_text_from_audio(
 
         # .m4s = AAC/M4A 容器，直接改名即可
         os.rename(m4s_path, m4a_path)
+
+        # 如果配置了免费的 GROQ_API_KEY，优先尝试高精度免费的 Groq Whisper (<=24MB)，失败回退免费硅基流动 SenseVoiceSmall
+        groq_key = os.environ.get("GROQ_API_KEY", "").strip()
+        if groq_key:
+            groq_text = transcribe_with_groq(m4a_path, api_key=groq_key)
+            if groq_text:
+                return groq_text
 
         if siliconflow_api_key:
             return transcribe_with_siliconflow(

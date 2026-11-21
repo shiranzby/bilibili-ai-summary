@@ -23,6 +23,7 @@ def callback(result_file: str, job_id: str, worker_url: str):
         "title": data.get("title", ""),
         "owner": data.get("owner", ""),
         "pubdate": data.get("pubdate"),
+        "duration": data.get("duration", ""),
         "timings": data.get("timings", {}),
     })
 
