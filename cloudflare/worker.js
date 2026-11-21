@@ -1108,7 +1108,7 @@ async function handleSubmit(request, env, ctx) {
   let owner = String(body.owner || '').trim();
   let duration = String(body.duration || '').trim();
   let pic = String(body.pic || '').trim().replace(/^http:\/\//, 'https://');
-  if ((!title || !pic) && /^BV/i.test(bvid)) {
+  if (!title && /^BV/i.test(bvid)) {
     try {
       const ctrl = new AbortController();
       const timer = setTimeout(() => ctrl.abort(), 3200);
@@ -2607,7 +2607,7 @@ theme-button{flex-shrink:0}
           <div class="page-toolbar">
             <div class="pt-left">
               <h2>历史归档记录</h2>
-              <p id="histPageSub">检索、打标、重算与批量管理全部视频摘要任务</p>
+              <p id="histPageSub">检索、打标、重新总结与批量管理全部视频摘要任务</p>
             </div>
             <div class="pt-actions">
               <div class="search-box" style="width:230px">
@@ -4163,8 +4163,9 @@ async function submitModalSingle() {
   const inp = document.getElementById('modalVideoUrl');
   const raw = inp.value.trim();
   if (!raw) { toast('请输入 B 站视频链接或 BV 号', true); return; }
-  const res = await submitVideo(raw);
-  if (res) { inp.value = ''; closeModal('submitModal'); }
+  inp.value = '';
+  closeModal('submitModal');
+  await submitVideo(raw);
 }
 async function submitInlineVideo() {
   const inp = document.getElementById('inlineVideoUrl');
@@ -4187,14 +4188,40 @@ async function submitVideo(overrideUrl, meta, stayOnPage) {
   const email_style = document.getElementById('singleEmailStyle').value || prefs.default_email_style || 'editorial';
   const send_email = prefs.send_email_on_single !== false;
 
+  const bvM = raw.match(/BV[a-zA-Z0-9]{8,12}/);
+  const avM = raw.match(/[Aa][Vv](\d+)/);
+  const parsedId = bvM ? bvM[0] : (avM ? ('av' + avM[1]) : raw);
+
+  // Instant 0ms optimistic navigation when jumping to summary workspace
+  let tempId = '';
+  const pickedTags = Array.from(submitSelectedFolders);
+  if (!stayOnPage) {
+    tempId = 'tmp_' + Date.now() + '_' + Math.random().toString(36).slice(2, 6);
+    const optJob = {
+      id: tempId,
+      bvid: parsedId,
+      title: (meta && meta.title) || parsedId,
+      owner: (meta && meta.owner) || '',
+      duration: (meta && meta.duration) || '',
+      pic: (meta && meta.pic) || '',
+      status: 'pending',
+      created_at: new Date().toISOString(),
+      video_url: 'https://www.bilibili.com/video/' + parsedId,
+    };
+    saveJobs([optJob, ...getJobs()], true);
+    selectJob(tempId, true);
+    toast('已提交处理，正在派发云端任务...');
+  }
+
   const btn = document.getElementById('modalSubmitBtn');
-  if (btn) { btn.disabled = true; btn.textContent = '解析中...'; }
+  if (btn) { btn.disabled = true; btn.textContent = '提交中...'; }
 
   try {
     const reqBody = { url: raw, summary_template: tpl, email, email_style, send_email };
     if (meta && meta.title) reqBody.title = meta.title;
     if (meta && meta.owner) reqBody.owner = meta.owner;
     if (meta && meta.duration) reqBody.duration = meta.duration;
+    if (meta && meta.pic) reqBody.pic = meta.pic;
 
     const resp = await apiFetch('/api/submit', {
       method: 'POST',
@@ -4202,7 +4229,16 @@ async function submitVideo(overrideUrl, meta, stayOnPage) {
       body: JSON.stringify(reqBody),
     });
     const data = await resp.json();
-    if (!resp.ok) { toast(data.error || '提交失败', true); return null; }
+    if (!resp.ok) {
+      if (tempId) {
+        const cleaned = getJobs().filter(j => j.id !== tempId);
+        if (selectedJobId === tempId) selectedJobId = cleaned[0] ? cleaned[0].id : null;
+        saveJobs(cleaned, true);
+        if (currentRoute === 'summary') activateRoute('summary', selectedJobId || '', false);
+      }
+      toast(data.error || '提交失败', true);
+      return null;
+    }
     const newJob = {
       id: data.job_id,
       bvid: data.bvid,
@@ -4214,19 +4250,30 @@ async function submitVideo(overrideUrl, meta, stayOnPage) {
       created_at: new Date().toISOString(),
       video_url: 'https://www.bilibili.com/video/' + data.bvid,
     };
-    if (submitSelectedFolders.size && newJob.bvid) {
-      libraryState.job_tags[newJob.bvid] = [...new Set([...(libraryState.job_tags[newJob.bvid] || []), ...Array.from(submitSelectedFolders)])];
+    if (pickedTags.length && newJob.bvid) {
+      libraryState.job_tags[newJob.bvid] = [...new Set([...(libraryState.job_tags[newJob.bvid] || []), ...pickedTags])];
       saveLibraryLocalAndCloud();
     }
-    const jobs = [newJob, ...getJobs().filter(j => j.id !== newJob.id)];
+    const jobs = [newJob, ...getJobs().filter(j => j.id !== newJob.id && j.id !== tempId)];
+    if (tempId && selectedJobId === tempId) {
+      selectedJobId = newJob.id;
+      try { history.replaceState(null, '', '#/summary/' + encodeURIComponent(newJob.id)); } catch {}
+    }
     saveJobs(jobs);
     if (!stayOnPage) {
       toast(send_email ? '已加入队列（完成后同步发邮件）' : '已加入队列（已关闭单条邮件通知）');
-      selectJob(newJob.id, true);
+      if (currentRoute === 'summary' && selectedJobId === newJob.id) renderDetail(newJob);
+      else selectJob(newJob.id, true);
     }
     startPolling(newJob.id);
     return newJob;
   } catch (e) {
+    if (tempId) {
+      const cleaned = getJobs().filter(j => j.id !== tempId);
+      if (selectedJobId === tempId) selectedJobId = cleaned[0] ? cleaned[0].id : null;
+      saveJobs(cleaned, true);
+      if (currentRoute === 'summary') activateRoute('summary', selectedJobId || '', false);
+    }
     toast('网络错误: ' + e.message, true);
     return null;
   } finally {
@@ -5193,7 +5240,7 @@ function buildVideoCardHtml(v, idx, opts) {
           (relTime ? '<span class="v-time-pill">' + esc(relTime) + '</span>' : '<span></span>') +
           '<div class="v-act-row">' +
             sumAction +
-            '<button class="v-act-btn primary" onclick="submitPoolVideo(\'' + poolName + '\',' + idx + ')">' + (hasSum ? '重算' : '一键总结') + '</button>' +
+            '<button class="v-act-btn primary" onclick="submitPoolVideo(\'' + poolName + '\',' + idx + ')">' + (hasSum ? '重新总结' : '一键总结') + '</button>' +
           '</div>' +
         '</div>' +
       '</div>' +
@@ -5213,7 +5260,7 @@ function togglePoolVideoWl(poolName, idx) { const v = getPoolByName(poolName)[id
 function togglePoolVideoFav(poolName, idx) { const v = getPoolByName(poolName)[idx]; if (v) toggleFavoriteVideo(v); }
 function submitPoolVideo(poolName, idx) {
   const v = getPoolByName(poolName)[idx];
-  if (v) submitVideo(v.bvid, { title: v.title || '', owner: v.author || '', duration: v.duration || '' });
+  if (v) submitVideo(v.bvid, { title: v.title || '', owner: v.author || '', duration: v.duration || '', pic: v.pic || '' });
 }
 function openFeedSummaryModal(poolName, idx) {
   const v = getPoolByName(poolName)[idx];

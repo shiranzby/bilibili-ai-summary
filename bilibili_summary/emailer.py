@@ -453,10 +453,10 @@ def _render_video_card(index: int, video: Dict, theme: Dict) -> str:
         else ""
     )
 
-    title_size = "16.5px" if is_compact else "18.5px"
+    title_size = "17px" if is_compact else "19px"
     card_mb = "14px" if is_compact else "20px"
     idx_str = f"{index:02d}"
-    cover_w = 200 if is_compact else 264
+    cover_w = 220 if is_compact else 300
 
     meta_header = f"""
       <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="margin-bottom:8px;">
@@ -581,10 +581,10 @@ def build_daily_briefing_email(videos: List[Dict], date_str: str = "", style: st
   {RESPONSIVE_EMAIL_STYLE}
 </head>
 <body style="margin:0;padding:0;background-color:{th['page_bg']};font-family:-apple-system,BlinkMacSystemFont,'PingFang SC','Microsoft YaHei','Segoe UI',sans-serif;color:#111827;-webkit-font-smoothing:antialiased;">
-  <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" class="outer-pad" style="background-color:{th['page_bg']};padding:18px 20px;">
+  <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" class="outer-pad" style="background-color:{th['page_bg']};padding:14px 16px;">
     <tr>
       <td align="center">
-        <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="width:100%;max-width:1080px;">
+        <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="width:100%;max-width:1480px;">
           <tr>
             <td class="header-pad" style="background:{th['header_bg']};border-top:{th['header_top_border']};border-left:1px solid #e5e7eb;border-right:1px solid #e5e7eb;{header_border_bottom}border-radius:14px 14px 0 0;padding:24px 30px 22px 30px;">
               <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0">
@@ -649,10 +649,10 @@ def build_single_video_email(video: Dict, style: str = "editorial") -> str:
   {RESPONSIVE_EMAIL_STYLE}
 </head>
 <body style="margin:0;padding:0;background-color:{th['page_bg']};font-family:-apple-system,BlinkMacSystemFont,'PingFang SC','Microsoft YaHei','Segoe UI',sans-serif;color:#111827;">
-  <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" class="outer-pad" style="background-color:{th['page_bg']};padding:18px 20px;">
+  <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" class="outer-pad" style="background-color:{th['page_bg']};padding:14px 16px;">
     <tr>
       <td align="center">
-        <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="width:100%;max-width:1080px;">
+        <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="width:100%;max-width:1480px;">
           <tr>
             <td class="header-pad" style="background:{th['header_bg']};border-top:{th['header_top_border']};border-left:1px solid #e5e7eb;border-right:1px solid #e5e7eb;{header_border_bottom}border-radius:14px 14px 0 0;padding:22px 28px;">
               <div style="font-size:11.5px;font-weight:600;letter-spacing:1.3px;color:{th['header_meta_color']};text-transform:uppercase;margin-bottom:6px;">
