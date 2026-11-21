@@ -612,19 +612,140 @@ async function handleGetMonitorArchive(request, env) {
   return jsonResponse({ ok: true, videos });
 }
 
+const LIBRARY_KEY = 'config/library.json';
+const DEFAULT_LIBRARY = {
+  folders: [
+    { id: 'tech', name: '科技', color: '#2563EB' },
+    { id: 'history', name: '历史', color: '#D97706' },
+    { id: 'game', name: '游戏', color: '#7C3AED' },
+    { id: 'software', name: '软件', color: '#059669' },
+  ],
+  job_tags: {},
+  up_tags: {},
+  watch_later: [],
+  favorites: [],
+};
+
+function sanitizeLibrary(raw) {
+  const src = raw && typeof raw === 'object' ? raw : {};
+  const folders = Array.isArray(src.folders) && src.folders.length
+    ? src.folders.slice(0, 40).map(f => ({
+        id: String(f.id || '').trim().slice(0, 32) || ('f_' + Date.now()),
+        name: String(f.name || '').trim().slice(0, 20) || '未命名',
+        color: /^#[0-9a-fA-F]{3,8}$/.test(String(f.color || '')) ? String(f.color) : '#2563EB',
+      }))
+    : DEFAULT_LIBRARY.folders.map(f => ({ ...f }));
+  const validIds = new Set(folders.map(f => f.id));
+  const cleanTagMap = (m) => {
+    const out = {};
+    if (m && typeof m === 'object') {
+      Object.keys(m).slice(0, 500).forEach(k => {
+        const arr = Array.isArray(m[k]) ? [...new Set(m[k].map(String).filter(id => validIds.has(id)))] : [];
+        if (arr.length) out[String(k)] = arr;
+      });
+    }
+    return out;
+  };
+  const cleanVidList = (arr) => {
+    if (!Array.isArray(arr)) return [];
+    const seen = new Set();
+    const out = [];
+    for (const v of arr) {
+      if (!v || !v.bvid) continue;
+      const bvid = String(v.bvid).trim();
+      if (!bvid || seen.has(bvid)) continue;
+      seen.add(bvid);
+      out.push({
+        bvid,
+        job_id: String(v.job_id || ''),
+        mid: Number(v.mid) || 0,
+        title: String(v.title || bvid).slice(0, 180),
+        author: String(v.author || '').slice(0, 60),
+        face: String(v.face || '').slice(0, 300),
+        pic: String(v.pic || '').slice(0, 300),
+        duration: String(v.duration || '').slice(0, 20),
+        play: Number(v.play) || 0,
+        danmaku: Number(v.danmaku) || 0,
+        created: Number(v.created) || 0,
+        url: String(v.url || `https://www.bilibili.com/video/${bvid}`).slice(0, 300),
+        added_at: String(v.added_at || nowISO()),
+      });
+      if (out.length >= 300) break;
+    }
+    return out;
+  };
+  return {
+    folders,
+    job_tags: cleanTagMap(src.job_tags),
+    up_tags: cleanTagMap(src.up_tags),
+    watch_later: cleanVidList(src.watch_later),
+    favorites: cleanVidList(src.favorites),
+    updated_at: src.updated_at || nowISO(),
+  };
+}
+
+async function readLibrary(env) {
+  if (!env.BILIBILI_BUCKET) return sanitizeLibrary(DEFAULT_LIBRARY);
+  try {
+    const obj = await env.BILIBILI_BUCKET.get(LIBRARY_KEY);
+    if (!obj) return sanitizeLibrary(DEFAULT_LIBRARY);
+    return sanitizeLibrary(await obj.json());
+  } catch {
+    return sanitizeLibrary(DEFAULT_LIBRARY);
+  }
+}
+
+async function handleGetLibrary(request, env) {
+  const lib = await readLibrary(env);
+  return jsonResponse({ ok: true, library: lib });
+}
+
+async function handleSaveLibrary(request, env) {
+  const sess = await verifySessionToken(request, env);
+  if (!sess) return errorResponse('需要登录管理员账号以同步云端标签库', 401);
+  if (!env.BILIBILI_BUCKET) return errorResponse('R2 未配置', 503);
+  const body = await request.json().catch(() => ({}));
+  const clean = sanitizeLibrary(body.library || body);
+  clean.updated_at = nowISO();
+  await env.BILIBILI_BUCKET.put(LIBRARY_KEY, JSON.stringify(clean), {
+    httpMetadata: { contentType: 'application/json' },
+  });
+  return jsonResponse({ ok: true, library: clean });
+}
+
+async function fetchBiliUpPage(proxyBase, mid, pn, ps) {
+  const url = `${proxyBase}/api/bili-up?mid=${mid}&pn=${pn}&ps=${ps}`;
+  const delays = [400, 900];
+  for (let attempt = 0; attempt < 3; attempt++) {
+    try {
+      const r = await fetch(url, { signal: AbortSignal.timeout(12000) });
+      if (r.ok) {
+        const d = await r.json();
+        if (d && (d.code === 0 || Array.isArray(d?.data?.list?.vlist))) return d;
+      }
+    } catch {}
+    if (attempt < delays.length) await new Promise(res => setTimeout(res, delays[attempt]));
+  }
+  return null;
+}
+
 async function handleGetUpVideos(request, env, ctx) {
   const sess = await verifySessionToken(request, env);
   if (!sess) return errorResponse('需要登录管理员账号', 401);
 
   const reqUrl = new URL(request.url);
   const midParam = (reqUrl.searchParams.get('mid') || '').trim();
-  const ps = Math.min(parseInt(reqUrl.searchParams.get('ps') || '16', 10) || 16, 30);
+  const midsParam = (reqUrl.searchParams.get('mids') || '').trim();
+  const pn = Math.max(1, Math.min(parseInt(reqUrl.searchParams.get('pn') || '1', 10) || 1, 50));
+  const ps = Math.max(4, Math.min(parseInt(reqUrl.searchParams.get('ps') || '20', 10) || 20, 30));
   const forceRefresh = reqUrl.searchParams.get('refresh') === '1';
 
-  // Cloudflare Edge Cache (5 min TTL) for fast reloads unless ?refresh=1
+  // Cloudflare Edge Cache (5 min TTL) per (mid, mids, pn, ps) unless ?refresh=1
   const cache = typeof caches !== 'undefined' ? caches.default : null;
-  const cacheKeyUrl = new URL(reqUrl.origin + '/__cache/up-videos');
+  const cacheKeyUrl = new URL(reqUrl.origin + '/__cache/up-videos-v2');
   cacheKeyUrl.searchParams.set('mid', midParam);
+  if (midsParam) cacheKeyUrl.searchParams.set('mids', midsParam);
+  cacheKeyUrl.searchParams.set('pn', String(pn));
   cacheKeyUrl.searchParams.set('ps', String(ps));
   const cacheReq = new Request(cacheKeyUrl.toString(), { method: 'GET' });
   if (cache && !forceRefresh) {
@@ -683,35 +804,79 @@ async function handleGetUpVideos(request, env, ctx) {
     return resp;
   };
 
-  if (midParam === 'all') {
-    const ups = (cfg.up_list || []).slice(0, 12);
-    const perUp = Math.max(4, Math.min(8, Math.ceil(24 / Math.max(1, ups.length))));
-    const results = await Promise.all(
-      ups.map(async u => {
-        try {
-          const r = await fetch(`${proxyBase}/api/bili-up?mid=${u.mid}&pn=1&ps=${perUp}`);
-          const d = await r.json();
-          return mapVlist(d?.data?.list?.vlist || [], Number(u.mid));
-        } catch {
-          return [];
-        }
-      })
-    );
-    const merged = results.flat().sort((a, b) => (b.created || 0) - (a.created || 0)).slice(0, 40);
-    return respondCached({ ok: true, mid: 'all', videos: merged, cached_at: nowISO() });
+  if (midParam === 'all' || midParam === 'group') {
+    let ups = (cfg.up_list || []).slice(0, 15);
+    if (midsParam) {
+      const allow = new Set(midsParam.split(',').map(s => Number(s.trim())).filter(n => n > 0));
+      ups = ups.filter(u => allow.has(Number(u.mid)));
+    }
+    if (!ups.length) {
+      return respondCached({ ok: true, mid: midParam, pn, ps, total: 0, has_more: false, videos: [], cached_at: nowISO() });
+    }
+    const perUp = ups.length <= 2 ? 12 : (ups.length <= 5 ? 8 : 6);
+    const allVids = [];
+    let anyMore = false;
+    let totalCount = 0;
+
+    // Staggered batches of 3 to avoid Bilibili burst rate-limits
+    for (let i = 0; i < ups.length; i += 3) {
+      const batch = ups.slice(i, i + 3);
+      const batchRes = await Promise.all(
+        batch.map(async u => {
+          const d = await fetchBiliUpPage(proxyBase, Number(u.mid), pn, perUp);
+          const vlist = d?.data?.list?.vlist || [];
+          const cnt = Number(d?.data?.page?.count || 0);
+          return { mid: Number(u.mid), items: mapVlist(vlist, Number(u.mid)), cnt };
+        })
+      );
+      batchRes.forEach(r => {
+        totalCount += r.cnt;
+        if (r.items.length > 0 && (r.cnt > pn * perUp || (r.cnt === 0 && r.items.length >= perUp))) anyMore = true;
+        allVids.push(...r.items);
+      });
+      if (i + 3 < ups.length) await new Promise(res => setTimeout(res, 90));
+    }
+
+    const seen = new Set();
+    const merged = allVids
+      .filter(v => { if (!v.bvid || seen.has(v.bvid)) return false; seen.add(v.bvid); return true; })
+      .sort((a, b) => (b.created || 0) - (a.created || 0));
+
+    return respondCached({
+      ok: true,
+      mid: midParam,
+      pn,
+      ps: perUp,
+      total: totalCount,
+      has_more: anyMore,
+      videos: merged,
+      cached_at: nowISO(),
+    });
   }
 
   if (!/^\d+$/.test(midParam)) return errorResponse('无效的 UP 主 UID', 400);
   const midNum = Number(midParam);
 
   try {
-    const r = await fetch(`${proxyBase}/api/bili-up?mid=${midNum}&pn=1&ps=${ps}`);
-    const d = await r.json();
+    const d = await fetchBiliUpPage(proxyBase, midNum, pn, ps);
+    if (!d) throw new Error('代理暂不可用，请稍后重试');
     const items = mapVlist(d?.data?.list?.vlist || [], midNum);
-    return respondCached({ ok: true, mid: midNum, videos: items, code: d.code, cached_at: nowISO() });
+    const total = Number(d?.data?.page?.count || 0);
+    const hasMore = items.length > 0 && (total > 0 ? (pn * ps) < total : items.length >= ps);
+    return respondCached({
+      ok: true,
+      mid: midNum,
+      pn,
+      ps,
+      total,
+      has_more: hasMore,
+      videos: items,
+      code: d.code,
+      cached_at: nowISO(),
+    });
   } catch (e) {
-    const fallback = archive.filter(v => Number(v.mid) === midNum);
-    return jsonResponse({ ok: true, mid: midNum, videos: fallback, warning: '实时列表拉取失败，仅显示历史归档: ' + e.message });
+    const fallback = pn === 1 ? archive.filter(v => Number(v.mid) === midNum) : [];
+    return jsonResponse({ ok: true, mid: midNum, pn, ps, total: fallback.length, has_more: false, videos: fallback, warning: '实时列表拉取失败: ' + e.message });
   }
 }
 
@@ -1368,9 +1533,9 @@ textarea.ctrl{height:auto;min-height:84px;padding:10px 12px;resize:vertical;line
 .icon-btn{width:34px;height:34px;display:inline-flex;align-items:center;justify-content:center;border:1px solid var(--border);border-radius:9px;background:var(--surface);color:var(--soft);flex-shrink:0;transition:border-color .15s,color .15s,background .15s}
 .icon-btn:hover{border-color:var(--border-strong);color:var(--text);background:var(--surface-hover)}
 
-.content-scroll{flex:1;overflow-y:auto;padding:22px 28px 48px}
-.content-inner{max-width:980px;margin:0 auto;transition:max-width .2s}
-.content-inner.wide-feed{max-width:1420px}
+.content-scroll{flex:1;overflow-y:auto;scrollbar-gutter:stable;padding:22px 28px 48px}
+.content-inner{max-width:980px;margin:0 auto}
+.content-inner.wide-feed{max-width:100%}
 
 /* Dashboard Overview (Empty / Home State) */
 .dash-hero{background:var(--surface);border:1px solid var(--border);border-radius:16px;padding:26px 28px;margin-bottom:16px;box-shadow:var(--shadow-sm)}
@@ -1412,11 +1577,74 @@ textarea.ctrl{height:auto;min-height:84px;padding:10px 12px;resize:vertical;line
 .meta-pill{display:inline-flex;align-items:center;gap:4px;padding:3px 10px;border-radius:999px;background:var(--surface-3);color:var(--soft);font-size:12px;font-weight:500;white-space:nowrap}
 .meta-pill.saved{background:var(--ok-soft);color:var(--ok-text);font-weight:600}
 .vh-actions{display:flex;align-items:center;gap:8px;flex-shrink:0}
-.star-btn{height:34px;padding:0 11px;border:1px solid var(--border);border-radius:9px;background:var(--surface);color:var(--soft);font-size:12.5px;font-weight:600;display:inline-flex;align-items:center;gap:5px;transition:all .15s}
+.star-btn{height:34px;padding:0 11px;border:1px solid var(--border);border-radius:9px;background:var(--surface);color:var(--soft);font-size:12.5px;font-weight:600;display:inline-flex;align-items:center;gap:5px;transition:all .15s;white-space:nowrap}
 .star-btn:hover{border-color:var(--border-strong);color:var(--text)}
 .star-btn.starred{border-color:#FCD34D;background:var(--warn-soft);color:#B45309}
+.wl-btn{height:34px;padding:0 11px;border:1px solid var(--border);border-radius:9px;background:var(--surface);color:var(--soft);font-size:12.5px;font-weight:600;display:inline-flex;align-items:center;gap:5px;transition:all .15s;white-space:nowrap}
+.wl-btn:hover{border-color:var(--border-strong);color:var(--text)}
+.wl-btn.active{border-color:#93C5FD;background:rgba(37,99,235,.10);color:#2563EB}
+[data-theme="dark"] .wl-btn.active{border-color:rgba(96,165,250,.45);background:rgba(59,130,246,.16);color:#93C5FD}
 .watch-btn{display:inline-flex;align-items:center;gap:5px;height:34px;padding:0 13px;border:1px solid var(--border);border-radius:9px;background:var(--surface);color:var(--text);font-size:12.5px;font-weight:600;text-decoration:none;white-space:nowrap;flex-shrink:0;transition:border-color .15s,color .15s}
 .watch-btn:hover{border-color:var(--brand);color:var(--brand)}
+
+/* Tag Folders & Watch Later System */
+.folder-bar{display:flex;flex-wrap:wrap;gap:5px;margin-bottom:10px;align-items:center}
+.folder-chip{display:inline-flex;align-items:center;gap:5px;height:25px;padding:0 9px;border-radius:999px;border:1px solid var(--border);background:var(--surface);color:var(--soft);font-size:11.5px;font-weight:600;white-space:nowrap;transition:border-color .15s,background .15s,color .15s}
+.folder-chip:hover{border-color:var(--border-strong);color:var(--text);background:var(--surface-hover)}
+.folder-chip.active{border-color:var(--brand-border);background:var(--brand-soft);color:var(--brand-dark)}
+.folder-dot{width:7px;height:7px;border-radius:50%;flex-shrink:0}
+.folder-cnt{font-size:10.5px;opacity:.75;font-weight:500}
+.folder-add-btn{display:inline-flex;align-items:center;gap:3px;height:25px;padding:0 8px;border-radius:999px;border:1px dashed var(--border-strong);background:transparent;color:var(--muted);font-size:11.5px;font-weight:600;white-space:nowrap;transition:all .15s}
+.folder-add-btn:hover{border-color:var(--brand);color:var(--brand-dark);background:var(--brand-soft)}
+
+.mini-tags{display:flex;flex-wrap:wrap;gap:4px;margin-top:5px}
+.mini-tag{display:inline-flex;align-items:center;gap:4px;padding:1px 6px;border-radius:5px;font-size:10.5px;font-weight:600;background:var(--surface-3);color:var(--soft);line-height:1.45}
+.mini-tag.wl{background:rgba(37,99,235,.10);color:#2563EB}
+[data-theme="dark"] .mini-tag.wl{background:rgba(59,130,246,.18);color:#93C5FD}
+
+.vh-tag-row{display:flex;flex-wrap:wrap;align-items:center;gap:6px;margin-top:10px;position:relative}
+.tag-pill{display:inline-flex;align-items:center;gap:5px;height:24px;padding:0 8px;border-radius:999px;border:1px solid var(--border);background:var(--bg);color:var(--text);font-size:11.5px;font-weight:600}
+.tag-pill button{border:none;background:none;color:var(--muted);font-size:13px;line-height:1;padding:0 1px;cursor:pointer}
+.tag-pill button:hover{color:var(--err)}
+.tag-add-btn{display:inline-flex;align-items:center;gap:4px;height:24px;padding:0 9px;border-radius:999px;border:1px dashed var(--border-strong);background:transparent;color:var(--soft);font-size:11.5px;font-weight:600;transition:all .15s}
+.tag-add-btn:hover{border-color:var(--brand);color:var(--brand-dark);background:var(--brand-soft)}
+
+.tag-popover{position:fixed;z-index:260;min-width:200px;max-width:250px;background:var(--surface);border:1px solid var(--border-strong);border-radius:12px;box-shadow:var(--shadow-lg);padding:6px;animation:modalPop .14s cubic-bezier(.22,1,.36,1)}
+.tag-pop-head{font-size:11px;font-weight:700;color:var(--muted);padding:5px 8px 6px;display:flex;align-items:center;justify-content:space-between}
+.tag-pop-item{width:100%;display:flex;align-items:center;justify-content:space-between;gap:8px;padding:7px 9px;border:none;background:transparent;border-radius:8px;font-size:12.5px;font-weight:500;color:var(--text);text-align:left;cursor:pointer}
+.tag-pop-item:hover{background:var(--surface-hover)}
+.tag-pop-item.selected{background:var(--brand-soft);color:var(--brand-dark);font-weight:600}
+.tag-pop-left{display:inline-flex;align-items:center;gap:7px;min-width:0}
+.tag-pop-sep{height:1px;background:var(--border);margin:5px 2px}
+
+.up-side-acts{display:flex;align-items:center;gap:2px;flex-shrink:0}
+.up-tag-btn{border:none;background:none;color:var(--muted);width:22px;height:22px;border-radius:6px;display:flex;align-items:center;justify-content:center;opacity:0;transition:opacity .15s,color .15s,background .15s}
+.up-side-card:hover .up-tag-btn,.up-side-card.active .up-tag-btn{opacity:1}
+.up-tag-btn:hover{color:var(--brand-dark);background:var(--brand-soft)}
+
+.v-thumb-wrap{position:relative;width:100%}
+.v-quick-acts{position:absolute;top:8px;right:8px;display:flex;gap:5px;z-index:3;opacity:0;transition:opacity .16s ease}
+.v-card:hover .v-quick-acts,.v-quick-acts.has-active{opacity:1}
+.v-qbtn{width:28px;height:28px;border-radius:8px;border:1px solid rgba(255,255,255,.22);background:rgba(15,17,22,.72);backdrop-filter:blur(6px);color:#fff;display:inline-flex;align-items:center;justify-content:center;transition:transform .12s,background .15s,border-color .15s}
+.v-qbtn:hover{background:rgba(15,17,22,.92);transform:scale(1.06)}
+.v-qbtn.wl-on{background:#2563EB;border-color:#60A5FA;color:#fff}
+.v-qbtn.fav-on{background:#D97706;border-color:#FCD34D;color:#fff}
+
+.feed-footer{margin-top:26px;display:flex;flex-direction:column;align-items:center;gap:10px;padding:12px 0 8px}
+.feed-load-btn{height:38px;padding:0 22px;border-radius:10px;border:1px solid var(--border);background:var(--surface);color:var(--text);font-size:13px;font-weight:600;display:inline-flex;align-items:center;gap:8px;box-shadow:var(--shadow-sm);transition:all .15s}
+.feed-load-btn:hover{border-color:var(--brand);color:var(--brand-dark);background:var(--brand-soft)}
+.feed-load-btn:disabled{opacity:.65;cursor:default}
+.feed-meta-note{font-size:12px;color:var(--muted)}
+
+.color-swatches{display:flex;gap:7px;flex-wrap:wrap;margin-top:6px}
+.color-sw{width:24px;height:24px;border-radius:50%;border:2px solid transparent;cursor:pointer;transition:transform .12s,box-shadow .12s}
+.color-sw:hover{transform:scale(1.1)}
+.color-sw.active{box-shadow:0 0 0 2px var(--surface),0 0 0 4px var(--text)}
+.folder-mgr-list{display:flex;flex-direction:column;gap:8px;margin-top:12px}
+.folder-mgr-row{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:10px 12px;border:1px solid var(--border);border-radius:10px;background:var(--bg)}
+.folder-mgr-left{display:flex;align-items:center;gap:9px;min-width:0}
+.folder-mgr-name{font-size:13.5px;font-weight:700;color:var(--text)}
+.folder-mgr-stat{font-size:11.5px;color:var(--muted)}
 
 /* View Tabs + Independent Action Buttons */
 .view-bar{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:14px;flex-wrap:wrap}
@@ -1707,9 +1935,11 @@ textarea.ctrl{height:auto;min-height:84px;padding:10px 12px;resize:vertical;line
           <span class="seg-slider"></span>
           <button class="h-ftab active" data-hf="all" onclick="setHistoryFilter('all')">全部</button>
           <button class="h-ftab" data-hf="starred" onclick="setHistoryFilter('starred')">收藏</button>
-          <button class="h-ftab" data-hf="completed" onclick="setHistoryFilter('completed')">完成</button>
+          <button class="h-ftab" data-hf="watchlater" onclick="setHistoryFilter('watchlater')">稍后再看</button>
           <button class="h-ftab" data-hf="failed" onclick="setHistoryFilter('failed')">失败</button>
         </div>
+
+        <div class="folder-bar" id="wsFolderBar"></div>
 
         <div class="history-head">
           <h3>历史记录 <span class="count-pill" id="countPill">0</span></h3>
@@ -1742,6 +1972,8 @@ textarea.ctrl{height:auto;min-height:84px;padding:10px 12px;resize:vertical;line
         <div class="sb-toast" id="sideUpToast"></div>
       </div>
 
+      <div class="folder-bar" id="monFolderBar"></div>
+
       <div class="history-head">
         <h3>已监控 UP 主 <span class="count-pill" id="upSideCount">0</span></h3>
         <button class="text-btn" onclick="openMonitorModal()">完整配置</button>
@@ -1773,7 +2005,7 @@ textarea.ctrl{height:auto;min-height:84px;padding:10px 12px;resize:vertical;line
       </div>
     </header>
 
-    <div class="content-scroll">
+    <div class="content-scroll" id="contentScroll">
       <div class="content-inner" id="contentInner">
         <!-- PAGE 1: WORKSPACE -->
         <div id="pageWorkspace">
@@ -1796,8 +2028,13 @@ textarea.ctrl{height:auto;min-height:84px;padding:10px 12px;resize:vertical;line
               <div class="vh-left">
                 <h1 class="vh-title"><a id="dTitleLink" href="#" target="_blank" rel="noopener">—</a></h1>
                 <div class="vh-pills" id="dPills"></div>
+                <div class="vh-tag-row" id="dTagRow"></div>
               </div>
               <div class="vh-actions">
+                <button class="wl-btn" id="wlBtn" onclick="toggleWatchLaterCurrent()">
+                  <svg class="ic" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><polyline points="12 7 12 12 15 15"/></svg>
+                  <span id="wlBtnText">稍后再看</span>
+                </button>
                 <button class="star-btn" id="starBtn" onclick="toggleStarCurrent()">
                   <svg class="ic" viewBox="0 0 24 24"><polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2"/></svg>
                   <span id="starBtnText">收藏</span>
@@ -1912,6 +2149,8 @@ textarea.ctrl{height:auto;min-height:84px;padding:10px 12px;resize:vertical;line
           </div>
           <div class="sb-toast" id="feedToast" style="margin-bottom:14px"></div>
           <div class="video-grid" id="upFeedGrid"></div>
+          <div class="feed-footer" id="feedFooter"></div>
+          <div id="feedSentinel" style="height:2px"></div>
         </div>
       </div>
     </div>
@@ -1920,6 +2159,40 @@ textarea.ctrl{height:auto;min-height:84px;padding:10px 12px;resize:vertical;line
 
 <!-- GLOBAL FLOATING TOAST -->
 <div class="global-toast" id="globalToast"></div>
+
+<!-- TAG PICKER POPOVER -->
+<div class="tag-popover hidden" id="tagPopover"></div>
+
+<!-- TAG FOLDER MANAGER MODAL -->
+<div class="modal-backdrop hidden" id="tagManagerModal" onclick="if(event.target===this)closeModal('tagManagerModal')">
+  <div class="modal">
+    <div class="modal-head">
+      <div>
+        <h2>标签文件夹管理</h2>
+        <div style="font-size:12px;color:var(--muted);margin-top:2px">同时适用于单条摘要分类与 UP 主分组，登录后自动同步至云端</div>
+      </div>
+      <button class="icon-btn" onclick="closeModal('tagManagerModal')" aria-label="关闭">
+        <svg class="ic" viewBox="0 0 24 24"><path d="M18 6L6 18M6 6l12 12"/></svg>
+      </button>
+    </div>
+    <div class="modal-body">
+      <div class="field">
+        <label>新建标签文件夹</label>
+        <div style="display:flex;gap:8px">
+          <input class="ctrl" id="newFolderNameInput" type="text" maxlength="16" placeholder="例如：科技、历史、游戏、AI工具..." onkeydown="if(event.key==='Enter')createNewFolder()">
+          <button class="btn btn-primary" type="button" onclick="createNewFolder()">创建</button>
+        </div>
+        <div class="color-swatches" id="folderColorSwatches"></div>
+      </div>
+      <div style="font-size:12px;font-weight:700;color:var(--soft);margin-top:16px">已有标签文件夹</div>
+      <div class="folder-mgr-list" id="folderMgrList"></div>
+    </div>
+    <div class="modal-foot">
+      <span style="font-size:12px;color:var(--muted)" id="librarySyncHint">本地已保存</span>
+      <button class="btn btn-primary" onclick="closeModal('tagManagerModal')">完成</button>
+    </div>
+  </div>
+</div>
 
 <!-- BATCH SUBMIT MODAL -->
 <div class="modal-backdrop hidden" id="batchModal" onclick="if(event.target===this)closeModal('batchModal')">
@@ -2259,10 +2532,21 @@ const LS_AUTH = 'bilisum_auth_token';
 const LS_USER = 'bilisum_auth_user';
 const LS_PREFS = 'bilisum_prefs_v1';
 const LS_CHATS = 'bilisum_chats_v1';
+const LS_LIBRARY = 'bilisum_library_v1';
+
+const FOLDER_COLORS = ['#2563EB', '#D97706', '#7C3AED', '#059669', '#E11D48', '#0891B2', '#4F46E5', '#64748B'];
+const DEFAULT_FOLDERS = [
+  { id: 'tech', name: '科技', color: '#2563EB' },
+  { id: 'history', name: '历史', color: '#D97706' },
+  { id: 'game', name: '游戏', color: '#7C3AED' },
+  { id: 'software', name: '软件', color: '#059669' },
+];
 
 let currentPage = 'workspace';
 let selectedJobId = null;
 let selectedUpMid = 'all';
+let selectedWsFolder = '';
+let selectedMonFolder = '';
 let currentFeedVideos = [];
 let modalSummaryRaw = '';
 let viewMode = 'summary';
@@ -2274,6 +2558,133 @@ let selectedIds = [];
 let pollTimers = {};
 let authUser = '';
 let toastTimer = null;
+let selectedNewFolderColor = FOLDER_COLORS[0];
+let librarySyncTimer = null;
+let pageScrollPos = { workspace: 0, monitor: 0 };
+let monitorPageBooted = false;
+let lastRenderedFeedKey = '';
+let lastRenderedFeedSig = '';
+
+let libraryState = loadLocalLibrary();
+
+function loadLocalLibrary() {
+  try {
+    const raw = JSON.parse(localStorage.getItem(LS_LIBRARY) || 'null');
+    if (raw && typeof raw === 'object') {
+      return {
+        folders: Array.isArray(raw.folders) && raw.folders.length ? raw.folders : DEFAULT_FOLDERS.map(f => ({ ...f })),
+        job_tags: raw.job_tags && typeof raw.job_tags === 'object' ? raw.job_tags : {},
+        up_tags: raw.up_tags && typeof raw.up_tags === 'object' ? raw.up_tags : {},
+        watch_later: Array.isArray(raw.watch_later) ? raw.watch_later : [],
+        favorites: Array.isArray(raw.favorites) ? raw.favorites : [],
+      };
+    }
+  } catch {}
+  return {
+    folders: DEFAULT_FOLDERS.map(f => ({ ...f })),
+    job_tags: {},
+    up_tags: {},
+    watch_later: [],
+    favorites: [],
+  };
+}
+
+function saveLibraryLocalAndCloud() {
+  try { localStorage.setItem(LS_LIBRARY, JSON.stringify(libraryState)); } catch {}
+  const hint = document.getElementById('librarySyncHint');
+  if (!authUser) {
+    if (hint) hint.textContent = '已保存在本地浏览器（登录管理员后可云端同步）';
+    return;
+  }
+  if (hint) hint.textContent = '正在同步至云端 R2...';
+  clearTimeout(librarySyncTimer);
+  librarySyncTimer = setTimeout(async () => {
+    try {
+      const r = await fetch('/api/library', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + getAuthToken() },
+        body: JSON.stringify({ library: libraryState }),
+      });
+      if (hint) hint.textContent = r.ok ? '已同步至 Cloudflare R2' : '本地已保存（云端同步稍后重试）';
+    } catch {
+      if (hint) hint.textContent = '本地已保存（网络离线）';
+    }
+  }, 450);
+}
+
+async function syncLibraryFromR2() {
+  try {
+    const r = await fetch('/api/library');
+    if (!r.ok) return;
+    const d = await r.json();
+    if (!d || !d.library) return;
+    const remote = d.library;
+    // Merge remote folders & maps if local hasn't been customized or merge union
+    const localHasCustom = Boolean(localStorage.getItem(LS_LIBRARY));
+    if (!localHasCustom) {
+      libraryState = {
+        folders: remote.folders && remote.folders.length ? remote.folders : DEFAULT_FOLDERS.map(f => ({ ...f })),
+        job_tags: remote.job_tags || {},
+        up_tags: remote.up_tags || {},
+        watch_later: remote.watch_later || [],
+        favorites: remote.favorites || [],
+      };
+    } else {
+      const fMap = new Map();
+      (remote.folders || []).forEach(f => fMap.set(f.id, f));
+      (libraryState.folders || []).forEach(f => fMap.set(f.id, f));
+      libraryState.folders = Array.from(fMap.values());
+      libraryState.job_tags = { ...(remote.job_tags || {}), ...(libraryState.job_tags || {}) };
+      libraryState.up_tags = { ...(remote.up_tags || {}), ...(libraryState.up_tags || {}) };
+      const mergeVids = (a, b) => {
+        const m = new Map();
+        (a || []).forEach(v => { if (v && v.bvid) m.set(v.bvid, v); });
+        (b || []).forEach(v => { if (v && v.bvid) m.set(v.bvid, v); });
+        return Array.from(m.values());
+      };
+      libraryState.watch_later = mergeVids(remote.watch_later, libraryState.watch_later);
+      libraryState.favorites = mergeVids(remote.favorites, libraryState.favorites);
+    }
+    try { localStorage.setItem(LS_LIBRARY, JSON.stringify(libraryState)); } catch {}
+    renderWorkspaceFolderBar();
+    renderList();
+    if (selectedJobId) {
+      const job = getJobs().find(j => j.id === selectedJobId);
+      if (job) renderDetailTagBar(job);
+    }
+    if (currentPage === 'monitor') {
+      renderMonitorFolderBar();
+      renderUpSidebar();
+    }
+  } catch {}
+}
+
+function getFolderById(id) {
+  return (libraryState.folders || []).find(f => f.id === id) || null;
+}
+function jobTagKey(job) { return String((job && (job.bvid || job.id)) || ''); }
+function getJobTagIds(job) {
+  const k = jobTagKey(job);
+  if (!k) return [];
+  const valid = new Set((libraryState.folders || []).map(f => f.id));
+  return (libraryState.job_tags[k] || []).filter(id => valid.has(id));
+}
+function getUpTagIds(mid) {
+  const k = String(mid || '');
+  if (!k) return [];
+  const valid = new Set((libraryState.folders || []).map(f => f.id));
+  return (libraryState.up_tags[k] || []).filter(id => valid.has(id));
+}
+function isWatchLater(bvid) {
+  return Boolean(bvid && (libraryState.watch_later || []).some(v => v.bvid === bvid));
+}
+function isFavBvid(bvid) {
+  return Boolean(bvid && (libraryState.favorites || []).some(v => v.bvid === bvid));
+}
+function isJobFavorited(job) {
+  if (!job) return false;
+  return Boolean(job.starred || isFavBvid(job.bvid));
+}
 
 let monitorConfig = {
   enabled: true, schedule_mode: 'times', times_cst: ['08:00', '20:00'],
@@ -2302,6 +2713,9 @@ const SVG_CLOSE_SM = '<svg class="ic" viewBox="0 0 24 24"><path d="M18 6L6 18M6 
 const SVG_CHEV = '<svg class="ic c-select-chev" viewBox="0 0 24 24"><path d="M6 9l6 6 6-6"/></svg>';
 const SVG_CHK = '<svg class="ic c-select-chk" viewBox="0 0 24 24"><polyline points="20 6 9 17 4 12"/></svg>';
 const SVG_STAR_SM = '<svg width="11" height="11" viewBox="0 0 24 24" fill="currentColor" stroke="none"><polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2"/></svg>';
+const SVG_CLOCK_SM = '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><polyline points="12 7 12 12 15 15"/></svg>';
+const SVG_STAR_LINE = '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2"/></svg>';
+const SVG_TAG_SM = '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M20.59 13.41l-7.17 7.17a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82z"/><line x1="7" y1="7" x2="7.01" y2="7"/></svg>';
 
 function esc(s) { return String(s || '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }
 function normStatus(st) {
@@ -2531,16 +2945,22 @@ function onTplPreset() {
   document.getElementById('customTplWrap').classList.toggle('hidden', document.getElementById('tplPreset').value !== 'custom');
 }
 
-// ── Page Switcher ──
+// ── Zero-Flicker Page Switcher ──
 async function switchPage(page) {
   if (page === 'monitor' && !authUser) {
     openModal('loginModal');
     setTimeout(() => document.getElementById('loginPass').focus(), 60);
     return;
   }
+  if (page === currentPage) return;
+  closeTagPopover();
+  const scrollEl = document.getElementById('contentScroll');
+  if (scrollEl) pageScrollPos[currentPage] = scrollEl.scrollTop;
+
   currentPage = page;
   document.querySelectorAll('#sideSwitcher .side-sw-btn').forEach(b => b.classList.toggle('active', b.dataset.page === page));
   moveSlider('sideSwitcher');
+
   const sbWs = document.getElementById('sidebarWorkspace');
   const sbMon = document.getElementById('sidebarMonitor');
   const pgWs = document.getElementById('pageWorkspace');
@@ -2549,9 +2969,9 @@ async function switchPage(page) {
   sbMon.classList.toggle('hidden', page !== 'monitor');
   pgWs.classList.toggle('hidden', page !== 'workspace');
   pgMon.classList.toggle('hidden', page !== 'monitor');
-  playAnim(page === 'workspace' ? sbWs : sbMon);
-  playAnim(page === 'workspace' ? pgWs : pgMon);
   document.getElementById('contentInner').classList.toggle('wide-feed', page === 'monitor');
+
+  if (scrollEl) scrollEl.scrollTop = pageScrollPos[page] || 0;
 
   if (page === 'workspace') {
     document.getElementById('topbarTitle').textContent = selectedJobId ? '单条视频摘要' : '视频知识库概览';
@@ -2811,6 +3231,346 @@ function startPolling(jobId) {
   }, 4000);
 }
 
+// ── Tag Folders, Watch Later & Favorites Logic ──
+function setWsFolder(fid) {
+  selectedWsFolder = selectedWsFolder === fid ? '' : fid;
+  renderWorkspaceFolderBar();
+  renderList();
+}
+
+function renderWorkspaceFolderBar() {
+  const bar = document.getElementById('wsFolderBar');
+  if (!bar) return;
+  const jobs = getJobs();
+  const folders = libraryState.folders || [];
+  let html = '<button class="folder-chip' + (!selectedWsFolder ? ' active' : '') + '" onclick="setWsFolder(\'\')">全部标签</button>';
+  folders.forEach(f => {
+    const cnt = jobs.filter(j => getJobTagIds(j).includes(f.id)).length;
+    const act = selectedWsFolder === f.id ? ' active' : '';
+    html += '<button class="folder-chip' + act + '" onclick="setWsFolder(\'' + esc(f.id) + '\')">' +
+      '<span class="folder-dot" style="background:' + esc(f.color) + '"></span>' +
+      '<span>' + esc(f.name) + '</span>' +
+      (cnt ? '<span class="folder-cnt">' + cnt + '</span>' : '') +
+    '</button>';
+  });
+  html += '<button class="folder-add-btn" onclick="openTagManagerModal()" title="管理标签文件夹">+ 标签</button>';
+  bar.innerHTML = html;
+}
+
+function renderDetailTagBar(job) {
+  const row = document.getElementById('dTagRow');
+  if (!row || !job) return;
+  const key = jobTagKey(job);
+  const tagIds = getJobTagIds(job);
+  let html = tagIds.map(id => {
+    const f = getFolderById(id);
+    if (!f) return '';
+    return '<span class="tag-pill"><span class="folder-dot" style="background:' + esc(f.color) + '"></span><span>' + esc(f.name) + '</span><button type="button" title="移除标签" onclick="toggleJobTag(\'' + esc(key) + '\',\'' + esc(f.id) + '\')">&times;</button></span>';
+  }).join('');
+  html += '<button type="button" class="tag-add-btn" onclick="openTagPopover(this,\'job\',\'' + esc(key) + '\')">' + SVG_TAG_SM + '<span>添加标签</span></button>';
+  row.innerHTML = html;
+}
+
+function updateWatchLaterBtn(job) {
+  const btn = document.getElementById('wlBtn');
+  const txt = document.getElementById('wlBtnText');
+  if (!btn || !txt) return;
+  const on = Boolean(job && isWatchLater(job.bvid));
+  btn.classList.toggle('active', on);
+  txt.textContent = on ? '已加稍后再看' : '稍后再看';
+}
+
+function toggleWatchLaterVideo(videoObj) {
+  if (!videoObj || !videoObj.bvid) return false;
+  const list = libraryState.watch_later || [];
+  const idx = list.findIndex(v => v.bvid === videoObj.bvid);
+  let added = false;
+  if (idx >= 0) {
+    list.splice(idx, 1);
+  } else {
+    list.unshift({
+      bvid: videoObj.bvid,
+      job_id: videoObj.job_id || '',
+      mid: Number(videoObj.mid) || 0,
+      title: videoObj.title || videoObj.bvid,
+      author: videoObj.author || videoObj.owner || '',
+      face: videoObj.face || '',
+      pic: videoObj.pic || '',
+      duration: videoObj.duration || '',
+      play: Number(videoObj.play) || 0,
+      danmaku: Number(videoObj.danmaku) || 0,
+      created: Number(videoObj.created) || 0,
+      url: videoObj.url || ('https://www.bilibili.com/video/' + videoObj.bvid),
+      added_at: new Date().toISOString(),
+    });
+    added = true;
+  }
+  libraryState.watch_later = list;
+  saveLibraryLocalAndCloud();
+  renderList();
+  if (selectedJobId) {
+    const cur = getJobs().find(j => j.id === selectedJobId);
+    if (cur && cur.bvid === videoObj.bvid) updateWatchLaterBtn(cur);
+  }
+  if (currentPage === 'monitor') {
+    renderMonitorFolderBar();
+    if (selectedUpMid === '__watchlater') renderSavedGrid('watchlater');
+    else syncFeedCardQuickStates(videoObj.bvid);
+  }
+  toast(added ? '已加入「稍后再看」' : '已移出「稍后再看」');
+  return added;
+}
+
+function toggleFavoriteVideo(videoObj) {
+  if (!videoObj || !videoObj.bvid) return false;
+  const list = libraryState.favorites || [];
+  const idx = list.findIndex(v => v.bvid === videoObj.bvid);
+  const jobs = getJobs();
+  const jobIdx = jobs.findIndex(j => j.bvid === videoObj.bvid || (videoObj.job_id && j.id === videoObj.job_id));
+  const wasOn = idx >= 0 || (jobIdx >= 0 && jobs[jobIdx].starred);
+  let added = false;
+
+  if (wasOn) {
+    if (idx >= 0) list.splice(idx, 1);
+    if (jobIdx >= 0) { jobs[jobIdx].starred = false; saveJobs(jobs); }
+  } else {
+    list.unshift({
+      bvid: videoObj.bvid,
+      job_id: (jobIdx >= 0 ? jobs[jobIdx].id : '') || videoObj.job_id || '',
+      mid: Number(videoObj.mid) || 0,
+      title: videoObj.title || videoObj.bvid,
+      author: videoObj.author || videoObj.owner || '',
+      face: videoObj.face || '',
+      pic: videoObj.pic || '',
+      duration: videoObj.duration || '',
+      play: Number(videoObj.play) || 0,
+      danmaku: Number(videoObj.danmaku) || 0,
+      created: Number(videoObj.created) || 0,
+      url: videoObj.url || ('https://www.bilibili.com/video/' + videoObj.bvid),
+      added_at: new Date().toISOString(),
+    });
+    if (jobIdx >= 0) { jobs[jobIdx].starred = true; saveJobs(jobs); }
+    added = true;
+  }
+  libraryState.favorites = list;
+  saveLibraryLocalAndCloud();
+  renderList();
+  renderDashboard();
+  if (selectedJobId) {
+    const cur = getJobs().find(j => j.id === selectedJobId);
+    if (cur && cur.bvid === videoObj.bvid) updateStarBtn(cur);
+  }
+  if (currentPage === 'monitor') {
+    renderMonitorFolderBar();
+    if (selectedUpMid === '__favorites') renderSavedGrid('favorites');
+    else syncFeedCardQuickStates(videoObj.bvid);
+  }
+  toast(added ? '已加入「收藏」' : '已取消收藏');
+  return added;
+}
+
+function toggleWatchLaterCurrent() {
+  const job = getJobs().find(j => j.id === selectedJobId);
+  if (!job) return;
+  toggleWatchLaterVideo({ bvid: job.bvid, job_id: job.id, title: job.title, author: job.owner, duration: job.duration, url: job.video_url });
+}
+
+function toggleJobTag(jobKey, folderId) {
+  if (!jobKey || !folderId) return;
+  const cur = new Set(libraryState.job_tags[jobKey] || []);
+  if (cur.has(folderId)) cur.delete(folderId); else cur.add(folderId);
+  if (cur.size) libraryState.job_tags[jobKey] = Array.from(cur);
+  else delete libraryState.job_tags[jobKey];
+  saveLibraryLocalAndCloud();
+  renderWorkspaceFolderBar();
+  renderList();
+  const job = getJobs().find(j => j.id === selectedJobId);
+  if (job && jobTagKey(job) === jobKey) renderDetailTagBar(job);
+  refreshOpenTagPopover();
+}
+
+function toggleUpTag(mid, folderId) {
+  const k = String(mid || '');
+  if (!k || !folderId) return;
+  const cur = new Set(libraryState.up_tags[k] || []);
+  if (cur.has(folderId)) cur.delete(folderId); else cur.add(folderId);
+  if (cur.size) libraryState.up_tags[k] = Array.from(cur);
+  else delete libraryState.up_tags[k];
+  saveLibraryLocalAndCloud();
+  renderMonitorFolderBar();
+  renderUpSidebar();
+  refreshOpenTagPopover();
+}
+
+let activeTagPopoverCtx = null;
+
+function closeTagPopover() {
+  const pop = document.getElementById('tagPopover');
+  if (pop) pop.classList.add('hidden');
+  activeTagPopoverCtx = null;
+}
+
+function refreshOpenTagPopover() {
+  if (!activeTagPopoverCtx) return;
+  const { targetType, targetKey } = activeTagPopoverCtx;
+  renderTagPopoverBody(targetType, targetKey);
+}
+
+function renderTagPopoverBody(targetType, targetKey) {
+  const pop = document.getElementById('tagPopover');
+  if (!pop) return;
+  const folders = libraryState.folders || [];
+  const chosen = new Set(targetType === 'up' ? getUpTagIds(targetKey) : (libraryState.job_tags[targetKey] || []));
+  const fnName = targetType === 'up' ? 'toggleUpTag' : 'toggleJobTag';
+  let html = '<div class="tag-pop-head"><span>选择标签文件夹</span></div>';
+  html += folders.map(f => {
+    const sel = chosen.has(f.id);
+    return '<button type="button" class="tag-pop-item' + (sel ? ' selected' : '') + '" onclick="' + fnName + '(\'' + esc(targetKey) + '\',\'' + esc(f.id) + '\')">' +
+      '<span class="tag-pop-left"><span class="folder-dot" style="background:' + esc(f.color) + '"></span><span>' + esc(f.name) + '</span></span>' +
+      (sel ? SVG_CHK : '') +
+    '</button>';
+  }).join('');
+  html += '<div class="tag-pop-sep"></div>' +
+    '<button type="button" class="tag-pop-item" onclick="closeTagPopover();openTagManagerModal()">' +
+      '<span class="tag-pop-left" style="color:var(--brand-dark);font-weight:600">+ 新建或管理文件夹</span>' +
+    '</button>';
+  pop.innerHTML = html;
+}
+
+function openTagPopover(anchorEl, targetType, targetKey) {
+  const pop = document.getElementById('tagPopover');
+  if (!pop) return;
+  if (activeTagPopoverCtx && activeTagPopoverCtx.anchorEl === anchorEl && !pop.classList.contains('hidden')) {
+    closeTagPopover();
+    return;
+  }
+  activeTagPopoverCtx = { anchorEl, targetType, targetKey };
+  renderTagPopoverBody(targetType, targetKey);
+  pop.classList.remove('hidden');
+  const rect = anchorEl.getBoundingClientRect();
+  const popRect = pop.getBoundingClientRect();
+  let top = rect.bottom + 6;
+  let left = rect.left;
+  if (top + popRect.height > window.innerHeight - 12) top = Math.max(12, rect.top - popRect.height - 6);
+  if (left + popRect.width > window.innerWidth - 12) left = Math.max(12, window.innerWidth - popRect.width - 12);
+  pop.style.top = top + 'px';
+  pop.style.left = left + 'px';
+}
+
+document.addEventListener('click', (e) => {
+  const pop = document.getElementById('tagPopover');
+  if (!pop || pop.classList.contains('hidden')) return;
+  if (pop.contains(e.target)) return;
+  if (activeTagPopoverCtx && activeTagPopoverCtx.anchorEl && activeTagPopoverCtx.anchorEl.contains(e.target)) return;
+  closeTagPopover();
+});
+
+function openTagManagerModal() {
+  closeTagPopover();
+  renderFolderColorSwatches();
+  renderFolderManagerList();
+  openModal('tagManagerModal');
+}
+
+function renderFolderColorSwatches() {
+  const box = document.getElementById('folderColorSwatches');
+  if (!box) return;
+  box.innerHTML = FOLDER_COLORS.map(c =>
+    '<button type="button" class="color-sw' + (selectedNewFolderColor === c ? ' active' : '') + '" style="background:' + c + '" onclick="pickFolderColor(\'' + c + '\')" aria-label="' + c + '"></button>'
+  ).join('');
+}
+
+function pickFolderColor(c) {
+  selectedNewFolderColor = c;
+  renderFolderColorSwatches();
+}
+
+function renderFolderManagerList() {
+  const box = document.getElementById('folderMgrList');
+  if (!box) return;
+  const jobs = getJobs();
+  const ups = monitorConfig.up_list || [];
+  const folders = libraryState.folders || [];
+  if (!folders.length) {
+    box.innerHTML = '<div style="text-align:center;color:var(--muted);padding:16px;font-size:12.5px">暂无标签文件夹，在上方新建一个吧</div>';
+    return;
+  }
+  box.innerHTML = folders.map(f => {
+    const jCnt = jobs.filter(j => getJobTagIds(j).includes(f.id)).length;
+    const uCnt = ups.filter(u => getUpTagIds(u.mid).includes(f.id)).length;
+    return '<div class="folder-mgr-row">' +
+      '<div class="folder-mgr-left">' +
+        '<span class="folder-dot" style="width:10px;height:10px;background:' + esc(f.color) + '"></span>' +
+        '<div><div class="folder-mgr-name">' + esc(f.name) + '</div><div class="folder-mgr-stat">摘要 ' + jCnt + ' 条 · UP主 ' + uCnt + ' 位</div></div>' +
+      '</div>' +
+      '<div style="display:flex;gap:6px">' +
+        '<button type="button" class="btn btn-sm" onclick="renameFolder(\'' + esc(f.id) + '\')">重命名</button>' +
+        '<button type="button" class="btn btn-sm" style="color:var(--err)" onclick="deleteFolder(\'' + esc(f.id) + '\')">删除</button>' +
+      '</div>' +
+    '</div>';
+  }).join('');
+}
+
+function createNewFolder() {
+  const inp = document.getElementById('newFolderNameInput');
+  const name = (inp.value || '').trim().slice(0, 16);
+  if (!name) { toast('请输入文件夹名称', true); return; }
+  if ((libraryState.folders || []).some(f => f.name === name)) { toast('已存在同名标签文件夹', true); return; }
+  const id = 'f_' + Date.now().toString(36) + '_' + Math.random().toString(36).slice(2, 5);
+  libraryState.folders.push({ id, name, color: selectedNewFolderColor || FOLDER_COLORS[0] });
+  inp.value = '';
+  saveLibraryLocalAndCloud();
+  renderFolderManagerList();
+  renderWorkspaceFolderBar();
+  renderMonitorFolderBar();
+  toast('已创建标签文件夹：' + name);
+}
+
+function renameFolder(id) {
+  const f = getFolderById(id);
+  if (!f) return;
+  const next = prompt('输入新的标签文件夹名称：', f.name);
+  if (next === null) return;
+  const clean = next.trim().slice(0, 16);
+  if (!clean) return;
+  f.name = clean;
+  saveLibraryLocalAndCloud();
+  renderFolderManagerList();
+  renderWorkspaceFolderBar();
+  renderMonitorFolderBar();
+  renderList();
+  renderUpSidebar();
+  const job = getJobs().find(j => j.id === selectedJobId);
+  if (job) renderDetailTagBar(job);
+  toast('已重命名为：' + clean);
+}
+
+function deleteFolder(id) {
+  const f = getFolderById(id);
+  if (!f) return;
+  if (!confirm('确定删除标签文件夹「' + f.name + '」？（不会删除视频或 UP 主本身）')) return;
+  libraryState.folders = (libraryState.folders || []).filter(x => x.id !== id);
+  if (selectedWsFolder === id) selectedWsFolder = '';
+  if (selectedMonFolder === id) selectedMonFolder = '';
+  Object.keys(libraryState.job_tags).forEach(k => {
+    libraryState.job_tags[k] = (libraryState.job_tags[k] || []).filter(x => x !== id);
+    if (!libraryState.job_tags[k].length) delete libraryState.job_tags[k];
+  });
+  Object.keys(libraryState.up_tags).forEach(k => {
+    libraryState.up_tags[k] = (libraryState.up_tags[k] || []).filter(x => x !== id);
+    if (!libraryState.up_tags[k].length) delete libraryState.up_tags[k];
+  });
+  saveLibraryLocalAndCloud();
+  renderFolderManagerList();
+  renderWorkspaceFolderBar();
+  renderMonitorFolderBar();
+  renderList();
+  renderUpSidebar();
+  const job = getJobs().find(j => j.id === selectedJobId);
+  if (job) renderDetailTagBar(job);
+  toast('已删除文件夹：' + f.name);
+}
+
 // ── History List & Filters ──
 function setHistoryFilter(f) {
   historyFilter = f;
@@ -2822,9 +3582,13 @@ function setHistoryFilter(f) {
 function renderList() {
   const kw = (document.getElementById('searchInput').value || '').trim().toLowerCase();
   let jobs = getJobs();
-  if (historyFilter === 'starred') jobs = jobs.filter(j => j.starred);
-  else if (historyFilter === 'completed') jobs = jobs.filter(j => normStatus(j.status) === 'completed');
+  if (historyFilter === 'starred') jobs = jobs.filter(j => isJobFavorited(j));
+  else if (historyFilter === 'watchlater') jobs = jobs.filter(j => isWatchLater(j.bvid));
   else if (historyFilter === 'failed') jobs = jobs.filter(j => normStatus(j.status) === 'failed');
+
+  if (selectedWsFolder) {
+    jobs = jobs.filter(j => getJobTagIds(j).includes(selectedWsFolder));
+  }
 
   const filtered = kw ? jobs.filter(j =>
     (j.title || '').toLowerCase().includes(kw) ||
@@ -2832,14 +3596,25 @@ function renderList() {
     (j.owner || '').toLowerCase().includes(kw)
   ) : jobs;
 
-  document.getElementById('countPill').textContent = String(filtered.length);
+  // Also include unsummarized saved videos when viewing Watch Later or Favorites (without tag filter)
+  let extraSaved = [];
+  if (!selectedWsFolder && (historyFilter === 'watchlater' || historyFilter === 'starred')) {
+    const existingBvids = new Set(getJobs().map(j => j.bvid));
+    const pool = historyFilter === 'watchlater' ? (libraryState.watch_later || []) : (libraryState.favorites || []);
+    extraSaved = pool.filter(v => !existingBvids.has(v.bvid) && (!kw || (v.title || '').toLowerCase().includes(kw) || (v.author || '').toLowerCase().includes(kw) || (v.bvid || '').toLowerCase().includes(kw)));
+  }
+
+  document.getElementById('countPill').textContent = String(filtered.length + extraSaved.length);
   const container = document.getElementById('historyList');
-  if (!filtered.length) {
-    container.innerHTML = '<div style="text-align:center;padding:28px 12px;color:var(--muted);font-size:12.5px">暂无匹配的历史记录</div>';
+  if (!filtered.length && !extraSaved.length) {
+    const emptyMsg = historyFilter === 'watchlater'
+      ? '暂无「稍后再看」视频，可在详情页或 UP 主动态中一键添加'
+      : (selectedWsFolder ? '该标签文件夹下暂无摘要' : '暂无匹配的历史记录');
+    container.innerHTML = '<div style="text-align:center;padding:28px 12px;color:var(--muted);font-size:12.5px">' + emptyMsg + '</div>';
     return;
   }
 
-  container.innerHTML = filtered.map(j => {
+  let html = filtered.map(j => {
     const active = j.id === selectedJobId && currentPage === 'workspace' ? ' active' : '';
     const st = normStatus(j.status);
     const dotCls = st === 'completed' ? 'ok' : (st === 'failed' ? 'err' : 'pending');
@@ -2851,21 +3626,42 @@ function renderList() {
     const chk = batchMode
       ? '<input type="checkbox" class="h-chk" ' + (selectedIds.includes(j.id) ? 'checked' : '') + ' onclick="event.stopPropagation();toggleSelectId(\'' + esc(j.id) + '\')">'
       : '';
+    const tagPills = getJobTagIds(j).map(tid => {
+      const f = getFolderById(tid);
+      return f ? '<span class="mini-tag"><span class="folder-dot" style="width:5px;height:5px;background:' + esc(f.color) + '"></span>' + esc(f.name) + '</span>' : '';
+    }).join('');
+    const wlBadge = isWatchLater(j.bvid) ? '<span class="mini-tag wl">稍后再看</span>' : '';
+    const tagsRow = (tagPills || wlBadge) ? '<div class="mini-tags">' + wlBadge + tagPills + '</div>' : '';
+
     return '<div class="h-card' + active + '" onclick="selectJob(\'' + esc(j.id) + '\')">' +
       chk +
       '<div class="h-body">' +
         '<div class="h-title">' + esc(j.title || j.bvid || '处理中...') + '</div>' +
         '<div class="h-meta">' + esc(metaParts.join(' · ')) + '</div>' +
+        tagsRow +
       '</div>' +
       '<div class="h-right">' +
         '<div style="display:flex;align-items:center;gap:5px">' +
-          (j.starred ? '<span class="h-star-dot">' + SVG_STAR_SM + '</span>' : '') +
+          (isJobFavorited(j) ? '<span class="h-star-dot">' + SVG_STAR_SM + '</span>' : '') +
           '<span class="dot ' + dotCls + '"></span>' +
         '</div>' +
         (!batchMode ? '<button class="h-del" title="删除" onclick="event.stopPropagation();deleteOneJob(\'' + esc(j.id) + '\')">' + SVG_CLOSE_SM + '</button>' : '') +
       '</div>' +
     '</div>';
   }).join('');
+
+  if (extraSaved.length) {
+    html += extraSaved.map(v =>
+      '<div class="h-card" onclick="submitVideo(\'' + esc(v.bvid) + '\',{title:' + JSON.stringify(v.title || '') + ',owner:' + JSON.stringify(v.author || '') + ',duration:' + JSON.stringify(v.duration || '') + '})">' +
+        '<div class="h-body">' +
+          '<div class="h-title">' + esc(v.title || v.bvid) + '</div>' +
+          '<div class="h-meta">' + esc([v.author, v.duration, v.bvid].filter(Boolean).join(' · ')) + '</div>' +
+          '<div class="mini-tags"><span class="mini-tag wl">点击立即总结</span></div>' +
+        '</div>' +
+      '</div>'
+    ).join('');
+  }
+  container.innerHTML = html;
 }
 
 function selectJob(id) {
@@ -2882,20 +3678,17 @@ function selectJob(id) {
 }
 
 function toggleStarCurrent() {
-  const jobs = getJobs();
-  const idx = jobs.findIndex(j => j.id === selectedJobId);
-  if (idx < 0) return;
-  jobs[idx].starred = !jobs[idx].starred;
-  saveJobs(jobs);
-  updateStarBtn(jobs[idx]);
-  toast(jobs[idx].starred ? '已加入收藏' : '已取消收藏');
+  const job = getJobs().find(j => j.id === selectedJobId);
+  if (!job) return;
+  toggleFavoriteVideo({ bvid: job.bvid, job_id: job.id, title: job.title, author: job.owner, duration: job.duration, url: job.video_url });
 }
 
 function updateStarBtn(job) {
   const btn = document.getElementById('starBtn');
   const txt = document.getElementById('starBtnText');
-  btn.classList.toggle('starred', Boolean(job && job.starred));
-  txt.textContent = (job && job.starred) ? '已收藏' : '收藏';
+  const on = isJobFavorited(job);
+  btn.classList.toggle('starred', on);
+  txt.textContent = on ? '已收藏' : '收藏';
 }
 
 function deleteOneJob(id) {
@@ -3371,6 +4164,8 @@ function renderStepper(job) {
 function renderDetail(job) {
   renderStepper(job);
   updateStarBtn(job);
+  updateWatchLaterBtn(job);
+  renderDetailTagBar(job);
   const videoUrl = job.video_url || ('https://www.bilibili.com/video/' + job.bvid);
   const titleLink = document.getElementById('dTitleLink');
   titleLink.textContent = job.title || job.bvid || '处理中...';
@@ -3530,16 +4325,21 @@ async function doLogin() {
 function doLogout() {
   localStorage.removeItem(LS_AUTH);
   localStorage.removeItem(LS_USER);
+  monitorPageBooted = false;
+  lastRenderedFeedKey = '';
+  lastRenderedFeedSig = '';
   updateAuthUi('');
   closeModal('monitorModal');
   toast('已退出管理员登录');
 }
 
-// ── Multi-Layer UP Feed Cache + Skeleton Shimmer + Cover Grid ──
-const SS_FEED_CACHE = 'bilisum_up_feed_cache_v1';
+// ── Multi-Layer UP Feed Cache + Infinite Scroll + UP Tag Folders + Cover Grid ──
+const SS_FEED_CACHE = 'bilisum_up_feed_cache_v2';
 const FEED_CACHE_TTL_MS = 10 * 60 * 1000;
 const feedMemCache = new Map();
 let prefetchDone = false;
+let feedPagination = { key: 'all', pn: 1, hasMore: false, loading: false, total: 0, mids: '' };
+let feedObserver = null;
 
 function readFeedCache(key) {
   const k = String(key || 'all');
@@ -3550,9 +4350,15 @@ function readFeedCache(key) {
   } catch {}
   return null;
 }
-function writeFeedCache(key, videos) {
+function writeFeedCache(key, entryData) {
   const k = String(key || 'all');
-  const entry = { videos, ts: Date.now() };
+  const entry = {
+    videos: entryData.videos || [],
+    pn: entryData.pn || 1,
+    hasMore: Boolean(entryData.hasMore),
+    total: Number(entryData.total) || 0,
+    ts: Date.now(),
+  };
   feedMemCache.set(k, entry);
   try {
     const store = JSON.parse(sessionStorage.getItem(SS_FEED_CACHE) || '{}');
@@ -3576,12 +4382,42 @@ function renderSkeletonGrid() {
   ).join('');
 }
 
+function initFeedInfiniteObserver() {
+  if (feedObserver || typeof IntersectionObserver === 'undefined') return;
+  const sentinel = document.getElementById('feedSentinel');
+  const root = document.getElementById('contentScroll');
+  if (!sentinel) return;
+  feedObserver = new IntersectionObserver((entries) => {
+    entries.forEach(entry => {
+      if (!entry.isIntersecting) return;
+      if (currentPage !== 'monitor') return;
+      if (selectedUpMid === '__watchlater' || selectedUpMid === '__favorites') return;
+      if (feedPagination.hasMore && !feedPagination.loading) {
+        loadMoreUpFeed();
+      }
+    });
+  }, { root: root || null, rootMargin: '420px 0px' });
+  feedObserver.observe(sentinel);
+}
+
 async function loadMonitorPage() {
+  initFeedInfiniteObserver();
+  if (monitorPageBooted && (monitorConfig.up_list || []).length > 0) {
+    renderMonitorFolderBar();
+    updateMonitorHeaderSummary();
+    if (selectedUpMid === '__watchlater') renderSavedGrid('watchlater');
+    else if (selectedUpMid === '__favorites') renderSavedGrid('favorites');
+    else if (!lastRenderedFeedKey) await fetchUpFeed(selectedUpMid || 'all');
+    return;
+  }
   await loadMonitorConfig();
+  monitorPageBooted = true;
   updateMonitorHeaderSummary();
+  renderMonitorFolderBar();
   renderUpSidebar();
   await fetchUpFeed(selectedUpMid || 'all');
 }
+
 function updateMonitorHeaderSummary() {
   const ups = monitorConfig.up_list || [];
   const styleNames = { editorial: '编辑部日报', minimal: '极简纸刊', bilibili: 'B站元气粉', compact: '极速速览' };
@@ -3589,39 +4425,139 @@ function updateMonitorHeaderSummary() {
   const timeStr = monitorConfig.schedule_mode === 'times' ? ('北京时间 ' + (monitorConfig.times_cst || []).join('、')) : ('UTC Cron ' + (monitorConfig.cron_utc || ''));
   document.getElementById('monSummaryLine').textContent = statusStr + ' · ' + timeStr + ' · 共监控 ' + ups.length + ' 位 UP 主 · 样式：' + (styleNames[monitorConfig.email_style] || '编辑部日报');
 }
+
+function setMonFolder(fid) {
+  selectedMonFolder = selectedMonFolder === fid ? '' : fid;
+  renderMonitorFolderBar();
+  renderUpSidebar();
+  if (selectedMonFolder) {
+    selectMonitorUp('folder:' + selectedMonFolder);
+  } else if (String(selectedUpMid).startsWith('folder:')) {
+    selectMonitorUp('all');
+  }
+}
+
+function renderMonitorFolderBar() {
+  const bar = document.getElementById('monFolderBar');
+  if (!bar) return;
+  const ups = monitorConfig.up_list || [];
+  const folders = libraryState.folders || [];
+  const wlCnt = (libraryState.watch_later || []).length;
+  const favCnt = (libraryState.favorites || []).length;
+
+  let html = '<button class="folder-chip' + (!selectedMonFolder && selectedUpMid !== '__watchlater' && selectedUpMid !== '__favorites' ? ' active' : '') + '" onclick="selectedMonFolder=\'\';renderMonitorFolderBar();renderUpSidebar();selectMonitorUp(\'all\')">全部</button>';
+  html += '<button class="folder-chip' + (selectedUpMid === '__watchlater' ? ' active' : '') + '" onclick="selectMonitorUp(\'__watchlater\')">' +
+    '<span class="folder-dot" style="background:#2563EB"></span><span>稍后再看</span>' + (wlCnt ? '<span class="folder-cnt">' + wlCnt + '</span>' : '') + '</button>';
+  html += '<button class="folder-chip' + (selectedUpMid === '__favorites' ? ' active' : '') + '" onclick="selectMonitorUp(\'__favorites\')">' +
+    '<span class="folder-dot" style="background:#D97706"></span><span>收藏</span>' + (favCnt ? '<span class="folder-cnt">' + favCnt + '</span>' : '') + '</button>';
+
+  folders.forEach(f => {
+    const cnt = ups.filter(u => getUpTagIds(u.mid).includes(f.id)).length;
+    const act = selectedMonFolder === f.id ? ' active' : '';
+    html += '<button class="folder-chip' + act + '" onclick="setMonFolder(\'' + esc(f.id) + '\')">' +
+      '<span class="folder-dot" style="background:' + esc(f.color) + '"></span>' +
+      '<span>' + esc(f.name) + '</span>' +
+      (cnt ? '<span class="folder-cnt">' + cnt + '</span>' : '') +
+    '</button>';
+  });
+  html += '<button class="folder-add-btn" onclick="openTagManagerModal()" title="管理标签文件夹">+ 标签</button>';
+  bar.innerHTML = html;
+}
+
 function renderUpSidebar() {
   const kw = (document.getElementById('upSearchInput').value || '').trim().toLowerCase();
-  const ups = monitorConfig.up_list || [];
+  const allUps = monitorConfig.up_list || [];
+  let ups = selectedMonFolder ? allUps.filter(u => getUpTagIds(u.mid).includes(selectedMonFolder)) : allUps;
   document.getElementById('upSideCount').textContent = String(ups.length);
   const filtered = kw ? ups.filter(u => String(u.name || '').toLowerCase().includes(kw) || String(u.mid || '').includes(kw)) : ups;
   const listEl = document.getElementById('upSideList');
   let html = '';
   if (!kw) {
-    html += '<div class="up-side-card' + (selectedUpMid === 'all' ? ' active' : '') + '" onclick="selectMonitorUp(\'all\')"><div class="up-ava-fb">全</div><div class="up-side-info"><div class="up-side-name">全部监控 UP 主</div><div class="up-side-uid">聚合最新动态 · ' + ups.length + ' 位</div></div></div>';
+    if (selectedMonFolder) {
+      const f = getFolderById(selectedMonFolder);
+      const fKey = 'folder:' + selectedMonFolder;
+      html += '<div class="up-side-card' + (selectedUpMid === fKey ? ' active' : '') + '" onclick="selectMonitorUp(\'' + esc(fKey) + '\')">' +
+        '<div class="up-ava-fb" style="background:' + esc((f && f.color) || '#2563EB') + ';color:#fff;border-color:transparent">' + esc(((f && f.name) || '类').slice(0, 1)) + '</div>' +
+        '<div class="up-side-info"><div class="up-side-name">「' + esc((f && f.name) || '分类') + '」全部动态</div><div class="up-side-uid">聚合该标签下 ' + ups.length + ' 位 UP 主</div></div></div>';
+    } else {
+      html += '<div class="up-side-card' + (selectedUpMid === 'all' ? ' active' : '') + '" onclick="selectMonitorUp(\'all\')"><div class="up-ava-fb">全</div><div class="up-side-info"><div class="up-side-name">全部监控 UP 主</div><div class="up-side-uid">聚合最新动态 · ' + allUps.length + ' 位</div></div></div>';
+    }
   }
   html += filtered.length ? filtered.map(u => {
     const active = String(selectedUpMid) === String(u.mid) ? ' active' : '';
     const faceUrl = u.face ? (u.face.replace(/^http:\/\//, 'https://') + '@96w_96h_1c.webp') : '';
     const ava = faceUrl ? '<img class="up-ava" src="' + esc(faceUrl) + '" referrerpolicy="no-referrer" alt="">' : '<div class="up-ava-fb">' + esc((u.name || String(u.mid)).slice(0, 1)) + '</div>';
-    return '<div class="up-side-card' + active + '" onclick="selectMonitorUp(' + Number(u.mid) + ')">' + ava + '<div class="up-side-info"><div class="up-side-name">' + esc(u.name || u.mid) + '</div><div class="up-side-uid">UID ' + esc(u.mid) + '</div></div><button class="h-del" title="取消监控" onclick="event.stopPropagation();quickRemoveMonitorUp(' + Number(u.mid) + ')">' + SVG_CLOSE_SM + '</button></div>';
-  }).join('') : '<div style="text-align:center;padding:24px 12px;color:var(--muted);font-size:12.5px">暂无匹配的 UP 主</div>';
+    const upTagsHtml = getUpTagIds(u.mid).map(tid => {
+      const f = getFolderById(tid);
+      return f ? '<span class="mini-tag"><span class="folder-dot" style="width:5px;height:5px;background:' + esc(f.color) + '"></span>' + esc(f.name) + '</span>' : '';
+    }).join('');
+    return '<div class="up-side-card' + active + '" onclick="selectMonitorUp(' + Number(u.mid) + ')">' +
+      ava +
+      '<div class="up-side-info">' +
+        '<div class="up-side-name">' + esc(u.name || u.mid) + '</div>' +
+        '<div class="up-side-uid">UID ' + esc(u.mid) + '</div>' +
+        (upTagsHtml ? '<div class="mini-tags">' + upTagsHtml + '</div>' : '') +
+      '</div>' +
+      '<div class="up-side-acts">' +
+        '<button class="up-tag-btn" title="设置标签分类" onclick="event.stopPropagation();openTagPopover(this,\'up\',\'' + Number(u.mid) + '\')">' + SVG_TAG_SM + '</button>' +
+        '<button class="h-del" title="取消监控" onclick="event.stopPropagation();quickRemoveMonitorUp(' + Number(u.mid) + ')">' + SVG_CLOSE_SM + '</button>' +
+      '</div>' +
+    '</div>';
+  }).join('') : '<div style="text-align:center;padding:24px 12px;color:var(--muted);font-size:12.5px">' + (selectedMonFolder ? '该标签下暂无 UP 主，点击任意 UP 主右侧标签图标即可加入' : '暂无匹配的 UP 主') + '</div>';
   listEl.innerHTML = html;
 }
+
+function renderSavedGrid(kind) {
+  const isWl = kind === 'watchlater';
+  const vids = isWl ? (libraryState.watch_later || []) : (libraryState.favorites || []);
+  document.getElementById('monFeedHeading').textContent = isWl ? '稍后再看视频列表' : '已收藏视频列表';
+  document.getElementById('topbarSub').textContent = (isWl ? '稍后再看' : '收藏夹') + ' · ' + vids.length + ' 条';
+  const grid = document.getElementById('upFeedGrid');
+  const footer = document.getElementById('feedFooter');
+  currentFeedVideos = vids.slice();
+  lastRenderedFeedKey = isWl ? '__watchlater' : '__favorites';
+  lastRenderedFeedSig = vids.map(v => v.bvid).join(',');
+  feedPagination = { key: lastRenderedFeedKey, pn: 1, hasMore: false, loading: false, total: vids.length, mids: '' };
+
+  if (!vids.length) {
+    grid.innerHTML = '<div class="reader-card" style="grid-column:1/-1;text-align:center;color:var(--muted);padding:38px">' +
+      (isWl ? '暂无「稍后再看」视频，悬停任意视频封面右上角即可一键加入' : '暂无「收藏」视频，悬停视频封面或摘要详情页即可一键收藏') + '</div>';
+    if (footer) footer.innerHTML = '';
+    return;
+  }
+  grid.innerHTML = vids.map((v, idx) => buildFeedCardHtml(v, idx)).join('');
+  if (footer) footer.innerHTML = '<div class="feed-meta-note">共 ' + vids.length + ' 条视频</div>';
+}
+
 async function selectMonitorUp(mid) {
   selectedUpMid = mid;
+  renderMonitorFolderBar();
   renderUpSidebar();
+  const scrollEl = document.getElementById('contentScroll');
+  if (scrollEl) { scrollEl.scrollTop = 0; pageScrollPos.monitor = 0; }
+
+  if (mid === '__watchlater') { renderSavedGrid('watchlater'); return; }
+  if (mid === '__favorites') { renderSavedGrid('favorites'); return; }
+
   const ups = monitorConfig.up_list || [];
   if (mid === 'all') {
     document.getElementById('monFeedHeading').textContent = '全部监控 UP 主动态';
     document.getElementById('topbarSub').textContent = '全部 UP 主';
+  } else if (String(mid).startsWith('folder:')) {
+    const fid = String(mid).slice(7);
+    const f = getFolderById(fid);
+    const label = (f && f.name) || '标签分类';
+    document.getElementById('monFeedHeading').textContent = '「' + label + '」聚合动态';
+    document.getElementById('topbarSub').textContent = '标签文件夹 · ' + label;
   } else {
     const found = ups.find(u => Number(u.mid) === Number(mid));
     const label = found ? found.name : ('UID ' + mid);
-    document.getElementById('monFeedHeading').textContent = label + ' · 最新视频';
+    document.getElementById('monFeedHeading').textContent = label + ' · 全部投稿';
     document.getElementById('topbarSub').textContent = label + ' (' + mid + ')';
   }
   await fetchUpFeed(mid);
 }
+
 async function quickAddMonitorUp() {
   const inp = document.getElementById('sideAddUpInput');
   const q = inp.value.trim();
@@ -3638,14 +4574,20 @@ async function quickAddMonitorUp() {
       const sr = await fetch('/api/monitor-config', { method: 'POST', headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + getAuthToken() }, body: JSON.stringify(monitorConfig) });
       const sd = await sr.json();
       if (sr.ok && sd.config) monitorConfig = sd.config;
+      if (selectedMonFolder) {
+        const k = String(d.mid);
+        libraryState.up_tags[k] = [...new Set([...(libraryState.up_tags[k] || []), selectedMonFolder])];
+        saveLibraryLocalAndCloud();
+      }
     }
     inp.value = ''; clearFeedCache('all');
-    updateMonitorHeaderSummary(); renderUpSidebar();
+    updateMonitorHeaderSummary(); renderMonitorFolderBar(); renderUpSidebar();
     toast('已添加监控：' + (d.name || d.mid));
     await selectMonitorUp(Number(d.mid));
   } catch (e) { showToast('sideUpToast', '添加异常：' + e.message, 'err'); }
   finally { btn.disabled = false; btn.textContent = '添加'; }
 }
+
 async function quickRemoveMonitorUp(mid) {
   const found = (monitorConfig.up_list || []).find(u => Number(u.mid) === Number(mid));
   if (!confirm('确定取消监控「' + (found ? found.name : mid) + '」？')) return;
@@ -3656,64 +4598,236 @@ async function quickRemoveMonitorUp(mid) {
     if (sr.ok && sd.config) monitorConfig = sd.config;
     if (String(selectedUpMid) === String(mid)) selectedUpMid = 'all';
     clearFeedCache('all'); clearFeedCache(mid);
-    updateMonitorHeaderSummary(); renderUpSidebar();
+    updateMonitorHeaderSummary(); renderMonitorFolderBar(); renderUpSidebar();
     await selectMonitorUp(selectedUpMid);
     toast('已取消监控');
   } catch (e) { toast('移除失败：' + e.message, true); }
 }
-function renderFeedCards(vids) {
-  const grid = document.getElementById('upFeedGrid');
-  currentFeedVideos = vids;
-  if (!vids.length) { grid.innerHTML = '<div class="reader-card" style="grid-column:1/-1;text-align:center;color:var(--muted);padding:36px">暂未获取到公开视频</div>'; return; }
-  grid.innerHTML = vids.map((v, idx) => {
-    const coverUrl = v.pic ? (v.pic.replace(/^http:\/\//, 'https://') + '@672w_378h_1c.webp') : '';
-    const faceUrl = v.face ? (v.face.replace(/^http:\/\//, 'https://') + '@96w_96h_1c.webp') : '';
-    const hasSum = Boolean(v.summary);
-    const statsStr = [fmtCount(v.play), fmtDanmaku(v.danmaku)].join(' · ');
-    const relTime = fmtRelativeTime(v.created);
-    const avaHtml = faceUrl ? '<img class="v-ava" src="' + esc(faceUrl) + '" referrerpolicy="no-referrer" alt="">' : '<div class="v-ava-fb">' + esc((v.author || 'UP').slice(0, 1)) + '</div>';
-    return '<article class="v-card"><a class="v-thumb-link" href="' + esc(v.url) + '" target="_blank" rel="noopener">' + (coverUrl ? '<img src="' + esc(coverUrl) + '" referrerpolicy="no-referrer" loading="lazy" alt="">' : '') + (hasSum ? '<span class="v-sum-badge">已有摘要</span>' : '') + (v.duration ? '<span class="v-dur">' + esc(v.duration) + '</span>' : '') + '</a><div class="v-body">' + avaHtml + '<div class="v-meta-col"><a class="v-title" href="' + esc(v.url) + '" target="_blank" rel="noopener" title="' + esc(v.title) + '">' + esc(v.title) + '</a><div class="v-author">' + esc(v.author || '') + '</div><div class="v-stats">' + esc(statsStr) + '</div><div class="v-foot">' + (relTime ? '<span class="v-time-pill">' + esc(relTime) + '</span>' : '<span></span>') + '<div class="v-act-row">' + (hasSum ? '<button class="v-act-btn" onclick="openFeedSummaryModal(' + idx + ')">查看摘要</button>' : '') + '<button class="v-act-btn primary" onclick="submitVideoFromFeed(' + idx + ')">' + (hasSum ? '重算' : '一键总结') + '</button></div></div></div></div></article>';
-  }).join('');
-  playAnim(grid);
+
+function buildFeedCardHtml(v, idx) {
+  const coverUrl = v.pic ? (v.pic.replace(/^http:\/\//, 'https://') + '@672w_378h_1c.webp') : '';
+  const faceUrl = v.face ? (v.face.replace(/^http:\/\//, 'https://') + '@96w_96h_1c.webp') : '';
+  const hasSum = Boolean(v.summary);
+  const statsStr = [fmtCount(v.play), fmtDanmaku(v.danmaku)].join(' · ');
+  const relTime = fmtRelativeTime(v.created);
+  const avaHtml = faceUrl ? '<img class="v-ava" src="' + esc(faceUrl) + '" referrerpolicy="no-referrer" alt="">' : '<div class="v-ava-fb">' + esc((v.author || 'UP').slice(0, 1)) + '</div>';
+  const wlOn = isWatchLater(v.bvid);
+  const favOn = isFavBvid(v.bvid);
+  return '<article class="v-card" data-bvid="' + esc(v.bvid) + '">' +
+    '<div class="v-thumb-wrap">' +
+      '<a class="v-thumb-link" href="' + esc(v.url) + '" target="_blank" rel="noopener">' +
+        (coverUrl ? '<img src="' + esc(coverUrl) + '" referrerpolicy="no-referrer" loading="lazy" alt="">' : '') +
+        (hasSum ? '<span class="v-sum-badge">已有摘要</span>' : '') +
+        (v.duration ? '<span class="v-dur">' + esc(v.duration) + '</span>' : '') +
+      '</a>' +
+      '<div class="v-quick-acts' + ((wlOn || favOn) ? ' has-active' : '') + '">' +
+        '<button type="button" class="v-qbtn v-qbtn-wl' + (wlOn ? ' wl-on' : '') + '" title="' + (wlOn ? '移出稍后再看' : '加入稍后再看') + '" onclick="event.preventDefault();event.stopPropagation();toggleFeedVideoWl(' + idx + ')">' + SVG_CLOCK_SM + '</button>' +
+        '<button type="button" class="v-qbtn v-qbtn-fav' + (favOn ? ' fav-on' : '') + '" title="' + (favOn ? '取消收藏' : '加入收藏') + '" onclick="event.preventDefault();event.stopPropagation();toggleFeedVideoFav(' + idx + ')">' + SVG_STAR_LINE + '</button>' +
+      '</div>' +
+    '</div>' +
+    '<div class="v-body">' + avaHtml +
+      '<div class="v-meta-col">' +
+        '<a class="v-title" href="' + esc(v.url) + '" target="_blank" rel="noopener" title="' + esc(v.title) + '">' + esc(v.title) + '</a>' +
+        '<div class="v-author">' + esc(v.author || '') + '</div>' +
+        '<div class="v-stats">' + esc(statsStr) + '</div>' +
+        '<div class="v-foot">' +
+          (relTime ? '<span class="v-time-pill">' + esc(relTime) + '</span>' : '<span></span>') +
+          '<div class="v-act-row">' +
+            (hasSum ? '<button class="v-act-btn" onclick="openFeedSummaryModal(' + idx + ')">查看摘要</button>' : '') +
+            '<button class="v-act-btn primary" onclick="submitVideoFromFeed(' + idx + ')">' + (hasSum ? '重算' : '一键总结') + '</button>' +
+          '</div>' +
+        '</div>' +
+      '</div>' +
+    '</div>' +
+  '</article>';
 }
+
+function toggleFeedVideoWl(idx) {
+  const v = currentFeedVideos[idx];
+  if (v) toggleWatchLaterVideo(v);
+}
+function toggleFeedVideoFav(idx) {
+  const v = currentFeedVideos[idx];
+  if (v) toggleFavoriteVideo(v);
+}
+function syncFeedCardQuickStates(bvid) {
+  if (!bvid) return;
+  const wlOn = isWatchLater(bvid);
+  const favOn = isFavBvid(bvid);
+  document.querySelectorAll('#upFeedGrid .v-card[data-bvid="' + bvid.replace(/"/g, '') + '"]').forEach(card => {
+    const acts = card.querySelector('.v-quick-acts');
+    const wlB = card.querySelector('.v-qbtn-wl');
+    const favB = card.querySelector('.v-qbtn-fav');
+    if (acts) acts.classList.toggle('has-active', wlOn || favOn);
+    if (wlB) { wlB.classList.toggle('wl-on', wlOn); wlB.title = wlOn ? '移出稍后再看' : '加入稍后再看'; }
+    if (favB) { favB.classList.toggle('fav-on', favOn); favB.title = favOn ? '取消收藏' : '加入收藏'; }
+  });
+}
+
+function renderFeedFooter() {
+  const footer = document.getElementById('feedFooter');
+  if (!footer) return;
+  const count = currentFeedVideos.length;
+  if (!count) { footer.innerHTML = ''; return; }
+  const totalStr = feedPagination.total > count ? (' / 共约 ' + feedPagination.total + ' 条') : '';
+  if (feedPagination.loading) {
+    footer.innerHTML = '<button class="feed-load-btn" disabled>正在加载更早的视频...</button><div class="feed-meta-note">已加载 ' + count + ' 条' + totalStr + '</div>';
+  } else if (feedPagination.hasMore) {
+    footer.innerHTML = '<button class="feed-load-btn" onclick="loadMoreUpFeed()">加载更多历史视频</button><div class="feed-meta-note">向下滚动自动翻页 · 已加载 ' + count + ' 条' + totalStr + '</div>';
+  } else {
+    footer.innerHTML = '<div class="feed-meta-note">已加载全部 ' + count + ' 条公开视频</div>';
+  }
+}
+
+function renderFeedCards(vids, key) {
+  const grid = document.getElementById('upFeedGrid');
+  const sig = vids.length + ':' + (vids[0] ? vids[0].bvid : '') + ':' + (vids[vids.length - 1] ? vids[vids.length - 1].bvid : '');
+  currentFeedVideos = vids.slice();
+  if (key && lastRenderedFeedKey === key && lastRenderedFeedSig === sig && grid.children.length > 0) {
+    renderFeedFooter();
+    return;
+  }
+  lastRenderedFeedKey = key || '';
+  lastRenderedFeedSig = sig;
+  if (!vids.length) {
+    grid.innerHTML = '<div class="reader-card" style="grid-column:1/-1;text-align:center;color:var(--muted);padding:36px">暂未获取到公开视频</div>';
+    renderFeedFooter();
+    return;
+  }
+  grid.innerHTML = vids.map((v, idx) => buildFeedCardHtml(v, idx)).join('');
+  renderFeedFooter();
+}
+
+function appendFeedCards(newVids) {
+  const grid = document.getElementById('upFeedGrid');
+  if (!grid || !newVids.length) { renderFeedFooter(); return; }
+  const startIdx = currentFeedVideos.length;
+  currentFeedVideos.push(...newVids);
+  const html = newVids.map((v, i) => buildFeedCardHtml(v, startIdx + i)).join('');
+  grid.insertAdjacentHTML('beforeend', html);
+  lastRenderedFeedSig = currentFeedVideos.length + ':' + (currentFeedVideos[0] ? currentFeedVideos[0].bvid : '') + ':' + (currentFeedVideos[currentFeedVideos.length - 1] ? currentFeedVideos[currentFeedVideos.length - 1].bvid : '');
+  renderFeedFooter();
+}
+
+function buildUpFeedApiUrl(key, pn, forceRefresh) {
+  const qs = [];
+  if (String(key).startsWith('folder:')) {
+    const fid = String(key).slice(7);
+    const mids = (monitorConfig.up_list || []).filter(u => getUpTagIds(u.mid).includes(fid)).map(u => u.mid).join(',');
+    qs.push('mid=group');
+    qs.push('mids=' + encodeURIComponent(mids));
+  } else {
+    qs.push('mid=' + encodeURIComponent(key));
+  }
+  qs.push('pn=' + pn);
+  qs.push('ps=20');
+  if (forceRefresh) qs.push('refresh=1');
+  return '/api/up-videos?' + qs.join('&');
+}
+
 function prefetchTopUpsQuietly() {
   if (prefetchDone || !authUser) return;
   prefetchDone = true;
-  (monitorConfig.up_list || []).slice(0, 6).forEach((u, i) => {
+  (monitorConfig.up_list || []).slice(0, 5).forEach((u, i) => {
     const k = String(u.mid);
     const ex = readFeedCache(k);
     if (ex && (Date.now() - ex.ts) < FEED_CACHE_TTL_MS) return;
     setTimeout(() => {
       if (!authUser) return;
-      fetch('/api/up-videos?mid=' + encodeURIComponent(k) + '&ps=16', { headers: { 'Authorization': 'Bearer ' + getAuthToken() } })
-        .then(r => r.ok ? r.json() : null).then(d => { if (d && Array.isArray(d.videos)) writeFeedCache(k, d.videos); }).catch(() => {});
-    }, 600 + i * 350);
+      fetch('/api/up-videos?mid=' + encodeURIComponent(k) + '&pn=1&ps=20', { headers: { 'Authorization': 'Bearer ' + getAuthToken() } })
+        .then(r => r.ok ? r.json() : null)
+        .then(d => { if (d && Array.isArray(d.videos)) writeFeedCache(k, { videos: d.videos, pn: 1, hasMore: Boolean(d.has_more), total: d.total || 0 }); })
+        .catch(() => {});
+    }, 800 + i * 450);
   });
 }
+
 async function fetchUpFeed(mid, forceRefresh) {
   const key = String(mid || 'all');
+  if (key === '__watchlater') { renderSavedGrid('watchlater'); return; }
+  if (key === '__favorites') { renderSavedGrid('favorites'); return; }
+
   const grid = document.getElementById('upFeedGrid');
   const refBtn = document.getElementById('refreshFeedBtn');
   const cached = !forceRefresh ? readFeedCache(key) : null;
   const isFresh = cached && (Date.now() - cached.ts) < FEED_CACHE_TTL_MS;
+
   if (cached) {
-    renderFeedCards(cached.videos);
+    feedPagination = { key, pn: cached.pn || 1, hasMore: Boolean(cached.hasMore), loading: false, total: cached.total || 0 };
+    renderFeedCards(cached.videos, key);
     if (isFresh) { prefetchTopUpsQuietly(); return; }
   } else {
+    lastRenderedFeedKey = '';
+    lastRenderedFeedSig = '';
+    feedPagination = { key, pn: 1, hasMore: false, loading: true, total: 0 };
     grid.innerHTML = renderSkeletonGrid();
+    const footer = document.getElementById('feedFooter');
+    if (footer) footer.innerHTML = '';
   }
+
   if (refBtn && forceRefresh) { refBtn.disabled = true; refBtn.textContent = '刷新中...'; }
   try {
-    const r = await fetch('/api/up-videos?mid=' + encodeURIComponent(key) + '&ps=16' + (forceRefresh ? '&refresh=1' : ''), { headers: { 'Authorization': 'Bearer ' + getAuthToken() } });
+    const r = await fetch(buildUpFeedApiUrl(key, 1, forceRefresh), { headers: { 'Authorization': 'Bearer ' + getAuthToken() } });
     const d = await r.json();
-    if (!r.ok) { if (!cached) grid.innerHTML = '<div class="reader-card" style="grid-column:1/-1;color:var(--err-text)">拉取失败：' + esc(d.error || ('HTTP ' + r.status)) + '</div>'; return; }
+    if (!r.ok) {
+      feedPagination.loading = false;
+      if (!cached) grid.innerHTML = '<div class="reader-card" style="grid-column:1/-1;color:var(--err-text)">拉取失败：' + esc(d.error || ('HTTP ' + r.status)) + '</div>';
+      return;
+    }
     const vids = d.videos || [];
-    writeFeedCache(key, vids);
-    if (String(selectedUpMid || 'all') === key) renderFeedCards(vids);
-    if (forceRefresh) toast('动态已刷新（共 ' + vids.length + ' 条）');
+    const entry = { videos: vids, pn: 1, hasMore: Boolean(d.has_more), total: Number(d.total) || 0 };
+    writeFeedCache(key, entry);
+    if (String(selectedUpMid || 'all') === key) {
+      feedPagination = { key, pn: 1, hasMore: entry.hasMore, loading: false, total: entry.total };
+      renderFeedCards(vids, key);
+    }
+    if (forceRefresh) toast('动态已刷新（第 1 页共 ' + vids.length + ' 条）');
     prefetchTopUpsQuietly();
-  } catch (e) { if (!cached) grid.innerHTML = '<div class="reader-card" style="grid-column:1/-1;color:var(--err-text)">网络异常：' + esc(e.message) + '</div>'; }
-  finally { if (refBtn) { refBtn.disabled = false; refBtn.textContent = '刷新动态'; } }
+  } catch (e) {
+    feedPagination.loading = false;
+    if (!cached) grid.innerHTML = '<div class="reader-card" style="grid-column:1/-1;color:var(--err-text)">网络异常：' + esc(e.message) + '</div>';
+  } finally {
+    if (refBtn) { refBtn.disabled = false; refBtn.textContent = '刷新动态'; }
+  }
+}
+
+async function loadMoreUpFeed() {
+  const key = String(selectedUpMid || 'all');
+  if (key === '__watchlater' || key === '__favorites') return;
+  if (feedPagination.loading || !feedPagination.hasMore || feedPagination.key !== key) return;
+
+  const nextPn = (feedPagination.pn || 1) + 1;
+  feedPagination.loading = true;
+  renderFeedFooter();
+
+  try {
+    const r = await fetch(buildUpFeedApiUrl(key, nextPn, false), { headers: { 'Authorization': 'Bearer ' + getAuthToken() } });
+    const d = await r.json();
+    if (String(selectedUpMid || 'all') !== key) return;
+    if (!r.ok) {
+      feedPagination.loading = false;
+      renderFeedFooter();
+      toast('翻页加载失败：' + (d.error || ('HTTP ' + r.status)), true);
+      return;
+    }
+    const seen = new Set(currentFeedVideos.map(v => v.bvid));
+    const incoming = (d.videos || []).filter(v => v && v.bvid && !seen.has(v.bvid));
+    feedPagination.pn = nextPn;
+    feedPagination.hasMore = Boolean(d.has_more) && (incoming.length > 0 || (d.videos || []).length > 0);
+    feedPagination.loading = false;
+    if (d.total) feedPagination.total = Number(d.total);
+    appendFeedCards(incoming);
+    writeFeedCache(key, {
+      videos: currentFeedVideos.slice(),
+      pn: feedPagination.pn,
+      hasMore: feedPagination.hasMore,
+      total: feedPagination.total,
+    });
+  } catch (e) {
+    feedPagination.loading = false;
+    renderFeedFooter();
+    toast('加载更多失败：' + e.message, true);
+  }
 }
 
 function openFeedSummaryModal(idx) {
@@ -3891,13 +5005,16 @@ initTheme();
 initCustomSelects();
 applyUserPrefsToUi();
 initSliderObservers();
+initFeedInfiniteObserver();
 checkAuth();
+renderWorkspaceFolderBar();
 renderList();
 renderDashboard();
 const initJobs = getJobs();
 if (initJobs.length > 0) selectJob(initJobs[0].id);
 initJobs.forEach(j => { if (normStatus(j.status) === 'pending') startPolling(j.id); });
 syncFromR2();
+syncLibraryFromR2();
 requestAnimationFrame(() => updateAllSliders(true));
 </script>
 </body>
@@ -3921,6 +5038,8 @@ export default {
       if (path === '/api/monitor-config' && request.method === 'POST') return await handleSaveMonitorConfig(request, env);
       if (path === '/api/up-lookup' && request.method === 'GET') return await handleUpLookup(request, env);
       if (path === '/api/up-videos' && request.method === 'GET') return await handleGetUpVideos(request, env, ctx);
+      if (path === '/api/library' && request.method === 'GET') return await handleGetLibrary(request, env);
+      if (path === '/api/library' && request.method === 'POST') return await handleSaveLibrary(request, env);
       if (path === '/api/monitor-archive' && request.method === 'GET') return await handleGetMonitorArchive(request, env);
       if (path === '/api/monitor-archive' && request.method === 'POST') return await handlePostMonitorArchive(request, env);
       if (path === '/api/cron-trigger' && (request.method === 'POST' || request.method === 'GET')) return await handleCronTrigger(request, env);
