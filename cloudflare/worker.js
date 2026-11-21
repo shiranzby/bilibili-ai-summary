@@ -608,13 +608,29 @@ async function handleGetMonitorArchive(request, env) {
   return jsonResponse({ ok: true, videos });
 }
 
-async function handleGetUpVideos(request, env) {
+async function handleGetUpVideos(request, env, ctx) {
   const sess = await verifySessionToken(request, env);
   if (!sess) return errorResponse('需要登录管理员账号', 401);
 
   const reqUrl = new URL(request.url);
   const midParam = (reqUrl.searchParams.get('mid') || '').trim();
   const ps = Math.min(parseInt(reqUrl.searchParams.get('ps') || '16', 10) || 16, 30);
+  const forceRefresh = reqUrl.searchParams.get('refresh') === '1';
+
+  // Cloudflare Edge Cache (5 min TTL) for fast reloads unless ?refresh=1
+  const cache = typeof caches !== 'undefined' ? caches.default : null;
+  const cacheKeyUrl = new URL(reqUrl.origin + '/__cache/up-videos');
+  cacheKeyUrl.searchParams.set('mid', midParam);
+  cacheKeyUrl.searchParams.set('ps', String(ps));
+  const cacheReq = new Request(cacheKeyUrl.toString(), { method: 'GET' });
+  if (cache && !forceRefresh) {
+    const hit = await cache.match(cacheReq);
+    if (hit) {
+      const cloned = new Response(hit.body, hit);
+      cloned.headers.set('X-Feed-Cache', 'HIT');
+      return cloned;
+    }
+  }
 
   const proxyBase = (env.BILI_PROXY_URL || BILI_PROXY_DEF).replace(/\/+$/, '');
   const cfg = await readMonitorConfig(env);
@@ -647,7 +663,22 @@ async function handleGetUpVideos(request, env) {
     });
   };
 
-  // Support aggregated feed across all monitored UPs (mid=all)
+  const respondCached = (payload) => {
+    const resp = new Response(JSON.stringify(payload), {
+      status: 200,
+      headers: {
+        ...CORS_HEADERS,
+        'Content-Type': 'application/json; charset=utf-8',
+        'Cache-Control': 'public, max-age=300',
+        'X-Feed-Cache': 'MISS',
+      },
+    });
+    if (cache && ctx && payload.ok && Array.isArray(payload.videos) && payload.videos.length > 0) {
+      ctx.waitUntil(cache.put(cacheReq, resp.clone()));
+    }
+    return resp;
+  };
+
   if (midParam === 'all') {
     const ups = (cfg.up_list || []).slice(0, 12);
     const perUp = Math.max(4, Math.min(8, Math.ceil(24 / Math.max(1, ups.length))));
@@ -663,7 +694,7 @@ async function handleGetUpVideos(request, env) {
       })
     );
     const merged = results.flat().sort((a, b) => (b.created || 0) - (a.created || 0)).slice(0, 40);
-    return jsonResponse({ ok: true, mid: 'all', videos: merged });
+    return respondCached({ ok: true, mid: 'all', videos: merged, cached_at: nowISO() });
   }
 
   if (!/^\d+$/.test(midParam)) return errorResponse('无效的 UP 主 UID', 400);
@@ -673,7 +704,7 @@ async function handleGetUpVideos(request, env) {
     const r = await fetch(`${proxyBase}/api/bili-up?mid=${midNum}&pn=1&ps=${ps}`);
     const d = await r.json();
     const items = mapVlist(d?.data?.list?.vlist || [], midNum);
-    return jsonResponse({ ok: true, mid: midNum, videos: items, code: d.code });
+    return respondCached({ ok: true, mid: midNum, videos: items, code: d.code, cached_at: nowISO() });
   } catch (e) {
     const fallback = archive.filter(v => Number(v.mid) === midNum);
     return jsonResponse({ ok: true, mid: midNum, videos: fallback, warning: '实时列表拉取失败，仅显示历史归档: ' + e.message });
@@ -952,8 +983,40 @@ svg.ic{width:14px;height:14px;stroke:currentColor;fill:none;stroke-width:2;strok
 .ctrl{width:100%;height:38px;padding:0 12px;font-size:13px;border:1px solid var(--border);border-radius:9px;background:var(--surface);color:var(--text);outline:none;transition:border-color .15s,box-shadow .15s}
 .ctrl:focus{border-color:var(--brand);box-shadow:0 0 0 3px var(--brand-soft)}
 .ctrl::placeholder{color:var(--muted)}
-select.ctrl{appearance:none;-webkit-appearance:none;padding-right:32px;background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 24 24' fill='none' stroke='%239CA3AF' stroke-width='2.2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M6 9l6 6 6-6'/%3E%3C/svg%3E");background-repeat:no-repeat;background-position:right 11px center}
+select.ctrl{appearance:none;-webkit-appearance:none;padding-right:32px}
 textarea.ctrl{height:auto;min-height:78px;padding:9px 12px;resize:vertical;line-height:1.55}
+
+/* Custom Card-Style Select Dropdown (No Native Double-Arrow or Black Popup) */
+.c-select{position:relative;width:100%}
+.c-select-native{position:absolute;opacity:0;pointer-events:none;width:1px;height:1px}
+.c-select-btn{width:100%;height:38px;padding:0 12px;font-size:13px;border:1px solid var(--border);border-radius:9px;background:var(--surface);color:var(--text);display:flex;align-items:center;justify-content:space-between;gap:8px;text-align:left;transition:border-color .15s,box-shadow .15s,background .15s}
+.c-select-btn:hover{border-color:var(--border-strong);background:var(--surface-hover)}
+.c-select.open .c-select-btn{border-color:var(--brand);box-shadow:0 0 0 3px var(--brand-soft)}
+.c-select-label{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1;min-width:0}
+.c-select-chev{color:var(--muted);transition:transform .2s cubic-bezier(.22,1,.36,1);flex-shrink:0}
+.c-select.open .c-select-chev{transform:rotate(180deg);color:var(--brand-dark)}
+.c-select-menu{position:absolute;left:0;right:0;top:calc(100% + 6px);background:var(--surface);border:1px solid var(--border);border-radius:11px;box-shadow:var(--shadow-md);padding:5px;z-index:260;opacity:0;transform:translateY(-6px) scale(.98);pointer-events:none;transition:opacity .16s ease,transform .18s cubic-bezier(.22,1,.36,1);max-height:240px;overflow-y:auto}
+.c-select.open .c-select-menu{opacity:1;transform:translateY(0) scale(1);pointer-events:auto}
+.c-select.drop-up .c-select-menu{top:auto;bottom:calc(100% + 6px);transform:translateY(6px) scale(.98)}
+.c-select.drop-up.open .c-select-menu{transform:translateY(0) scale(1)}
+.c-select-opt{width:100%;border:none;background:transparent;padding:8px 10px;border-radius:7px;font-size:13px;color:var(--soft);display:flex;align-items:center;justify-content:space-between;gap:8px;text-align:left;transition:background .12s,color .12s}
+.c-select-opt:hover{background:var(--surface-2);color:var(--text)}
+.c-select-opt.selected{background:var(--brand-soft);color:var(--brand-dark);font-weight:600}
+.c-select-chk{opacity:0;flex-shrink:0}
+.c-select-opt.selected .c-select-chk{opacity:1}
+
+/* Animated Toggle Switch */
+.tog-switch{position:relative;display:inline-flex;align-items:center;width:40px;height:22px;flex-shrink:0;cursor:pointer}
+.tog-switch input{opacity:0;width:0;height:0;position:absolute}
+.tog-track{position:absolute;inset:0;background:var(--border-strong);border-radius:999px;transition:background .22s ease}
+.tog-thumb{position:absolute;left:3px;top:3px;width:16px;height:16px;border-radius:50%;background:#fff;box-shadow:0 1px 3px rgba(0,0,0,.22);transition:transform .24s cubic-bezier(.22,1,.36,1)}
+.tog-switch input:checked + .tog-track{background:var(--brand)}
+.tog-switch input:checked ~ .tog-thumb{transform:translateX(18px)}
+
+/* Panel & Sliding Pill Animations */
+@keyframes panelFadeIn{from{opacity:0;transform:translateY(5px)}to{opacity:1;transform:translateY(0)}}
+.anim-in{animation:panelFadeIn .22s cubic-bezier(.22,1,.36,1)}
+.seg-slider{position:absolute;top:3px;bottom:3px;left:0;border-radius:7px;background:var(--surface);box-shadow:var(--shadow-sm);z-index:0;pointer-events:none;transition:transform .26s cubic-bezier(.22,1,.36,1),width .26s cubic-bezier(.22,1,.36,1);will-change:transform,width}
 
 /* Layout */
 .app{display:grid;grid-template-columns:var(--sidebar-w,336px) 1px 1fr;height:100vh}
@@ -969,10 +1032,10 @@ textarea.ctrl{height:auto;min-height:78px;padding:9px 12px;resize:vertical;line-
 .brand-sub{font-size:11px;color:var(--muted);margin-top:1px}
 
 /* Top-Left Mode Switcher inside Sidebar */
-.side-switcher{display:grid;grid-template-columns:1fr 1fr;gap:4px;background:var(--surface-2);padding:3px;border-radius:10px;border:1px solid var(--border);margin-bottom:14px;flex-shrink:0}
-.side-sw-btn{border:none;background:transparent;height:32px;border-radius:7px;font-size:13px;font-weight:600;color:var(--soft);white-space:nowrap;transition:all .15s;display:inline-flex;align-items:center;justify-content:center;gap:5px}
+.side-switcher{position:relative;display:grid;grid-template-columns:1fr 1fr;gap:4px;background:var(--surface-2);padding:3px;border-radius:10px;border:1px solid var(--border);margin-bottom:14px;flex-shrink:0}
+.side-sw-btn{position:relative;z-index:1;border:none;background:transparent;height:32px;border-radius:7px;font-size:13px;font-weight:600;color:var(--soft);white-space:nowrap;transition:color .2s ease;display:inline-flex;align-items:center;justify-content:center;gap:5px}
 .side-sw-btn:hover{color:var(--text)}
-.side-sw-btn.active{background:var(--surface);color:var(--text);box-shadow:var(--shadow-sm)}
+.side-sw-btn.active{color:var(--text)}
 .side-pane{flex:1;min-height:0;display:flex;flex-direction:column;overflow:hidden}
 
 /* Submit Bar */
@@ -1104,10 +1167,10 @@ textarea.ctrl{height:auto;min-height:78px;padding:9px 12px;resize:vertical;line-
 
 /* View Tabs + Independent Action Buttons */
 .view-bar{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:14px;flex-wrap:wrap}
-.seg-tabs{display:inline-flex;background:var(--surface-2);padding:3px;border-radius:10px;border:1px solid var(--border)}
-.seg-tab{border:none;background:transparent;padding:6px 14px;border-radius:7px;font-size:13px;font-weight:600;color:var(--soft);white-space:nowrap;transition:all .15s}
+.seg-tabs{position:relative;display:inline-flex;background:var(--surface-2);padding:3px;border-radius:10px;border:1px solid var(--border)}
+.seg-tab{position:relative;z-index:1;border:none;background:transparent;padding:6px 14px;border-radius:7px;font-size:13px;font-weight:600;color:var(--soft);white-space:nowrap;transition:color .2s ease}
 .seg-tab:hover{color:var(--text)}
-.seg-tab.active{background:var(--surface);color:var(--text);box-shadow:var(--shadow-sm)}
+.seg-tab.active{color:var(--text)}
 .action-group{display:inline-flex;align-items:center;gap:8px;flex-wrap:wrap}
 .act-btn{display:inline-flex;align-items:center;gap:5px;height:33px;padding:0 12px;border:1px solid var(--border);border-radius:8px;background:var(--surface);color:var(--soft);font-size:12.5px;font-weight:600;white-space:nowrap;transition:border-color .15s,color .15s,background .15s}
 .act-btn:hover{border-color:var(--border-strong);color:var(--text);background:var(--surface-hover)}
@@ -1193,9 +1256,10 @@ textarea.ctrl{height:auto;min-height:78px;padding:9px 12px;resize:vertical;line-
 .btn-brand:hover{opacity:.92;border-color:transparent}
 
 /* Modal Form Sections */
-.m-tabs{display:inline-flex;gap:4px;margin-bottom:18px;background:var(--surface-2);padding:3px;border-radius:9px;border:1px solid var(--border)}
-.m-tab{border:none;background:transparent;padding:6px 14px;border-radius:7px;font-size:13px;font-weight:600;color:var(--soft);white-space:nowrap}
-.m-tab.active{background:var(--surface);color:var(--text);box-shadow:var(--shadow-sm)}
+.m-tabs{position:relative;display:inline-flex;gap:4px;margin-bottom:18px;background:var(--surface-2);padding:3px;border-radius:9px;border:1px solid var(--border)}
+.m-tab{position:relative;z-index:1;border:none;background:transparent;padding:6px 14px;border-radius:7px;font-size:13px;font-weight:600;color:var(--soft);white-space:nowrap;transition:color .2s ease}
+.m-tab:hover{color:var(--text)}
+.m-tab.active{color:var(--text)}
 .form-row{display:grid;grid-template-columns:1fr 1fr;gap:14px}
 .form-section{background:var(--bg);border:1px solid var(--border);border-radius:12px;padding:16px;margin-bottom:14px}
 .sec-head{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:12px;flex-wrap:wrap}
@@ -1271,6 +1335,7 @@ textarea.ctrl{height:auto;min-height:78px;padding:9px 12px;resize:vertical;line-
 
     <!-- Top-Left Sidebar Mode Switcher -->
     <div class="side-switcher" id="sideSwitcher">
+      <span class="seg-slider"></span>
       <button class="side-sw-btn active" data-page="workspace" onclick="switchPage('workspace')">单条摘要</button>
       <button class="side-sw-btn" data-page="monitor" onclick="switchPage('monitor')">UP主监控</button>
     </div>
@@ -1412,6 +1477,7 @@ textarea.ctrl{height:auto;min-height:78px;padding:9px 12px;resize:vertical;line-
 
             <div class="view-bar">
               <div class="seg-tabs" id="segTabs">
+                <span class="seg-slider"></span>
                 <button class="seg-tab active" data-mode="summary" onclick="setViewMode('summary')">AI 总结</button>
                 <button class="seg-tab" data-mode="transcript" onclick="setViewMode('transcript')">完整转录</button>
                 <button class="seg-tab" data-mode="split" onclick="setViewMode('split')">分栏对照</button>
@@ -1452,7 +1518,7 @@ textarea.ctrl{height:auto;min-height:78px;padding:9px 12px;resize:vertical;line-
               <p id="monSummaryLine">正在加载监控配置...</p>
             </div>
             <div class="mon-tb-actions">
-              <button class="btn" onclick="fetchUpFeed(selectedUpMid)">刷新动态</button>
+              <button class="btn" id="refreshFeedBtn" onclick="fetchUpFeed(selectedUpMid, true)">刷新动态</button>
               <button class="btn" onclick="openMonitorModal()">定时与样式设置</button>
               <button class="btn btn-primary" onclick="triggerMonitorNow('feedToast')">立即巡检</button>
             </div>
@@ -1529,7 +1595,8 @@ textarea.ctrl{height:auto;min-height:78px;padding:9px 12px;resize:vertical;line-
       </button>
     </div>
     <div class="modal-body">
-      <div class="m-tabs">
+      <div class="m-tabs" id="monitorTabs">
+        <span class="seg-slider"></span>
         <button class="m-tab active" data-mtab="schedule" onclick="switchMonitorTab('schedule')">定时与 UP 主监控</button>
         <button class="m-tab" data-mtab="email" onclick="switchMonitorTab('email')">邮件样式与实时预览</button>
       </div>
@@ -1542,7 +1609,11 @@ textarea.ctrl{height:auto;min-height:78px;padding:9px 12px;resize:vertical;line-
               <div style="font-size:13.5px;font-weight:700">启用自动定时监控</div>
               <div style="font-size:12px;color:var(--muted);margin-top:2px">开启后通过 Shy Cron 按设定时间自动触发 GitHub Actions 抓取新视频</div>
             </div>
-            <input type="checkbox" id="cfgEnabled" checked>
+            <label class="tog-switch">
+              <input type="checkbox" id="cfgEnabled" checked>
+              <span class="tog-track"></span>
+              <span class="tog-thumb"></span>
+            </label>
           </div>
         </div>
 
@@ -1675,7 +1746,11 @@ textarea.ctrl{height:auto;min-height:78px;padding:9px 12px;resize:vertical;line-
           <div class="form-row">
             <div class="switch-row" style="height:38px;padding:0 12px;background:var(--surface);border:1px solid var(--border);border-radius:9px">
               <span style="font-size:12.5px;font-weight:600">多 UP 主合并为同一封日报</span>
-              <input type="checkbox" id="cfgMergeEmails" checked onchange="renderEmailPreview()">
+              <label class="tog-switch">
+                <input type="checkbox" id="cfgMergeEmails" checked onchange="renderEmailPreview()">
+                <span class="tog-track"></span>
+                <span class="tog-thumb"></span>
+              </label>
             </div>
             <div class="field">
               <input class="ctrl" id="cfgSmtpTo" type="email" placeholder="自定义收件邮箱（留空用默认 Secret）">
@@ -1827,6 +1902,121 @@ function onTplPreset() {
   document.getElementById('customTplWrap').classList.toggle('hidden', v !== 'custom');
 }
 
+// ── Smooth Sliding Pill Indicator & Micro-Fade Helper ──
+function moveSlider(containerId, instant) {
+  const box = document.getElementById(containerId);
+  if (!box) return;
+  const slider = box.querySelector('.seg-slider');
+  const active = box.querySelector('.active');
+  if (!slider || !active || active.offsetWidth === 0) return;
+  if (instant) {
+    const prev = slider.style.transition;
+    slider.style.transition = 'none';
+    slider.style.width = active.offsetWidth + 'px';
+    slider.style.transform = 'translateX(' + active.offsetLeft + 'px)';
+    slider.offsetHeight; // force reflow
+    slider.style.transition = prev || '';
+  } else {
+    slider.style.width = active.offsetWidth + 'px';
+    slider.style.transform = 'translateX(' + active.offsetLeft + 'px)';
+  }
+}
+
+function updateAllSliders(instant) {
+  ['sideSwitcher', 'segTabs', 'monitorTabs'].forEach(id => moveSlider(id, instant));
+}
+
+function playAnim(el) {
+  if (!el) return;
+  el.classList.remove('anim-in');
+  void el.offsetWidth;
+  el.classList.add('anim-in');
+}
+
+window.addEventListener('resize', () => updateAllSliders(true));
+
+// ── Custom Card-Style Select Dropdown Engine ──
+const SVG_CHEV = '<svg class="ic c-select-chev" viewBox="0 0 24 24"><path d="M6 9l6 6 6-6"/></svg>';
+const SVG_CHK = '<svg class="ic c-select-chk" viewBox="0 0 24 24"><polyline points="20 6 9 17 4 12"/></svg>';
+
+function closeAllCustomSelects(exceptWrap) {
+  document.querySelectorAll('.c-select.open').forEach(w => {
+    if (w !== exceptWrap) w.classList.remove('open', 'drop-up');
+  });
+}
+
+function syncCustomSelect(sel) {
+  if (typeof sel === 'string') sel = document.getElementById(sel);
+  if (!sel || !sel._csWrap) return;
+  const wrap = sel._csWrap;
+  const opt = sel.options[sel.selectedIndex] || sel.options[0];
+  wrap.querySelector('.c-select-label').textContent = opt ? opt.textContent : '';
+  wrap.querySelectorAll('.c-select-opt').forEach(btn => {
+    btn.classList.toggle('selected', btn.dataset.val === sel.value);
+  });
+}
+
+function syncAllCustomSelects() {
+  document.querySelectorAll('select.c-select-native').forEach(syncCustomSelect);
+}
+
+function initCustomSelects() {
+  document.querySelectorAll('select.ctrl').forEach(sel => {
+    if (sel._csWrap) return;
+    const wrap = document.createElement('div');
+    wrap.className = 'c-select';
+    sel.parentNode.insertBefore(wrap, sel);
+    sel.classList.add('c-select-native');
+    wrap.appendChild(sel);
+
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'c-select-btn';
+    btn.innerHTML = '<span class="c-select-label"></span>' + SVG_CHEV;
+
+    const menu = document.createElement('div');
+    menu.className = 'c-select-menu';
+
+    Array.from(sel.options).forEach(o => {
+      const item = document.createElement('button');
+      item.type = 'button';
+      item.className = 'c-select-opt';
+      item.dataset.val = o.value;
+      item.innerHTML = '<span>' + esc(o.textContent) + '</span>' + SVG_CHK;
+      item.addEventListener('click', (e) => {
+        e.stopPropagation();
+        sel.value = o.value;
+        syncCustomSelect(sel);
+        wrap.classList.remove('open', 'drop-up');
+        sel.dispatchEvent(new Event('change', { bubbles: true }));
+      });
+      menu.appendChild(item);
+    });
+
+    btn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      const willOpen = !wrap.classList.contains('open');
+      closeAllCustomSelects(wrap);
+      if (willOpen) {
+        const rect = btn.getBoundingClientRect();
+        const spaceBelow = window.innerHeight - rect.bottom;
+        wrap.classList.toggle('drop-up', spaceBelow < 210);
+        wrap.classList.add('open');
+      } else {
+        wrap.classList.remove('open', 'drop-up');
+      }
+    });
+
+    wrap.appendChild(btn);
+    wrap.appendChild(menu);
+    sel._csWrap = wrap;
+    syncCustomSelect(sel);
+  });
+}
+
+document.addEventListener('click', () => closeAllCustomSelects(null));
+document.addEventListener('keydown', (e) => { if (e.key === 'Escape') closeAllCustomSelects(null); });
+
 // ── Top-Left Sidebar Switcher (Single Video vs UP Monitor) ──
 async function switchPage(page) {
   if (page === 'monitor' && !authUser) {
@@ -1836,15 +2026,23 @@ async function switchPage(page) {
   }
   currentPage = page;
   document.querySelectorAll('#sideSwitcher .side-sw-btn').forEach(b => b.classList.toggle('active', b.dataset.page === page));
-  document.getElementById('sidebarWorkspace').classList.toggle('hidden', page !== 'workspace');
-  document.getElementById('sidebarMonitor').classList.toggle('hidden', page !== 'monitor');
-  document.getElementById('pageWorkspace').classList.toggle('hidden', page !== 'workspace');
-  document.getElementById('pageMonitor').classList.toggle('hidden', page !== 'monitor');
+  moveSlider('sideSwitcher');
+  const sbWs = document.getElementById('sidebarWorkspace');
+  const sbMon = document.getElementById('sidebarMonitor');
+  const pgWs = document.getElementById('pageWorkspace');
+  const pgMon = document.getElementById('pageMonitor');
+  sbWs.classList.toggle('hidden', page !== 'workspace');
+  sbMon.classList.toggle('hidden', page !== 'monitor');
+  pgWs.classList.toggle('hidden', page !== 'workspace');
+  pgMon.classList.toggle('hidden', page !== 'monitor');
+  playAnim(page === 'workspace' ? sbWs : sbMon);
+  playAnim(page === 'workspace' ? pgWs : pgMon);
   document.getElementById('contentInner').classList.toggle('wide-feed', page === 'monitor');
 
   if (page === 'workspace') {
     document.getElementById('topbarTitle').textContent = '单条视频摘要';
     document.getElementById('topbarSub').textContent = '';
+    requestAnimationFrame(() => moveSlider('segTabs', true));
   } else {
     document.getElementById('topbarTitle').textContent = 'UP主监控动态';
     await loadMonitorPage();
@@ -2273,7 +2471,9 @@ function renderDetail(job) {
 function setViewMode(mode) {
   viewMode = mode;
   document.querySelectorAll('#segTabs .seg-tab').forEach(b => b.classList.toggle('active', b.dataset.mode === mode));
+  moveSlider('segTabs');
   applyViewMode();
+  playAnim(document.getElementById('readerGrid'));
 }
 
 function applyViewMode() {
@@ -2285,6 +2485,7 @@ function applyViewMode() {
   sp.classList.toggle('hidden', viewMode === 'transcript');
   tp.classList.toggle('hidden', viewMode === 'summary');
   spLbl.classList.toggle('hidden', viewMode !== 'split');
+  requestAnimationFrame(() => moveSlider('segTabs', true));
 }
 
 function copyCurrent() {
@@ -2357,6 +2558,7 @@ async function openMonitorEntry() {
 
 async function openMonitorModal() {
   openModal('monitorModal');
+  requestAnimationFrame(() => moveSlider('monitorTabs', true));
   await loadMonitorConfig();
 }
 
@@ -2499,6 +2701,7 @@ async function quickAddMonitorUp() {
       if (sr.ok && sd.config) monitorConfig = sd.config;
     }
     inp.value = '';
+    clearFeedCache('all');
     updateMonitorHeaderSummary();
     renderUpSidebar();
     showToast('sideUpToast', '已添加监控：' + (d.name || d.mid), 'ok');
@@ -2524,6 +2727,8 @@ async function quickRemoveMonitorUp(mid) {
     const sd = await sr.json();
     if (sr.ok && sd.config) monitorConfig = sd.config;
     if (String(selectedUpMid) === String(mid)) selectedUpMid = 'all';
+    clearFeedCache('all');
+    clearFeedCache(mid);
     updateMonitorHeaderSummary();
     renderUpSidebar();
     await selectMonitorUp(selectedUpMid);
@@ -2532,61 +2737,161 @@ async function quickRemoveMonitorUp(mid) {
   }
 }
 
-async function fetchUpFeed(mid) {
-  const grid = document.getElementById('upFeedGrid');
-  grid.innerHTML = '<div class="reader-card" style="grid-column:1/-1;text-align:center;color:var(--muted);padding:36px">正在加载视频封面与最新动态...</div>';
+// ── Multi-Layer UP Feed Cache (Memory + sessionStorage, 10 min TTL) ──
+const SS_FEED_CACHE = 'bilisum_up_feed_cache_v1';
+const FEED_CACHE_TTL_MS = 10 * 60 * 1000;
+const feedMemCache = new Map();
+let prefetchDone = false;
+
+function readFeedCache(key) {
+  const k = String(key || 'all');
+  if (feedMemCache.has(k)) return feedMemCache.get(k);
   try {
-    const r = await fetch('/api/up-videos?mid=' + encodeURIComponent(mid || 'all') + '&ps=16', {
-      headers: { 'Authorization': 'Bearer ' + getAuthToken() },
-    });
-    const d = await r.json();
-    if (!r.ok) {
-      grid.innerHTML = '<div class="reader-card" style="grid-column:1/-1;color:var(--err-text)">拉取失败：' + esc(d.error || ('HTTP ' + r.status)) + '</div>';
-      return;
+    const store = JSON.parse(sessionStorage.getItem(SS_FEED_CACHE) || '{}');
+    if (store[k] && Array.isArray(store[k].videos)) {
+      feedMemCache.set(k, store[k]);
+      return store[k];
     }
-    const vids = d.videos || [];
-    currentFeedVideos = vids;
-    if (!vids.length) {
-      grid.innerHTML = '<div class="reader-card" style="grid-column:1/-1;text-align:center;color:var(--muted);padding:36px">暂未获取到公开视频</div>';
-      return;
+  } catch {}
+  return null;
+}
+
+function writeFeedCache(key, videos) {
+  const k = String(key || 'all');
+  const entry = { videos, ts: Date.now() };
+  feedMemCache.set(k, entry);
+  try {
+    const store = JSON.parse(sessionStorage.getItem(SS_FEED_CACHE) || '{}');
+    store[k] = entry;
+    // Keep up to 25 cached UP entries in sessionStorage
+    const keys = Object.keys(store);
+    if (keys.length > 25) {
+      keys.sort((a, b) => (store[a].ts || 0) - (store[b].ts || 0));
+      keys.slice(0, keys.length - 25).forEach(old => delete store[old]);
     }
+    sessionStorage.setItem(SS_FEED_CACHE, JSON.stringify(store));
+  } catch {}
+}
 
-    grid.innerHTML = vids.map((v, idx) => {
-      const coverUrl = v.pic ? (v.pic.replace(/^http:\/\//, 'https://') + '@672w_378h_1c.webp') : '';
-      const faceUrl = v.face ? (v.face.replace(/^http:\/\//, 'https://') + '@96w_96h_1c.webp') : '';
-      const hasSum = Boolean(v.summary);
-      const statsStr = [fmtCount(v.play), fmtDanmaku(v.danmaku)].join(' · ');
-      const relTime = fmtRelativeTime(v.created);
+function clearFeedCache(key) {
+  if (key) {
+    feedMemCache.delete(String(key));
+  } else {
+    feedMemCache.clear();
+  }
+  try {
+    if (key) {
+      const store = JSON.parse(sessionStorage.getItem(SS_FEED_CACHE) || '{}');
+      delete store[String(key)];
+      sessionStorage.setItem(SS_FEED_CACHE, JSON.stringify(store));
+    } else {
+      sessionStorage.removeItem(SS_FEED_CACHE);
+    }
+  } catch {}
+}
 
-      const avaHtml = faceUrl
-        ? '<img class="v-ava" src="' + esc(faceUrl) + '" referrerpolicy="no-referrer" alt="">'
-        : '<div class="v-ava-fb">' + esc((v.author || 'UP').slice(0, 1)) + '</div>';
+function renderFeedCards(vids) {
+  const grid = document.getElementById('upFeedGrid');
+  currentFeedVideos = vids;
+  if (!vids.length) {
+    grid.innerHTML = '<div class="reader-card" style="grid-column:1/-1;text-align:center;color:var(--muted);padding:36px">暂未获取到公开视频</div>';
+    return;
+  }
+  grid.innerHTML = vids.map((v, idx) => {
+    const coverUrl = v.pic ? (v.pic.replace(/^http:\/\//, 'https://') + '@672w_378h_1c.webp') : '';
+    const faceUrl = v.face ? (v.face.replace(/^http:\/\//, 'https://') + '@96w_96h_1c.webp') : '';
+    const hasSum = Boolean(v.summary);
+    const statsStr = [fmtCount(v.play), fmtDanmaku(v.danmaku)].join(' · ');
+    const relTime = fmtRelativeTime(v.created);
 
-      return '<article class="v-card">' +
-        '<a class="v-thumb-link" href="' + esc(v.url) + '" target="_blank" rel="noopener">' +
-          (coverUrl ? '<img src="' + esc(coverUrl) + '" referrerpolicy="no-referrer" loading="lazy" alt="">' : '') +
-          (hasSum ? '<span class="v-sum-badge">已有摘要</span>' : '') +
-          (v.duration ? '<span class="v-dur">' + esc(v.duration) + '</span>' : '') +
-        '</a>' +
-        '<div class="v-body">' +
-          avaHtml +
-          '<div class="v-meta-col">' +
-            '<a class="v-title" href="' + esc(v.url) + '" target="_blank" rel="noopener" title="' + esc(v.title) + '">' + esc(v.title) + '</a>' +
-            '<div class="v-author">' + esc(v.author || '') + '</div>' +
-            '<div class="v-stats">' + esc(statsStr) + '</div>' +
-            '<div class="v-foot">' +
-              (relTime ? '<span class="v-time-pill">' + esc(relTime) + '</span>' : '<span></span>') +
-              '<div class="v-act-row">' +
-                (hasSum ? '<button class="v-act-btn" onclick="openFeedSummaryModal(' + idx + ')">查看摘要</button>' : '') +
-                '<button class="v-act-btn primary" onclick="submitVideo(\'' + esc(v.bvid) + '\')">' + (hasSum ? '重算' : '一键总结') + '</button>' +
-              '</div>' +
+    const avaHtml = faceUrl
+      ? '<img class="v-ava" src="' + esc(faceUrl) + '" referrerpolicy="no-referrer" alt="">'
+      : '<div class="v-ava-fb">' + esc((v.author || 'UP').slice(0, 1)) + '</div>';
+
+    return '<article class="v-card">' +
+      '<a class="v-thumb-link" href="' + esc(v.url) + '" target="_blank" rel="noopener">' +
+        (coverUrl ? '<img src="' + esc(coverUrl) + '" referrerpolicy="no-referrer" loading="lazy" alt="">' : '') +
+        (hasSum ? '<span class="v-sum-badge">已有摘要</span>' : '') +
+        (v.duration ? '<span class="v-dur">' + esc(v.duration) + '</span>' : '') +
+      '</a>' +
+      '<div class="v-body">' +
+        avaHtml +
+        '<div class="v-meta-col">' +
+          '<a class="v-title" href="' + esc(v.url) + '" target="_blank" rel="noopener" title="' + esc(v.title) + '">' + esc(v.title) + '</a>' +
+          '<div class="v-author">' + esc(v.author || '') + '</div>' +
+          '<div class="v-stats">' + esc(statsStr) + '</div>' +
+          '<div class="v-foot">' +
+            (relTime ? '<span class="v-time-pill">' + esc(relTime) + '</span>' : '<span></span>') +
+            '<div class="v-act-row">' +
+              (hasSum ? '<button class="v-act-btn" onclick="openFeedSummaryModal(' + idx + ')">查看摘要</button>' : '') +
+              '<button class="v-act-btn primary" onclick="submitVideo(\'' + esc(v.bvid) + '\')">' + (hasSum ? '重算' : '一键总结') + '</button>' +
             '</div>' +
           '</div>' +
         '</div>' +
-      '</article>';
-    }).join('');
+      '</div>' +
+    '</article>';
+  }).join('');
+  playAnim(grid);
+}
+
+function prefetchTopUpsQuietly() {
+  if (prefetchDone || !authUser) return;
+  prefetchDone = true;
+  const ups = (monitorConfig.up_list || []).slice(0, 6);
+  ups.forEach((u, i) => {
+    const k = String(u.mid);
+    const existing = readFeedCache(k);
+    if (existing && (Date.now() - existing.ts) < FEED_CACHE_TTL_MS) return;
+    setTimeout(() => {
+      if (!authUser) return;
+      fetch('/api/up-videos?mid=' + encodeURIComponent(k) + '&ps=16', {
+        headers: { 'Authorization': 'Bearer ' + getAuthToken() },
+      }).then(r => r.ok ? r.json() : null).then(d => {
+        if (d && Array.isArray(d.videos)) writeFeedCache(k, d.videos);
+      }).catch(() => {});
+    }, 600 + i * 350);
+  });
+}
+
+async function fetchUpFeed(mid, forceRefresh) {
+  const key = String(mid || 'all');
+  const grid = document.getElementById('upFeedGrid');
+  const refBtn = document.getElementById('refreshFeedBtn');
+  const cached = !forceRefresh ? readFeedCache(key) : null;
+  const isFresh = cached && (Date.now() - cached.ts) < FEED_CACHE_TTL_MS;
+
+  // Instant 0ms render if cached
+  if (cached) {
+    renderFeedCards(cached.videos);
+    if (isFresh) {
+      prefetchTopUpsQuietly();
+      return;
+    }
+  } else {
+    grid.innerHTML = '<div class="reader-card" style="grid-column:1/-1;text-align:center;color:var(--muted);padding:36px">正在加载视频封面与最新动态...</div>';
+  }
+
+  if (refBtn && forceRefresh) { refBtn.disabled = true; refBtn.textContent = '刷新中...'; }
+  try {
+    const url = '/api/up-videos?mid=' + encodeURIComponent(key) + '&ps=16' + (forceRefresh ? '&refresh=1' : '');
+    const r = await fetch(url, { headers: { 'Authorization': 'Bearer ' + getAuthToken() } });
+    const d = await r.json();
+    if (!r.ok) {
+      if (!cached) grid.innerHTML = '<div class="reader-card" style="grid-column:1/-1;color:var(--err-text)">拉取失败：' + esc(d.error || ('HTTP ' + r.status)) + '</div>';
+      return;
+    }
+    const vids = d.videos || [];
+    writeFeedCache(key, vids);
+    // Only overwrite grid if user is still viewing this same UP
+    if (String(selectedUpMid || 'all') === key) {
+      renderFeedCards(vids);
+    }
+    if (forceRefresh) showToast('feedToast', '动态已刷新（共 ' + vids.length + ' 条）', 'ok');
+    prefetchTopUpsQuietly();
   } catch (e) {
-    grid.innerHTML = '<div class="reader-card" style="grid-column:1/-1;color:var(--err-text)">网络异常：' + esc(e.message) + '</div>';
+    if (!cached) grid.innerHTML = '<div class="reader-card" style="grid-column:1/-1;color:var(--err-text)">网络异常：' + esc(e.message) + '</div>';
+  } finally {
+    if (refBtn) { refBtn.disabled = false; refBtn.textContent = '刷新动态'; }
   }
 }
 
@@ -2610,9 +2915,13 @@ function copyModalSummary() {
 
 // ── Monitor Settings Modal Logic ──
 function switchMonitorTab(tab) {
-  document.querySelectorAll('.m-tab').forEach(b => b.classList.toggle('active', b.dataset.mtab === tab));
-  document.getElementById('mTabSchedule').classList.toggle('hidden', tab !== 'schedule');
-  document.getElementById('mTabEmail').classList.toggle('hidden', tab !== 'email');
+  document.querySelectorAll('#monitorTabs .m-tab').forEach(b => b.classList.toggle('active', b.dataset.mtab === tab));
+  moveSlider('monitorTabs');
+  const sEl = document.getElementById('mTabSchedule');
+  const eEl = document.getElementById('mTabEmail');
+  sEl.classList.toggle('hidden', tab !== 'schedule');
+  eEl.classList.toggle('hidden', tab !== 'email');
+  playAnim(tab === 'schedule' ? sEl : eEl);
   if (tab === 'email') renderEmailPreview();
 }
 
@@ -2636,10 +2945,12 @@ function hydrateMonitorForm() {
   document.getElementById('cfgMaxVideos').value = String(monitorConfig.max_videos_per_run || 5);
   document.getElementById('cfgMergeEmails').checked = monitorConfig.merge_emails !== false;
   document.getElementById('cfgSmtpTo').value = monitorConfig.smtp_to || '';
+  syncAllCustomSelects();
   onScheduleModeChange();
   renderTimeChips();
   renderUpChips();
   selectEmailStyle(monitorConfig.email_style || 'editorial');
+  requestAnimationFrame(() => moveSlider('monitorTabs', true));
 
   const syncEl = document.getElementById('cronSyncStatus');
   if (monitorConfig.last_cron_sync) {
@@ -2880,12 +3191,14 @@ async function triggerMonitorNow(toastId) {
 
 // ── Init ──
 initTheme();
+initCustomSelects();
 checkAuth();
 renderList();
 const initJobs = getJobs();
 if (initJobs.length > 0) selectJob(initJobs[0].id);
 initJobs.forEach(j => { if (normStatus(j.status) === 'pending') startPolling(j.id); });
 syncFromR2();
+requestAnimationFrame(() => updateAllSliders(true));
 </script>
 </body>
 </html>`;
@@ -2907,7 +3220,7 @@ export default {
       if (path === '/api/monitor-config' && request.method === 'GET') return await handleGetMonitorConfig(request, env);
       if (path === '/api/monitor-config' && request.method === 'POST') return await handleSaveMonitorConfig(request, env);
       if (path === '/api/up-lookup' && request.method === 'GET') return await handleUpLookup(request, env);
-      if (path === '/api/up-videos' && request.method === 'GET') return await handleGetUpVideos(request, env);
+      if (path === '/api/up-videos' && request.method === 'GET') return await handleGetUpVideos(request, env, ctx);
       if (path === '/api/monitor-archive' && request.method === 'GET') return await handleGetMonitorArchive(request, env);
       if (path === '/api/monitor-archive' && request.method === 'POST') return await handlePostMonitorArchive(request, env);
       if (path === '/api/cron-trigger' && (request.method === 'POST' || request.method === 'GET')) return await handleCronTrigger(request, env);
