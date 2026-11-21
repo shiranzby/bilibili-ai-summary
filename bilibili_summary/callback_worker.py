@@ -24,6 +24,9 @@ def callback(result_file: str, job_id: str, worker_url: str):
         "owner": data.get("owner", ""),
         "pubdate": data.get("pubdate"),
         "duration": data.get("duration", ""),
+        "error": data.get("error", ""),
+        "error_stage": data.get("error_stage", ""),
+        "error_hint": data.get("error_hint", ""),
         "timings": data.get("timings", {}),
     })
 

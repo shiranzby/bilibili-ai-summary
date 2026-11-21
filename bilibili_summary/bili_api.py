@@ -260,22 +260,48 @@ def get_up_video_list(mid: int, page: int = 1, page_size: int = 30) -> Optional[
     return None
 
 
+def _video_id_params(vid: str) -> dict:
+    """兼容 BV 号与 av 号 (如 av117258412104418 → {'aid': '117258412104418'})"""
+    s = (vid or "").strip()
+    if s.lower().startswith("av") and s[2:].isdigit():
+        return {"aid": s[2:]}
+    return {"bvid": s}
+
+
+def explain_bili_code(code, message: str = "") -> str:
+    """将常见 B 站错误码转换为人类可读的排查提示"""
+    mapping = {
+        -400: "请求参数无效（请检查 BV/av 号格式是否正确）",
+        -404: "视频不存在、已被 UP 主删除或下架",
+        -412: "出口 IP 触发 B 站风控拦截 (-412)，需要通过中继或更换 IP 重试",
+        -352: "触发 B 站安全校验 (-352)，需补充 WBI/buvid3 或 Cookie",
+        62002: "稿件不可见（可能为私密/审核中/仅粉丝可见）",
+        62004: "稿件审核中，暂无法访问",
+        -10403: "视频存在地区/版权限制，当前节点无法访问",
+    }
+    if code in mapping:
+        return mapping[code]
+    return f"B站接口返回 code={code} ({message or '未知错误'})"
+
+
 def get_video_info(bvid: str) -> Optional[dict]:
     """
-    获取视频详细信息 (直连 wbi/view → 直连 view → Vercel中继兜底)
+    获取视频详细信息 (兼容 BV 号与 av 号; 直连 wbi/view → 直连 view → Vercel中继兜底)
     """
+    id_params = _video_id_params(bvid)
+
     # 1. 直连 x/web-interface/wbi/view (带真实 WBI + buvid3)
     try:
         resp = requests.get(
             "https://api.bilibili.com/x/web-interface/wbi/view",
-            params=_sign_wbi({"bvid": bvid}),
+            params=_sign_wbi(dict(id_params)),
             headers=_make_headers(mobile=False),
             timeout=TIMEOUT,
         )
         data = resp.json()
         if data.get("code") == 0 and data.get("data"):
             return data.get("data")
-        err_msg = f"{data.get('message')} (code={data.get('code')})"
+        err_msg = explain_bili_code(data.get("code"), data.get("message", ""))
     except Exception as e:
         err_msg = str(e)
 
@@ -283,26 +309,27 @@ def get_video_info(bvid: str) -> Optional[dict]:
     try:
         resp2 = requests.get(
             "https://api.bilibili.com/x/web-interface/view",
-            params={"bvid": bvid},
+            params=dict(id_params),
             headers=_make_headers(mobile=True),
             timeout=TIMEOUT,
         )
         data2 = resp2.json()
         if data2.get("code") == 0 and data2.get("data"):
             return data2.get("data")
-        err_msg = f"{data2.get('message')} (code={data2.get('code')})"
+        err_msg = explain_bili_code(data2.get("code"), data2.get("message", ""))
     except Exception as e2:
         err_msg = str(e2)
 
     print(f"  [B站API] 直连获取视频{bvid}信息失败: {err_msg}，尝试中继...")
 
-    # 3. Vercel 中继兜底 (同时缓存 cid 和 audio_urls 供音频模块复用)
-    bundle = fetch_video_bundle_from_proxy(bvid)
-    if bundle and bundle.get("info"):
-        print(f"  [B站中继] ✅ 获取视频{bvid}信息成功")
-        return bundle["info"]
+    # 3. Vercel 中继兜底 (仅 BV 号走中继，av 号若直连失败通常为视频不存在)
+    if "bvid" in id_params:
+        bundle = fetch_video_bundle_from_proxy(bvid)
+        if bundle and bundle.get("info"):
+            print(f"  [B站中继] ✅ 获取视频{bvid}信息成功")
+            return bundle["info"]
 
-    print(f"  [B站API] ❌ 获取视频{bvid}信息彻底失败")
+    print(f"  [B站API] ❌ 获取视频{bvid}信息彻底失败: {err_msg}")
     return None
 
 

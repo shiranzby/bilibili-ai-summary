@@ -23,7 +23,7 @@ from config import (
     SILICONFLOW_STT_MODEL,
     SILICONFLOW_SUMMARY_MODEL,
 )
-from audio_transcriber import get_text_from_audio
+from audio_transcriber import get_text_from_audio, get_last_diagnostics
 from bili_api import get_video_info, format_duration
 from summarizer import summarize_subtitle
 
@@ -58,6 +58,8 @@ def process(bvid: str, job_id: str = "", summary_template: str = "") -> dict:
         "summary": None,
         "transcript": "",
         "error": "",
+        "error_stage": "",
+        "error_hint": "",
         "timings": {},
         "video_url": f"https://www.bilibili.com/video/{bvid}",
     }
@@ -74,13 +76,18 @@ def process(bvid: str, job_id: str = "", summary_template: str = "") -> dict:
     result["timings"]["stt"] = t_stt
 
     if not audio_text:
+        diag = get_last_diagnostics()
         desc = ((info or {}).get("desc") or "").strip()
         if desc and len(desc) > 20:
             print(f"[处理] ⚠ 语音识别失败，回退使用视频描述 ({len(desc)} 字符)", file=sys.stderr)
             audio_text = f"[视频描述] {desc[:3000]}"
+            result["error_stage"] = diag.get("stage", "")
+            result["error_hint"] = f"语音提取未成功（{diag.get('error') or '未知原因'}），已自动回退为视频简介生成摘要"
         else:
             result["status"] = "failed"
-            result["error"] = "语音识别失败且无可用视频描述"
+            result["error_stage"] = diag.get("stage") or ("video_info" if not info else "stt")
+            result["error"] = diag.get("error") or ("无法获取视频信息（视频可能不存在、已删除或不可见）" if not info else "语音识别失败且无可用视频描述")
+            result["error_hint"] = diag.get("hint") or "请检查视频链接是否有效、是否为公开非充电专属视频，或稍后重试"
             result["timings"]["total"] = round(time.time() - t0, 1)
             return result
 

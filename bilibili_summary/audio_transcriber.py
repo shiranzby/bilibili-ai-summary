@@ -20,9 +20,23 @@ from typing import Optional
 from bili_api import (
     _make_headers,
     _sign_wbi,
+    _video_id_params,
     fetch_video_bundle_from_proxy,
     get_bili_proxy_url,
 )
+
+# 记录最近一次语音提取的结构化故障诊断信息，便于上游精准回报原因
+_last_diag = {"stage": "", "error": "", "hint": ""}
+
+
+def get_last_diagnostics() -> dict:
+    return dict(_last_diag)
+
+
+def _set_diag(stage: str, error: str, hint: str):
+    _last_diag["stage"] = stage
+    _last_diag["error"] = error
+    _last_diag["hint"] = hint
 
 # 仅保留 100% 免费模型，杜绝意外扣费
 FREE_SILICONFLOW_STT_MODEL = "FunAudioLLM/SenseVoiceSmall"
@@ -47,17 +61,18 @@ def _extract_sorted_audio_urls(dash: dict) -> list:
 
 
 def get_cid(bvid: str) -> Optional[int]:
-    """获取视频第一P的 cid (直连 → pagelist → 中继兜底)"""
-    # 先看中继缓存里是否已有
-    bundle = fetch_video_bundle_from_proxy(bvid) if _has_proxy_cache(bvid) else None
-    if bundle and bundle.get("cid"):
-        return bundle["cid"]
+    """获取视频第一P的 cid (兼容 BV/av; 直连 → pagelist → 中继兜底)"""
+    id_params = _video_id_params(bvid)
+    if "bvid" in id_params and _has_proxy_cache(bvid):
+        bundle = fetch_video_bundle_from_proxy(bvid)
+        if bundle and bundle.get("cid"):
+            return bundle["cid"]
 
     # 1. 直连 x/web-interface/wbi/view
     try:
         resp = requests.get(
             "https://api.bilibili.com/x/web-interface/wbi/view",
-            params=_sign_wbi({"bvid": bvid}),
+            params=_sign_wbi(dict(id_params)),
             headers=_make_headers(mobile=False),
             timeout=15,
         )
@@ -67,14 +82,16 @@ def get_cid(bvid: str) -> Optional[int]:
             cid = d.get("cid") or (d.get("pages") or [{}])[0].get("cid")
             if cid:
                 return cid
-    except Exception:
-        pass
+        else:
+            _set_diag("video_info", f"B站 view 接口 code={data.get('code')} ({data.get('message')})", "视频可能已删除、不可见，或当前节点触发风控拦截")
+    except Exception as e:
+        _set_diag("video_info", f"请求 B站 view 接口异常: {e}", "请检查网络连通性或重试")
 
     # 2. 直连 x/player/pagelist
     try:
         resp = requests.get(
             "https://api.bilibili.com/x/player/pagelist",
-            params={"bvid": bvid},
+            params=dict(id_params),
             headers=_make_headers(mobile=True),
             timeout=15,
         )
@@ -85,9 +102,10 @@ def get_cid(bvid: str) -> Optional[int]:
         pass
 
     # 3. 中继兜底
-    bundle = fetch_video_bundle_from_proxy(bvid)
-    if bundle and bundle.get("cid"):
-        return bundle["cid"]
+    if "bvid" in id_params:
+        bundle = fetch_video_bundle_from_proxy(bvid)
+        if bundle and bundle.get("cid"):
+            return bundle["cid"]
 
     return None
 
@@ -113,13 +131,14 @@ def get_audio_urls_from_playurl(bvid: str, cid: Optional[int] = None, force_refr
         cid = get_cid(bvid)
 
     # 1. 直连 WBI playurl / 普通 playurl
+    id_params = _video_id_params(bvid)
     if cid:
         for endpoint, use_wbi in [
             ("https://api.bilibili.com/x/player/wbi/playurl", True),
             ("https://api.bilibili.com/x/player/playurl", False),
         ]:
             try:
-                params = {"bvid": bvid, "cid": cid, "fnval": 16, "qn": 16, "fourk": 1}
+                params = {**id_params, "cid": cid, "fnval": 16, "qn": 16, "fourk": 1}
                 if use_wbi:
                     params = _sign_wbi(params)
                 resp = requests.get(
@@ -134,18 +153,24 @@ def get_audio_urls_from_playurl(bvid: str, cid: Optional[int] = None, force_refr
                     if urls:
                         print(f"    [playurl] 直连获取到 {len(urls)} 条音频直链")
                         return urls
+                    _set_diag("playurl", "playurl 未返回 DASH 音频流", "可能是番剧/大会员专享、充电专属或版权受限视频")
                 else:
                     print(f"    [playurl] 直连错误: code={data.get('code')} msg={data.get('message')}")
+                    _set_diag("playurl", f"B站 playurl 返回 code={data.get('code')} ({data.get('message')})", "可能触发风控、地区限制或该视频需要登录/大会员权限")
             except Exception as e:
                 print(f"    [playurl] 直连异常: {e}")
+                _set_diag("playurl", f"playurl 请求异常: {e}", "B站接口连接异常，请稍后重试")
 
     # 2. Vercel 中继兜底
-    print(f"    [playurl] 切换中继获取音频直链...")
-    bundle = fetch_video_bundle_from_proxy(bvid, force_refresh=force_refresh)
-    if bundle and bundle.get("audio_urls"):
-        urls = bundle["audio_urls"]
-        print(f"    [playurl] ✅ 中继获取到 {len(urls)} 条音频直链")
-        return urls
+    if "bvid" in id_params:
+        print(f"    [playurl] 切换中继获取音频直链...")
+        bundle = fetch_video_bundle_from_proxy(bvid, force_refresh=force_refresh)
+        if bundle and bundle.get("audio_urls"):
+            urls = bundle["audio_urls"]
+            print(f"    [playurl] ✅ 中继获取到 {len(urls)} 条音频直链")
+            return urls
+        if bundle and bundle.get("debug"):
+            _set_diag("playurl", f"中继解析音频流失败: {bundle.get('debug')}", "视频可能已下架、设为私密、充电专属或受地区版权限制")
 
     return None
 
@@ -289,14 +314,25 @@ def _call_siliconflow_stt_once(audio_path: str, api_key: str, model: str, timeou
 
         preview = resp.text[:200].replace("\n", " ")
         print(f"    [SiFlow] ({model}) HTTP {resp.status_code}: {preview}")
-        # 401/403 为鉴权失败，无需同 key 反复重试
+        hint_map = {
+            401: "SILICONFLOW_API_KEY 无效或已过期，请检查 GitHub Secrets",
+            403: "API Key 权限不足或被风控限制",
+            413: "音频文件过大超过接口上传上限",
+            429: "触发硅基流动请求频率限制，请稍后重试",
+            500: "硅基流动语音识别服务端临时报错 (500)，可稍后重试",
+            502: "硅基流动网关异常 (502)，可稍后重试",
+            503: "硅基流动服务暂时过载 (503)，可稍后重试",
+        }
+        _set_diag("stt", f"硅基流动 STT ({model}) HTTP {resp.status_code}: {preview[:120]}", hint_map.get(resp.status_code, "请检查硅基流动服务状态与 API Key"))
         retryable = resp.status_code in (429, 500, 502, 503, 504)
         return None, retryable
     except requests.exceptions.Timeout:
         print(f"    [SiFlow] ({model}) 请求超时 ({timeout}s)")
+        _set_diag("stt", f"硅基流动 STT 请求超时 ({timeout}s)", "视频可能过长或网络波动，请稍后重试")
         return None, True
     except Exception as e:
         print(f"    [SiFlow] ({model}) 异常: {e}")
+        _set_diag("stt", f"硅基流动 STT 异常: {e}", "请检查网络或硅基流动服务状态")
         return None, True
 
 
@@ -380,6 +416,7 @@ def get_text_from_audio(
     """
     一站式: B站音频下载 → 直接上传硅基流动语音识别
     """
+    _set_diag("", "", "")
     with tempfile.TemporaryDirectory() as tmpdir:
         m4s_path = os.path.join(tmpdir, f"{bvid}.m4s")
         m4a_path = os.path.join(tmpdir, f"{bvid}.m4a")
@@ -388,6 +425,8 @@ def get_text_from_audio(
         all_urls = get_audio_urls_from_playurl(bvid)
         if not all_urls:
             print("    [音频] ❌ 无法获取音频直链")
+            if not _last_diag["stage"]:
+                _set_diag("playurl", "未能获取 B 站视频 cid 或音频直链", "请确认视频是否有效、非大会员/充电专属或私密稿件")
             return None
 
         download_ok = False
@@ -419,6 +458,7 @@ def get_text_from_audio(
 
         if not download_ok:
             print("    [音频] ❌ 下载失败")
+            _set_diag("cdn_download", "B站 CDN 直连与 Vercel 中继下载均失败", "可能是 B 站 CDN 临时拒绝访问 (403/567) 或音频流链接已失效，请稍后重试")
             return None
 
         # .m4s = AAC/M4A 容器，直接改名即可

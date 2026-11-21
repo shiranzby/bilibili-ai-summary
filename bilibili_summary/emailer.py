@@ -465,6 +465,8 @@ def build_daily_briefing_email(videos: List[Dict], date_str: str = "", style: st
     toc_rows = []
     for i, v in enumerate(videos, 1):
         t = html_lib.escape(v.get("title") or v.get("bvid", ""))
+        bvid_i = html_lib.escape(v.get("bvid", ""))
+        v_url = html_lib.escape(v.get("url") or f"https://www.bilibili.com/video/{bvid_i}")
         up = html_lib.escape(v.get("up_name") or "")
         dur = html_lib.escape(str(v.get("duration") or ""))
         dur_html = f'<span style="color:#9ca3af;font-size:11.5px;margin-left:6px;">({dur})</span>' if dur else ""
@@ -473,7 +475,7 @@ def build_daily_briefing_email(videos: List[Dict], date_str: str = "", style: st
             f'<tr>'
             f'<td valign="top" style="width:26px;padding:3px 6px 3px 0;font-family:Consolas,monospace;font-size:12px;color:{th["accent"]};font-weight:700;">{i:02d}</td>'
             f'<td valign="top" style="padding:3px 0;font-size:13px;line-height:1.5;color:#374151;">'
-            f'<a href="#video-{i}" style="color:#1f2937;text-decoration:none;">{up_html}{t}</a>{dur_html}'
+            f'<a href="{v_url}" target="_blank" style="color:#1f2937;text-decoration:none;border-bottom:1px solid #e5e7eb;">{up_html}{t}</a>{dur_html}'
             f'</td>'
             f'</tr>'
         )

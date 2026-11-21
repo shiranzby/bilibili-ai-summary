@@ -37,7 +37,28 @@ from bili_api import (
 )
 from summarizer import summarize_subtitle
 from emailer import send_email, build_daily_briefing_email
-from audio_transcriber import get_text_from_audio
+from audio_transcriber import get_text_from_audio, get_last_diagnostics
+
+
+def push_monitor_archive(videos: list):
+    """将本次监控生成的视频摘要推送至 Worker R2 归档，供 Web 端「UP主监控」二级页面直接查看"""
+    worker_url = os.environ.get("WORKER_URL", "").strip().rstrip("/")
+    monitor_token = os.environ.get("CRON_TRIGGER_SECRET", "").strip()
+    if not worker_url or not monitor_token or not videos:
+        return
+    try:
+        resp = requests.post(
+            f"{worker_url}/api/monitor-archive",
+            headers={"X-Monitor-Token": monitor_token, "Content-Type": "application/json"},
+            json={"videos": videos},
+            timeout=20,
+        )
+        if resp.ok:
+            print(f"  [归档] ✅ 已同步 {len(videos)} 条监控摘要至在线后台")
+        else:
+            print(f"  [归档] ⚠ 同步返回 HTTP {resp.status_code}")
+    except Exception as e:
+        print(f"  [归档] ⚠ 同步异常 (非致命): {e}")
 
 
 def load_remote_monitor_config() -> dict:
@@ -145,13 +166,16 @@ def process_video(video: dict, up_name: str) -> dict:
         )
 
     subtitle_text = audio_text
+    diag_msg = ""
     if not subtitle_text:
+        diag = get_last_diagnostics()
+        diag_msg = f"（失败环节: {diag.get('stage') or '未知'}；原因: {diag.get('error') or '未能获取文字内容'}）"
         desc = (info or {}).get("desc", "").strip()
         if desc and len(desc) > 20:
             print(f"  [处理] ✅ 使用视频描述 ({len(desc)} 字符)")
             subtitle_text = f"[视频描述] {desc[:3000]}"
         else:
-            print("  [处理] ⚠ 语音识别失败且无视频描述")
+            print(f"  [处理] ⚠ 语音识别失败且无视频描述 {diag_msg}")
 
     summary = None
     if subtitle_text:
@@ -168,7 +192,7 @@ def process_video(video: dict, up_name: str) -> dict:
     return {
         "bvid": bvid,
         "title": title,
-        "summary": summary or "（该视频无法获取文字内容，无法生成总结）",
+        "summary": summary or f"（该视频无法获取文字内容，无法生成总结{diag_msg}）",
         "url": f"https://www.bilibili.com/video/{bvid}",
         "pub_time": pub_time_display,
         "duration": duration_display,
@@ -317,7 +341,8 @@ def main():
             if ok:
                 email_sent = True
 
-    # ---------- 保存状态 ----------
+    # ---------- 归档至 Worker R2 + 保存状态 ----------
+    push_monitor_archive(all_new_videos)
     save_state(state, STATE_FILE)
 
     print(f"\n{'=' * 55}")

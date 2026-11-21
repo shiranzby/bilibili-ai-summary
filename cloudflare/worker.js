@@ -12,6 +12,7 @@
 const MAX_RESULTS = 10;
 const HISTORY_KEY = 'history/shared.json';
 const MONITOR_CONFIG_KEY = 'config/monitor.json';
+const MONITOR_ARCHIVE_KEY = 'monitor_archive/latest.json';
 const BILI_PROXY_DEF = 'https://bilisum-bili-proxy.vercel.app';
 const GH_OWNER_DEF = 'shiranzby';
 const GH_REPO_DEF = 'bilibili-ai-summary';
@@ -533,6 +534,104 @@ async function handleManualMonitorRun(request, env) {
   return jsonResponse({ ok: true, message: '已触发 GitHub Actions 监控任务，约 1~2 分钟后完成' }, 202);
 }
 
+async function readMonitorArchive(env) {
+  if (!env.BILIBILI_BUCKET) return [];
+  try {
+    const obj = await env.BILIBILI_BUCKET.get(MONITOR_ARCHIVE_KEY);
+    if (!obj) return [];
+    const data = await obj.json();
+    return Array.isArray(data.videos) ? data.videos : [];
+  } catch {
+    return [];
+  }
+}
+
+async function handlePostMonitorArchive(request, env) {
+  const monToken = request.headers.get('X-Monitor-Token') || '';
+  if (!env.CRON_TRIGGER_SECRET || !safeEqual(monToken, env.CRON_TRIGGER_SECRET)) {
+    return errorResponse('Invalid monitor token', 401);
+  }
+  if (!env.BILIBILI_BUCKET) return errorResponse('R2 未配置', 503);
+  const body = await request.json().catch(() => ({}));
+  const incoming = Array.isArray(body.videos) ? body.videos : [];
+  const existing = await readMonitorArchive(env);
+  const byBvid = new Map();
+  existing.forEach(v => { if (v && v.bvid) byBvid.set(v.bvid, v); });
+  incoming.forEach(v => {
+    if (v && v.bvid) {
+      byBvid.set(v.bvid, {
+        bvid: v.bvid,
+        mid: Number(v.mid) || 0,
+        up_name: v.up_name || '',
+        title: v.title || v.bvid,
+        summary: v.summary || '',
+        duration: v.duration || '',
+        pub_time: v.pub_time || '',
+        url: v.url || `https://www.bilibili.com/video/${v.bvid}`,
+        created: v.created || 0,
+        archived_at: nowISO(),
+      });
+    }
+  });
+  const merged = Array.from(byBvid.values())
+    .sort((a, b) => (b.created || 0) - (a.created || 0))
+    .slice(0, 150);
+  await env.BILIBILI_BUCKET.put(MONITOR_ARCHIVE_KEY, JSON.stringify({ videos: merged, updated_at: nowISO() }), {
+    httpMetadata: { contentType: 'application/json' },
+  });
+  return jsonResponse({ ok: true, total: merged.length });
+}
+
+async function handleGetMonitorArchive(request, env) {
+  const sess = await verifySessionToken(request, env);
+  if (!sess) return errorResponse('需要登录管理员账号', 401);
+  const midFilter = parseInt(new URL(request.url).searchParams.get('mid') || '0', 10);
+  let videos = await readMonitorArchive(env);
+  if (midFilter) videos = videos.filter(v => Number(v.mid) === midFilter);
+  return jsonResponse({ ok: true, videos });
+}
+
+async function handleGetUpVideos(request, env) {
+  const sess = await verifySessionToken(request, env);
+  if (!sess) return errorResponse('需要登录管理员账号', 401);
+
+  const reqUrl = new URL(request.url);
+  const mid = (reqUrl.searchParams.get('mid') || '').trim();
+  const ps = Math.min(parseInt(reqUrl.searchParams.get('ps') || '15', 10) || 15, 30);
+  if (!/^\d+$/.test(mid)) return errorResponse('无效的 UP 主 UID', 400);
+
+  const proxyBase = (env.BILI_PROXY_URL || BILI_PROXY_DEF).replace(/\/+$/, '');
+  const archive = await readMonitorArchive(env);
+  const summaryMap = new Map();
+  archive.forEach(v => { if (v && v.bvid) summaryMap.set(v.bvid, v); });
+
+  try {
+    const r = await fetch(`${proxyBase}/api/bili-up?mid=${mid}&pn=1&ps=${ps}`);
+    const d = await r.json();
+    const vlist = d?.data?.list?.vlist || [];
+    const items = vlist.map(v => {
+      const arch = summaryMap.get(v.bvid);
+      return {
+        bvid: v.bvid,
+        title: v.title || v.bvid,
+        description: v.description || '',
+        duration: v.length || '',
+        created: v.created || 0,
+        play: v.play || 0,
+        pic: v.pic || '',
+        url: `https://www.bilibili.com/video/${v.bvid}`,
+        summary: arch ? arch.summary : '',
+        archived: Boolean(arch && arch.summary),
+      };
+    });
+    return jsonResponse({ ok: true, mid: Number(mid), videos: items, code: d.code });
+  } catch (e) {
+    // Fallback to archived items only
+    const fallback = archive.filter(v => Number(v.mid) === Number(mid));
+    return jsonResponse({ ok: true, mid: Number(mid), videos: fallback, warning: '实时列表拉取失败，仅显示历史归档: ' + e.message });
+  }
+}
+
 // ═══════════════════════════════════════════════════════
 // R2 Storage & History & Jobs
 // ═══════════════════════════════════════════════════════
@@ -707,7 +806,7 @@ async function handleDeleteJob(request, env, jobId) {
 async function handleCallback(request, env) {
   if (!env.BILIBILI_BUCKET) return errorResponse('R2 未配置', 503);
   const body = await request.json();
-  const { job_id, bvid, status, summary, transcript, title, timings, owner, pubdate, duration } = body;
+  const { job_id, bvid, status, summary, transcript, title, timings, owner, pubdate, duration, error, error_stage, error_hint } = body;
   if (!job_id || !bvid) return errorResponse('缺少 job_id 或 bvid', 400);
   const pending = await env.BILIBILI_BUCKET.get(`pending/${job_id}.json`);
   if (!pending) return errorResponse('任务不存在或已处理', 404);
@@ -721,6 +820,9 @@ async function handleCallback(request, env) {
     owner: owner || '',
     pubdate: pubdate || null,
     duration: duration || '',
+    error: error || '',
+    error_stage: error_stage || '',
+    error_hint: error_hint || '',
     completed_at: nowISO(),
     video_url: `https://www.bilibili.com/video/${bvid}`,
   };
@@ -773,21 +875,20 @@ function generateFrontendPage() {
   --brand:#FB7299;--brand-dark:#E11D48;--brand-soft:#FFF1F5;--brand-border:#FECDD3;
   --cta:#111827;--cta-hover:#1F2937;--cta-text:#FFFFFF;
   --ok:#10B981;--ok-soft:#ECFDF5;--ok-text:#047857;
-  --err:#EF4444;--err-soft:#FEF2F2;--err-text:#B91C1C;
+  --err:#EF4444;--err-soft:#FEF2F2;--err-border:#FECACA;--err-text:#B91C1C;
   --warn:#F59E0B;--warn-soft:#FFFBEB;
   --shadow-sm:0 1px 2px rgba(16,24,40,.04);
   --shadow-md:0 4px 16px rgba(16,24,40,.06);
   --shadow-lg:0 20px 48px rgba(16,24,40,.14);
-  --radius:12px;
 }
 [data-theme="dark"]{
   --bg:#0B0D12;--surface:#13161F;--surface-2:#1B202C;--surface-hover:#181C27;
-  --border:rgba(255,255,255,.08);--border-strong:rgba(255,255,255,.15);
+  --border:rgba(255,255,255,.09);--border-strong:rgba(255,255,255,.16);
   --text:#F3F4F6;--soft:#CBD5E1;--muted:#6B7280;
   --brand:#FB7299;--brand-dark:#FDA4AF;--brand-soft:rgba(251,114,153,.13);--brand-border:rgba(251,114,153,.32);
   --cta:#FB7299;--cta-hover:#F43F7A;--cta-text:#FFFFFF;
   --ok:#10B981;--ok-soft:rgba(16,185,129,.14);--ok-text:#6EE7B7;
-  --err:#F87171;--err-soft:rgba(239,68,68,.14);--err-text:#FCA5A5;
+  --err:#F87171;--err-soft:rgba(239,68,68,.12);--err-border:rgba(239,68,68,.28);--err-text:#FCA5A5;
   --warn:#FBBF24;--warn-soft:rgba(245,158,11,.14);
   --shadow-sm:0 1px 2px rgba(0,0,0,.3);
   --shadow-md:0 4px 18px rgba(0,0,0,.35);
@@ -797,55 +898,62 @@ html,body{height:100%;font-family:-apple-system,BlinkMacSystemFont,'PingFang SC'
 button,input,select,textarea{font-family:inherit;color:inherit}
 button{cursor:pointer}
 .hidden{display:none!important}
+svg.ic{width:14px;height:14px;stroke:currentColor;fill:none;stroke-width:2;stroke-linecap:round;stroke-linejoin:round;flex-shrink:0}
+
+/* Unified Form Controls */
+.ctrl{width:100%;height:38px;padding:0 12px;font-size:13px;border:1px solid var(--border);border-radius:9px;background:var(--surface);color:var(--text);outline:none;transition:border-color .15s,box-shadow .15s}
+.ctrl:focus{border-color:var(--brand);box-shadow:0 0 0 3px var(--brand-soft)}
+.ctrl::placeholder{color:var(--muted)}
+select.ctrl{appearance:none;-webkit-appearance:none;padding-right:32px;background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 24 24' fill='none' stroke='%239CA3AF' stroke-width='2.2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M6 9l6 6 6-6'/%3E%3C/svg%3E");background-repeat:no-repeat;background-position:right 11px center}
+textarea.ctrl{height:auto;min-height:78px;padding:9px 12px;resize:vertical;line-height:1.55}
 
 /* Layout */
-.app{display:grid;grid-template-columns:var(--sidebar-w,340px) 1px 1fr;height:100vh}
+.app{display:grid;grid-template-columns:var(--sidebar-w,336px) 1px 1fr;height:100vh}
 .divider{background:var(--border);cursor:col-resize;position:relative;transition:background .15s}
 .divider:hover,.divider.dragging{background:var(--brand)}
 .divider::after{content:'';position:absolute;left:-4px;right:-4px;top:0;bottom:0}
 
 /* Sidebar */
-.sidebar{background:var(--surface);display:flex;flex-direction:column;height:100vh;overflow:hidden;padding:20px 18px 16px}
-.brand{display:flex;align-items:center;gap:10px;margin-bottom:18px}
-.brand-icon{width:34px;height:34px;border-radius:10px;background:var(--brand);display:flex;align-items:center;justify-content:center;flex-shrink:0;box-shadow:0 3px 10px rgba(251,114,153,.28)}
-.brand-title{font-size:18px;font-weight:800;letter-spacing:-.2px;color:var(--text)}
+.sidebar{background:var(--surface);display:flex;flex-direction:column;height:100vh;overflow:hidden;padding:18px 18px 16px}
+.brand{display:flex;align-items:center;gap:10px;margin-bottom:16px}
+.brand-icon{width:34px;height:34px;border-radius:10px;background:var(--brand);display:flex;align-items:center;justify-content:center;flex-shrink:0;box-shadow:0 3px 10px rgba(251,114,153,.26)}
+.brand-title{font-size:17px;font-weight:800;letter-spacing:-.2px;color:var(--text)}
 .brand-sub{font-size:11px;color:var(--muted);margin-top:1px}
 
-/* Submit box */
+/* Submit Bar */
 .input-shell{display:flex;align-items:center;gap:6px;background:var(--bg);border:1px solid var(--border);border-radius:11px;padding:4px 4px 4px 12px;transition:border-color .15s,box-shadow .15s}
 .input-shell:focus-within{border-color:var(--brand);box-shadow:0 0 0 3px var(--brand-soft)}
-.input-shell input{flex:1;min-width:0;border:none;background:transparent;font-size:13.5px;outline:none;padding:7px 0;color:var(--text)}
+.input-shell input{flex:1;min-width:0;border:none;background:transparent;font-size:13px;outline:none;height:34px;color:var(--text)}
 .input-shell input::placeholder{color:var(--muted)}
-.btn-submit{border:none;background:var(--cta);color:var(--cta-text);padding:8px 14px;border-radius:8px;font-size:13px;font-weight:600;white-space:nowrap;transition:background .15s,transform .1s}
+.btn-submit{border:none;background:var(--cta);color:var(--cta-text);height:34px;padding:0 14px;border-radius:8px;font-size:13px;font-weight:600;white-space:nowrap;flex-shrink:0;transition:background .15s}
 .btn-submit:hover{background:var(--cta-hover)}
 .btn-submit:disabled{opacity:.5;cursor:not-allowed}
 
-/* Advanced collapsible */
-.adv-toggle{display:inline-flex;align-items:center;gap:5px;margin-top:10px;background:none;border:none;color:var(--soft);font-size:12.5px;font-weight:500;padding:4px 2px}
-.adv-toggle:hover{color:var(--text)}
-.adv-box{margin-top:8px;padding:12px;background:var(--bg);border:1px solid var(--border);border-radius:10px;display:flex;flex-direction:column;gap:10px}
-.field label{display:block;font-size:11.5px;font-weight:600;color:var(--soft);margin-bottom:4px}
-.field input,.field select,.field textarea{width:100%;padding:7px 10px;font-size:12.5px;border:1px solid var(--border);border-radius:8px;background:var(--surface);color:var(--text);outline:none}
-.field input:focus,.field select:focus,.field textarea:focus{border-color:var(--brand)}
-.field textarea{min-height:70px;resize:vertical;line-height:1.5}
+/* Advanced Collapsible Panel */
+.adv-toggle{display:flex;align-items:center;justify-content:space-between;width:100%;margin-top:10px;background:transparent;border:1px solid transparent;border-radius:8px;color:var(--soft);font-size:12.5px;font-weight:500;padding:6px 8px;transition:background .15s,color .15s}
+.adv-toggle:hover{background:var(--surface-2);color:var(--text)}
+.adv-toggle .caret{transition:transform .18s ease}
+.adv-toggle.open .caret{transform:rotate(180deg)}
+.adv-box{margin-top:6px;padding:12px;background:var(--bg);border:1px solid var(--border);border-radius:11px;display:flex;flex-direction:column;gap:10px}
+.field{display:flex;flex-direction:column;gap:5px}
+.field label{font-size:12px;font-weight:600;color:var(--soft);white-space:nowrap}
 
-/* Status Toast inside sidebar */
-.sb-toast{margin-top:10px;padding:8px 11px;border-radius:8px;font-size:12px;line-height:1.45;display:none}
+/* Toast */
+.sb-toast{margin-top:10px;padding:9px 12px;border-radius:9px;font-size:12.5px;line-height:1.5;display:none}
 .sb-toast.show{display:block}
 .sb-toast.ok{background:var(--ok-soft);color:var(--ok-text)}
-.sb-toast.err{background:var(--err-soft);color:var(--err-text)}
+.sb-toast.err{background:var(--err-soft);color:var(--err-text);border:1px solid var(--err-border)}
 .sb-toast.info{background:var(--surface-2);color:var(--soft)}
 
-/* History section */
-.history-wrap{flex:1;min-height:0;display:flex;flex-direction:column;margin-top:16px;padding-top:14px;border-top:1px solid var(--border)}
+/* History Section */
+.history-wrap{flex:1;min-height:0;display:flex;flex-direction:column;margin-top:14px;padding-top:14px;border-top:1px solid var(--border)}
 .search-box{position:relative;margin-bottom:12px}
-.search-box input{width:100%;padding:8px 12px 8px 32px;border:1px solid var(--border);border-radius:9px;background:var(--bg);font-size:13px;outline:none;color:var(--text)}
-.search-box input:focus{border-color:var(--brand)}
-.search-box .s-ic{position:absolute;left:10px;top:50%;transform:translateY(-50%);color:var(--muted);font-size:13px;pointer-events:none}
+.search-box .ctrl{padding-left:34px;background-color:var(--bg);height:36px}
+.search-box .s-ic{position:absolute;left:11px;top:50%;transform:translateY(-50%);color:var(--muted);pointer-events:none;display:flex}
 .history-head{display:flex;align-items:center;justify-content:space-between;margin-bottom:8px;padding:0 2px}
-.history-head h3{font-size:12.5px;font-weight:700;color:var(--soft);display:flex;align-items:center;gap:6px}
+.history-head h3{font-size:12.5px;font-weight:700;color:var(--soft);display:inline-flex;align-items:center;gap:6px}
 .count-pill{font-size:11px;font-weight:600;color:var(--muted);background:var(--surface-2);padding:1px 7px;border-radius:999px}
-.text-btn{background:none;border:none;font-size:12px;color:var(--muted);padding:2px 6px;border-radius:5px}
+.text-btn{background:none;border:none;font-size:12px;color:var(--muted);padding:3px 7px;border-radius:6px;white-space:nowrap}
 .text-btn:hover{color:var(--text);background:var(--surface-2)}
 .text-btn.danger{color:var(--err)}
 .batch-bar{display:flex;align-items:center;gap:6px;margin-bottom:8px;padding:6px 8px;background:var(--surface-2);border-radius:8px;font-size:12px}
@@ -858,65 +966,81 @@ button{cursor:pointer}
 .h-card.active{border-color:var(--text);box-shadow:var(--shadow-sm);background:var(--surface)}
 [data-theme="dark"] .h-card.active{border-color:var(--brand);box-shadow:inset 3px 0 0 var(--brand)}
 .h-body{flex:1;min-width:0}
-.h-title{font-size:13px;font-weight:600;line-height:1.4;color:var(--text);display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;margin-bottom:5px}
+.h-title{font-size:13px;font-weight:600;line-height:1.45;color:var(--text);display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;margin-bottom:4px}
 .h-meta{font-size:11.5px;color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.h-right{display:flex;flex-direction:column;align-items:flex-end;gap:6px;flex-shrink:0;padding-top:3px}
+.h-right{display:flex;flex-direction:column;align-items:flex-end;gap:6px;flex-shrink:0;padding-top:4px}
 .dot{width:8px;height:8px;border-radius:50%;flex-shrink:0}
 .dot.ok{background:var(--ok)}
 .dot.pending{background:var(--warn);animation:pulse 1.4s infinite}
 .dot.err{background:var(--err)}
 @keyframes pulse{0%,100%{opacity:1}50%{opacity:.35}}
-.h-del{opacity:0;background:none;border:none;color:var(--muted);font-size:13px;padding:2px 5px;border-radius:5px;transition:opacity .12s,color .12s}
+.h-del{opacity:0;background:none;border:none;color:var(--muted);padding:2px 4px;border-radius:5px;display:inline-flex;transition:opacity .12s,color .12s}
 .h-card:hover .h-del{opacity:1}
 .h-del:hover{color:var(--err);background:var(--err-soft)}
 .h-chk{margin-top:3px;accent-color:var(--brand)}
 
 /* Main Workspace */
-.main{display:flex;flex-direction:column;height:100vh;overflow:hidden;background:var(--bg)}
-.topbar{display:flex;align-items:center;justify-content:space-between;gap:14px;padding:14px 28px;border-bottom:1px solid var(--border);background:var(--bg);flex-shrink:0}
-.stepper{display:flex;align-items:center;gap:8px;background:var(--surface);border:1px solid var(--border);border-radius:11px;padding:7px 14px;font-size:12.5px;overflow-x:auto;max-width:100%}
-.st-item{display:inline-flex;align-items:center;gap:5px;color:var(--muted);white-space:nowrap;font-weight:500}
-.st-item.done{color:var(--text)}
-.st-item.done .st-ic{color:var(--ok)}
-.st-item.active{color:var(--brand-dark);font-weight:600}
-.st-item.final-done{background:var(--ok-soft);color:var(--ok-text);padding:2px 10px;border-radius:999px;font-weight:600}
-.st-item.final-err{background:var(--err-soft);color:var(--err-text);padding:2px 10px;border-radius:999px;font-weight:600}
-.st-arrow{color:var(--muted);font-size:12px;opacity:.6}
+.main{display:flex;flex-direction:column;height:100vh;overflow:hidden;background:var(--bg);min-width:0}
 
-.topbar-actions{display:flex;align-items:center;gap:8px;flex-shrink:0;margin-left:auto}
-.pill-btn{display:inline-flex;align-items:center;gap:6px;padding:7px 12px;border:1px solid var(--border);border-radius:9px;background:var(--surface);color:var(--text);font-size:12.5px;font-weight:600;transition:border-color .15s,background .15s}
+/* Top Navigation Bar — Single Clean Row, Never Overflows */
+.topbar{display:flex;align-items:center;justify-content:space-between;gap:12px;height:56px;padding:0 28px;border-bottom:1px solid var(--border);background:var(--surface);flex-shrink:0}
+.nav-tabs{display:inline-flex;align-items:center;gap:4px;background:var(--surface-2);padding:3px;border-radius:9px;border:1px solid var(--border)}
+.nav-tab{border:none;background:transparent;padding:5px 13px;border-radius:7px;font-size:13px;font-weight:600;color:var(--soft);white-space:nowrap;transition:all .15s}
+.nav-tab:hover{color:var(--text)}
+.nav-tab.active{background:var(--surface);color:var(--text);box-shadow:var(--shadow-sm)}
+.nav-guest-label{font-size:13px;font-weight:600;color:var(--soft);white-space:nowrap}
+
+.topbar-actions{display:flex;align-items:center;gap:8px;flex-shrink:0}
+.pill-btn{display:inline-flex;align-items:center;gap:6px;height:34px;padding:0 12px;border:1px solid var(--border);border-radius:9px;background:var(--surface);color:var(--text);font-size:12.5px;font-weight:600;white-space:nowrap;transition:border-color .15s,background .15s}
 .pill-btn:hover{border-color:var(--border-strong);background:var(--surface-hover)}
 .pill-btn.authed{border-color:var(--brand-border);background:var(--brand-soft);color:var(--brand-dark)}
-.icon-btn{width:34px;height:34px;display:inline-flex;align-items:center;justify-content:center;border:1px solid var(--border);border-radius:9px;background:var(--surface);color:var(--soft);font-size:15px}
-.icon-btn:hover{border-color:var(--border-strong);color:var(--text)}
+.icon-btn{width:34px;height:34px;display:inline-flex;align-items:center;justify-content:center;border:1px solid var(--border);border-radius:9px;background:var(--surface);color:var(--soft);flex-shrink:0}
+.icon-btn:hover{border-color:var(--border-strong);color:var(--text);background:var(--surface-hover)}
 
-.content-scroll{flex:1;overflow-y:auto;padding:22px 28px 40px}
+.content-scroll{flex:1;overflow-y:auto;padding:20px 28px 44px}
 .content-inner{max-width:960px;margin:0 auto}
 
+/* Stepper inside content column — Clean full-width, no ugly scrollbar */
+.stepper{display:flex;align-items:center;justify-content:space-between;gap:6px;background:var(--surface);border:1px solid var(--border);border-radius:11px;padding:9px 16px;margin-bottom:14px;font-size:12.5px}
+.st-item{display:inline-flex;align-items:center;gap:6px;color:var(--muted);white-space:nowrap;font-weight:500}
+.st-item.done{color:var(--text)}
+.st-item.done .st-dot{background:var(--ok);border-color:var(--ok);color:#fff}
+.st-item.active{color:var(--brand-dark);font-weight:600}
+.st-item.active .st-dot{border-color:var(--brand);background:var(--brand-soft)}
+.st-dot{width:16px;height:16px;border-radius:50%;border:1.5px solid var(--border-strong);display:inline-flex;align-items:center;justify-content:center;font-size:10px;flex-shrink:0}
+.st-line{flex:1;height:1px;background:var(--border);min-width:12px}
+.st-line.done{background:var(--ok);opacity:.45}
+.st-badge{padding:2px 10px;border-radius:999px;font-size:12px;font-weight:600;white-space:nowrap}
+.st-badge.ok{background:var(--ok-soft);color:var(--ok-text)}
+.st-badge.err{background:var(--err-soft);color:var(--err-text)}
+.st-badge.pending{background:var(--warn-soft);color:#B45309}
+
 /* Empty State */
-.empty-state{margin:60px auto;max-width:480px;text-align:center;padding:40px 28px;background:var(--surface);border:1px solid var(--border);border-radius:16px;box-shadow:var(--shadow-sm)}
-.empty-ic{width:54px;height:54px;margin:0 auto 14px;border-radius:14px;background:var(--brand-soft);color:var(--brand);display:flex;align-items:center;justify-content:center;font-size:26px}
-.empty-state h2{font-size:18px;font-weight:700;margin-bottom:8px}
-.empty-state p{font-size:13.5px;color:var(--soft);line-height:1.65}
+.empty-state{margin:48px auto;max-width:480px;text-align:center;padding:40px 28px;background:var(--surface);border:1px solid var(--border);border-radius:16px;box-shadow:var(--shadow-sm)}
+.empty-ic{width:48px;height:48px;margin:0 auto 14px;border-radius:12px;background:var(--brand-soft);color:var(--brand);display:flex;align-items:center;justify-content:center}
+.empty-state h2{font-size:17px;font-weight:700;margin-bottom:8px}
+.empty-state p{font-size:13.5px;color:var(--soft);line-height:1.7}
 
 /* Video Header Card */
-.video-head{background:var(--surface);border:1px solid var(--border);border-radius:14px;padding:20px 22px;margin-bottom:16px;display:flex;align-items:flex-start;justify-content:space-between;gap:16px;box-shadow:var(--shadow-sm)}
+.video-head{background:var(--surface);border:1px solid var(--border);border-radius:14px;padding:18px 22px;margin-bottom:14px;display:flex;align-items:flex-start;justify-content:space-between;gap:16px;box-shadow:var(--shadow-sm)}
 .vh-left{min-width:0;flex:1}
-.vh-title{font-size:19px;font-weight:800;line-height:1.4;color:var(--text);margin-bottom:11px;word-break:break-word}
+.vh-title{font-size:18.5px;font-weight:800;line-height:1.4;color:var(--text);margin-bottom:10px;word-break:break-word}
+.vh-title a{color:inherit;text-decoration:none}
+.vh-title a:hover{color:var(--brand-dark)}
 .vh-pills{display:flex;flex-wrap:wrap;gap:7px}
-.meta-pill{display:inline-flex;align-items:center;gap:5px;padding:3px 10px;border-radius:999px;background:var(--surface-2);color:var(--soft);font-size:12px;font-weight:500}
-.watch-btn{display:inline-flex;align-items:center;gap:5px;padding:8px 14px;border:1px solid var(--border);border-radius:9px;background:var(--surface);color:var(--text);font-size:12.5px;font-weight:600;text-decoration:none;white-space:nowrap;transition:border-color .15s,background .15s}
+.meta-pill{display:inline-flex;align-items:center;gap:4px;padding:3px 10px;border-radius:999px;background:var(--surface-2);color:var(--soft);font-size:12px;font-weight:500;white-space:nowrap}
+.watch-btn{display:inline-flex;align-items:center;gap:5px;height:34px;padding:0 13px;border:1px solid var(--border);border-radius:9px;background:var(--surface);color:var(--text);font-size:12.5px;font-weight:600;text-decoration:none;white-space:nowrap;flex-shrink:0;transition:border-color .15s,color .15s}
 .watch-btn:hover{border-color:var(--brand);color:var(--brand)}
 
-/* Segmented Tabs + Export Toolbar */
+/* View Tabs + Independent Action Buttons */
 .view-bar{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:14px;flex-wrap:wrap}
 .seg-tabs{display:inline-flex;background:var(--surface-2);padding:3px;border-radius:10px;border:1px solid var(--border)}
-.seg-tab{border:none;background:transparent;padding:6px 13px;border-radius:7px;font-size:13px;font-weight:600;color:var(--soft);display:inline-flex;align-items:center;gap:5px;transition:all .15s}
+.seg-tab{border:none;background:transparent;padding:6px 14px;border-radius:7px;font-size:13px;font-weight:600;color:var(--soft);white-space:nowrap;transition:all .15s}
+.seg-tab:hover{color:var(--text)}
 .seg-tab.active{background:var(--surface);color:var(--text);box-shadow:var(--shadow-sm)}
-.export-group{display:inline-flex;background:var(--surface);border:1px solid var(--border);border-radius:9px;overflow:hidden}
-.exp-btn{border:none;background:transparent;padding:6px 12px;font-size:12.5px;font-weight:500;color:var(--soft);border-right:1px solid var(--border);display:inline-flex;align-items:center;gap:4px}
-.exp-btn:last-child{border-right:none}
-.exp-btn:hover{background:var(--surface-2);color:var(--text)}
+.action-group{display:inline-flex;align-items:center;gap:8px;flex-wrap:wrap}
+.act-btn{display:inline-flex;align-items:center;gap:5px;height:33px;padding:0 12px;border:1px solid var(--border);border-radius:8px;background:var(--surface);color:var(--soft);font-size:12.5px;font-weight:600;white-space:nowrap;transition:border-color .15s,color .15s,background .15s}
+.act-btn:hover{border-color:var(--border-strong);color:var(--text);background:var(--surface-hover)}
 
 /* Reading Panels */
 .reader-grid{display:grid;grid-template-columns:1fr;gap:16px}
@@ -925,11 +1049,11 @@ button{cursor:pointer}
 .panel-label{font-size:11.5px;font-weight:700;letter-spacing:.7px;color:var(--muted);text-transform:uppercase;margin-bottom:14px}
 
 /* Rendered Rich Summary */
-.md-theme-box{background:var(--brand-soft);border-left:3.5px solid var(--brand);border-radius:0 10px 10px 0;padding:15px 18px;margin-bottom:22px}
-.md-theme-label{font-size:12px;font-weight:700;color:var(--brand-dark);letter-spacing:.4px;margin-bottom:6px}
+.md-theme-box{background:var(--brand-soft);border-left:3.5px solid var(--brand);border-radius:0 10px 10px 0;padding:14px 18px;margin-bottom:20px}
+.md-theme-label{font-size:12px;font-weight:700;color:var(--brand-dark);letter-spacing:.4px;margin-bottom:5px}
 .md-theme-body{font-size:14.5px;line-height:1.75;color:var(--text);font-weight:500}
-.md-sec-title{font-size:16px;font-weight:800;color:var(--text);margin:20px 0 12px;letter-spacing:-.1px}
-.md-list{list-style:none;display:flex;flex-direction:column;gap:11px;margin-bottom:20px}
+.md-sec-title{font-size:15.5px;font-weight:800;color:var(--text);margin:18px 0 11px}
+.md-list{list-style:none;display:flex;flex-direction:column;gap:10px;margin-bottom:18px}
 .md-list li{display:flex;align-items:flex-start;gap:10px;font-size:14px;line-height:1.75;color:var(--soft)}
 .md-num{min-width:22px;height:22px;border-radius:50%;background:var(--surface-2);color:var(--brand-dark);font-size:11.5px;font-weight:700;display:inline-flex;align-items:center;justify-content:center;margin-top:2px;flex-shrink:0}
 .md-list strong,.md-p strong{color:var(--text);font-weight:650}
@@ -942,66 +1066,107 @@ button{cursor:pointer}
 .transcript-box{font-size:13.8px;line-height:1.85;color:var(--soft);white-space:pre-wrap;word-break:break-word;max-height:72vh;overflow-y:auto}
 .pending-banner{padding:28px 20px;text-align:center;color:var(--soft);font-size:14px}
 
+/* Structured Diagnostic Card for Failed Jobs */
+.diag-card{background:var(--err-soft);border:1px solid var(--err-border);border-radius:12px;padding:18px 20px}
+.diag-head{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:12px;flex-wrap:wrap}
+.diag-title{font-size:14.5px;font-weight:700;color:var(--err-text);display:inline-flex;align-items:center;gap:7px}
+.diag-stage{font-size:11.5px;font-weight:600;padding:2px 9px;border-radius:999px;background:var(--surface);border:1px solid var(--err-border);color:var(--err-text)}
+.diag-rows{display:flex;flex-direction:column;gap:8px;font-size:13px;line-height:1.65;color:var(--text)}
+.diag-row{display:grid;grid-template-columns:76px 1fr;gap:8px}
+.diag-key{color:var(--soft);font-weight:600}
+.diag-foot{margin-top:14px;padding-top:12px;border-top:1px dashed var(--err-border);display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap}
+
+/* Secondary Page: Monitored UP Creators Feed */
+.mon-header{background:var(--surface);border:1px solid var(--border);border-radius:14px;padding:16px 20px;margin-bottom:16px;display:flex;align-items:center;justify-content:space-between;gap:14px;flex-wrap:wrap;box-shadow:var(--shadow-sm)}
+.mon-header-info h2{font-size:17px;font-weight:800;margin-bottom:4px}
+.mon-header-info p{font-size:12.5px;color:var(--soft)}
+.mon-grid{display:grid;grid-template-columns:240px 1fr;gap:16px;align-items:start}
+.up-nav-card{background:var(--surface);border:1px solid var(--border);border-radius:14px;padding:10px;display:flex;flex-direction:column;gap:5px;box-shadow:var(--shadow-sm)}
+.up-nav-item{display:flex;align-items:center;justify-content:space-between;gap:8px;width:100%;text-align:left;padding:10px 12px;border:1px solid transparent;border-radius:9px;background:transparent;transition:all .15s}
+.up-nav-item:hover{background:var(--surface-2)}
+.up-nav-item.active{background:var(--brand-soft);border-color:var(--brand-border);color:var(--brand-dark)}
+.up-nav-name{font-size:13.5px;font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.up-nav-uid{font-size:11px;color:var(--muted);font-family:Consolas,monospace}
+.feed-list{display:flex;flex-direction:column;gap:12px}
+.feed-card{background:var(--surface);border:1px solid var(--border);border-radius:13px;padding:16px 18px;box-shadow:var(--shadow-sm)}
+.feed-top{display:flex;align-items:flex-start;justify-content:space-between;gap:12px;margin-bottom:8px}
+.feed-title{font-size:15px;font-weight:700;line-height:1.45;color:var(--text);text-decoration:none}
+.feed-title:hover{color:var(--brand-dark)}
+.feed-meta{display:flex;flex-wrap:wrap;gap:8px;font-size:12px;color:var(--muted);margin-bottom:10px}
+.feed-actions{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.feed-summary-wrap{margin-top:12px;padding-top:12px;border-top:1px solid var(--border)}
+
 /* Modals */
-.modal-backdrop{position:fixed;inset:0;background:rgba(10,12,18,.55);backdrop-filter:blur(4px);z-index:200;display:flex;align-items:center;justify-content:center;padding:20px}
+.modal-backdrop{position:fixed;inset:0;background:rgba(10,12,18,.52);backdrop-filter:blur(4px);z-index:200;display:flex;align-items:center;justify-content:center;padding:20px}
 .modal{background:var(--surface);border:1px solid var(--border);border-radius:16px;box-shadow:var(--shadow-lg);width:100%;max-width:420px;max-height:90vh;display:flex;flex-direction:column;overflow:hidden}
 .modal.wide{max-width:860px}
 .modal-head{display:flex;align-items:center;justify-content:space-between;padding:18px 22px;border-bottom:1px solid var(--border)}
-.modal-head h2{font-size:16.5px;font-weight:800}
+.modal-head h2{font-size:16px;font-weight:800}
 .modal-body{padding:20px 22px;overflow-y:auto;flex:1}
-.modal-foot{padding:14px 22px;border-top:1px solid var(--border);display:flex;align-items:center;justify-content:space-between;gap:10px;background:var(--bg)}
-.btn{display:inline-flex;align-items:center;justify-content:center;gap:6px;padding:8px 15px;border-radius:9px;font-size:13px;font-weight:600;border:1px solid var(--border);background:var(--surface);color:var(--text)}
-.btn:hover{background:var(--surface-hover)}
+.modal-foot{padding:14px 22px;border-top:1px solid var(--border);display:flex;align-items:center;justify-content:space-between;gap:10px;background:var(--bg);flex-wrap:wrap}
+.btn{display:inline-flex;align-items:center;justify-content:center;gap:6px;height:36px;padding:0 14px;border-radius:9px;font-size:13px;font-weight:600;border:1px solid var(--border);background:var(--surface);color:var(--text);white-space:nowrap;transition:background .15s,border-color .15s}
+.btn:hover{background:var(--surface-hover);border-color:var(--border-strong)}
+.btn-sm{height:30px;padding:0 11px;font-size:12px;border-radius:7px}
 .btn-primary{background:var(--cta);color:var(--cta-text);border-color:transparent}
-.btn-primary:hover{background:var(--cta-hover)}
+.btn-primary:hover{background:var(--cta-hover);border-color:transparent}
 .btn-brand{background:var(--brand);color:#fff;border-color:transparent}
-.btn-brand:hover{opacity:.92}
+.btn-brand:hover{opacity:.92;border-color:transparent}
 
-/* Monitor Modal specifics */
-.m-tabs{display:flex;gap:6px;margin-bottom:18px;border-bottom:1px solid var(--border);padding-bottom:10px}
-.m-tab{border:none;background:transparent;padding:7px 14px;border-radius:8px;font-size:13px;font-weight:600;color:var(--soft)}
-.m-tab.active{background:var(--brand-soft);color:var(--brand-dark)}
-.form-row{display:grid;grid-template-columns:1fr 1fr;gap:14px;margin-bottom:14px}
-.form-section{background:var(--bg);border:1px solid var(--border);border-radius:12px;padding:15px 16px;margin-bottom:14px}
-.form-section h4{font-size:13px;font-weight:700;margin-bottom:10px;display:flex;align-items:center;justify-content:space-between}
-.chip-list{display:flex;flex-wrap:wrap;gap:8px;margin-top:8px}
+/* Modal Form Sections */
+.m-tabs{display:inline-flex;gap:4px;margin-bottom:18px;background:var(--surface-2);padding:3px;border-radius:9px;border:1px solid var(--border)}
+.m-tab{border:none;background:transparent;padding:6px 14px;border-radius:7px;font-size:13px;font-weight:600;color:var(--soft);white-space:nowrap}
+.m-tab.active{background:var(--surface);color:var(--text);box-shadow:var(--shadow-sm)}
+.form-row{display:grid;grid-template-columns:1fr 1fr;gap:14px}
+.form-section{background:var(--bg);border:1px solid var(--border);border-radius:12px;padding:16px;margin-bottom:14px}
+.sec-head{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:12px;flex-wrap:wrap}
+.sec-head h4{font-size:13.5px;font-weight:700;color:var(--text)}
+.chip-list{display:flex;flex-wrap:wrap;gap:8px;margin-top:10px}
 .chip{display:inline-flex;align-items:center;gap:6px;padding:5px 10px;background:var(--surface);border:1px solid var(--border);border-radius:8px;font-size:12.5px}
 .chip b{font-weight:600;color:var(--text)}
 .chip small{color:var(--muted);font-family:Consolas,monospace;font-size:11px}
 .chip button{border:none;background:none;color:var(--muted);font-size:14px;line-height:1;padding:0 2px}
 .chip button:hover{color:var(--err)}
 .inline-add{display:flex;gap:8px;align-items:center}
-.inline-add input{flex:1}
+.inline-add .ctrl{flex:1;min-width:0}
 .switch-row{display:flex;align-items:center;justify-content:space-between;gap:12px}
-.switch-row input[type=checkbox]{width:18px;height:18px;accent-color:var(--brand);cursor:pointer}
-.cron-badge{font-family:Consolas,monospace;font-size:12px;padding:3px 9px;background:var(--surface);border:1px solid var(--border);border-radius:6px;color:var(--brand-dark)}
+.switch-row input[type=checkbox]{width:18px;height:18px;accent-color:var(--brand);cursor:pointer;flex-shrink:0}
+.cron-badge{font-family:Consolas,monospace;font-size:12px;padding:3px 9px;background:var(--surface);border:1px solid var(--border);border-radius:6px;color:var(--brand-dark);white-space:nowrap}
 
-/* Email Style Selector + Visual Thumbnails */
+/* Email Style Selector */
 .style-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin-bottom:14px}
 .style-card{border:2px solid var(--border);border-radius:11px;padding:8px;background:var(--surface);cursor:pointer;transition:all .15s;text-align:left}
 .style-card:hover{border-color:var(--border-strong)}
 .style-card.selected{border-color:var(--brand);box-shadow:0 0 0 3px var(--brand-soft)}
-.style-thumb{height:68px;border-radius:7px;overflow:hidden;border:1px solid var(--border);margin-bottom:7px;display:flex;flex-direction:column}
-.st-hd{height:20px;padding:4px 6px;display:flex;align-items:center;gap:4px}
+.style-thumb{height:66px;border-radius:7px;overflow:hidden;border:1px solid var(--border);margin-bottom:7px;display:flex;flex-direction:column}
+.st-hd{height:19px;padding:4px 6px;display:flex;align-items:center;gap:4px}
 .st-bar{height:4px;border-radius:2px;width:45%}
 .st-bd{flex:1;padding:5px 6px;display:flex;flex-direction:column;gap:4px}
 .st-line{height:4px;border-radius:2px;background:#e5e7eb}
 .style-name{font-size:12.5px;font-weight:700;color:var(--text)}
 .style-desc{font-size:11px;color:var(--muted);margin-top:2px}
-.email-preview-frame{width:100%;height:360px;border:1px solid var(--border);border-radius:10px;background:#fff}
+.email-preview-frame{width:100%;height:370px;border:1px solid var(--border);border-radius:10px;background:#fff}
 
-/* Responsive */
-@media(max-width:960px){
+/* Responsive Breakpoints */
+@media(max-width:1100px){
+  .app{grid-template-columns:300px 1px 1fr}
+  .topbar{padding:0 18px}
+  .content-scroll{padding:18px}
+  .mon-grid{grid-template-columns:200px 1fr}
+}
+@media(max-width:860px){
   html,body{overflow:auto;height:auto}
   .app{grid-template-columns:1fr;height:auto;min-height:100vh}
   .sidebar{height:auto;overflow:visible;border-bottom:1px solid var(--border)}
-  .history-list{max-height:260px}
+  .history-list{max-height:240px}
   .divider{display:none}
   .main{height:auto;overflow:visible}
-  .topbar{padding:12px 16px;flex-wrap:wrap}
+  .topbar{padding:10px 16px;height:auto}
   .content-scroll{padding:16px}
+  .stepper{padding:8px 10px;font-size:11.5px;gap:4px}
+  .st-dot{width:14px;height:14px}
   .video-head{flex-direction:column}
   .reader-grid.split{grid-template-columns:1fr}
+  .mon-grid{grid-template-columns:1fr}
   .style-grid{grid-template-columns:repeat(2,1fr)}
   .form-row{grid-template-columns:1fr}
 }
@@ -1026,18 +1191,19 @@ button{cursor:pointer}
     </div>
 
     <div class="input-shell">
-      <input id="videoUrl" type="text" placeholder="输入B站视频链接或 BV 号..." autocomplete="off">
+      <input id="videoUrl" type="text" placeholder="输入B站视频链接或 BV 号..." autocomplete="off" onkeydown="if(event.key==='Enter')submitVideo()">
       <button class="btn-submit" id="submitBtn" onclick="submitVideo()">开始总结</button>
     </div>
 
-    <button class="adv-toggle" type="button" onclick="toggleAdv()">
-      <span id="advArrow">▸</span> 高级配置（模板 / 邮箱 / 样式）
+    <button class="adv-toggle" id="advToggleBtn" type="button" onclick="toggleAdv()">
+      <span>高级配置（模板 / 邮箱 / 样式）</span>
+      <svg class="ic caret" viewBox="0 0 24 24"><path d="M6 9l6 6 6-6"/></svg>
     </button>
 
     <div class="adv-box hidden" id="advBox">
       <div class="field">
         <label>总结模板</label>
-        <select id="tplPreset" onchange="onTplPreset()">
+        <select class="ctrl" id="tplPreset" onchange="onTplPreset()">
           <option value="">默认精炼日报模板</option>
           <option value="notes">深度结构化笔记</option>
           <option value="quotes">金句与核心观点提取</option>
@@ -1046,15 +1212,15 @@ button{cursor:pointer}
       </div>
       <div class="field hidden" id="customTplWrap">
         <label>自定义模板（含 {content} 占位符）</label>
-        <textarea id="customTpl" placeholder="请根据以下视频内容提取核心干货：\n{content}"></textarea>
+        <textarea class="ctrl" id="customTpl" placeholder="请根据以下视频内容提取核心干货：\n{content}"></textarea>
       </div>
       <div class="field">
         <label>单条结果接收邮箱（可选）</label>
-        <input id="customEmail" type="email" placeholder="留空则发至默认邮箱">
+        <input class="ctrl" id="customEmail" type="email" placeholder="留空则发至默认邮箱">
       </div>
       <div class="field">
         <label>单条邮件样式</label>
-        <select id="singleEmailStyle">
+        <select class="ctrl" id="singleEmailStyle">
           <option value="editorial">编辑部日报（深色报头 · 默认）</option>
           <option value="minimal">极简纸刊（纯白 Notion 风）</option>
           <option value="bilibili">B站元气粉（樱花粉渐变）</option>
@@ -1067,8 +1233,10 @@ button{cursor:pointer}
 
     <div class="history-wrap">
       <div class="search-box">
-        <span class="s-ic">🔍</span>
-        <input id="searchInput" type="text" placeholder="搜索历史记录..." oninput="renderList()">
+        <span class="s-ic">
+          <svg class="ic" viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4.3-4.3"/></svg>
+        </span>
+        <input class="ctrl" id="searchInput" type="text" placeholder="搜索历史记录..." oninput="renderList()">
       </div>
       <div class="history-head">
         <h3>历史记录 <span class="count-pill" id="countPill">0</span></h3>
@@ -1088,55 +1256,102 @@ button{cursor:pointer}
   <!-- RIGHT MAIN PANEL -->
   <main class="main">
     <header class="topbar">
-      <div class="stepper hidden" id="stepperBar"></div>
+      <div id="topNavLeft">
+        <div class="nav-guest-label" id="guestNavLabel">视频分析工作台</div>
+        <div class="nav-tabs hidden" id="authedNavTabs">
+          <button class="nav-tab active" data-page="workspace" onclick="switchPage('workspace')">单条摘要</button>
+          <button class="nav-tab" data-page="monitor" onclick="switchPage('monitor')">UP 主监控</button>
+        </div>
+      </div>
+
       <div class="topbar-actions">
         <button class="pill-btn" id="monitorBtn" onclick="openMonitorEntry()">
-          <span id="monitorBtnIcon">🔐</span>
-          <span id="monitorBtnText">登录 · 监控与日报设置</span>
+          <span id="monitorBtnIcon"></span>
+          <span id="monitorBtnText">登录管理</span>
         </button>
-        <button class="icon-btn" id="themeBtn" onclick="toggleTheme()" title="切换浅色 / 暗色主题">🌙</button>
+        <button class="icon-btn" id="themeBtn" onclick="toggleTheme()" title="切换浅色 / 暗色主题"></button>
       </div>
     </header>
 
     <div class="content-scroll">
       <div class="content-inner">
-        <div class="empty-state" id="emptyState">
-          <div class="empty-ic">🎬</div>
-          <h2>粘贴 B 站链接，一键提炼视频精华</h2>
-          <p>支持直接粘贴 B 站完整链接、分享文案或 BV 号。系统将自动提取音频、免费语音转文字并生成结构化日报摘要；登录后还可配置 UP 主定时监控与多套精美邮件样式。</p>
-        </div>
+        <!-- PAGE 1: SINGLE VIDEO WORKSPACE -->
+        <div id="pageWorkspace">
+          <div class="stepper hidden" id="stepperBar"></div>
 
-        <div id="detailView" class="hidden">
-          <section class="video-head">
-            <div class="vh-left">
-              <h1 class="vh-title" id="dTitle">—</h1>
-              <div class="vh-pills" id="dPills"></div>
+          <div class="empty-state" id="emptyState">
+            <div class="empty-ic">
+              <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="5 3 19 12 5 21 5 3"/></svg>
             </div>
-            <a class="watch-btn" id="dWatchLink" href="#" target="_blank" rel="noopener">在B站观看 ↗</a>
-          </section>
-
-          <div class="view-bar">
-            <div class="seg-tabs" id="segTabs">
-              <button class="seg-tab active" data-mode="summary" onclick="setViewMode('summary')">✨ AI 总结</button>
-              <button class="seg-tab" data-mode="transcript" onclick="setViewMode('transcript')">📝 完整转录</button>
-              <button class="seg-tab" data-mode="split" onclick="setViewMode('split')">⚡ 分栏对照</button>
-            </div>
-            <div class="export-group">
-              <button class="exp-btn" onclick="copyCurrent()">📋 复制</button>
-              <button class="exp-btn" onclick="exportFile('md')">导出 MD</button>
-              <button class="exp-btn" onclick="exportFile('txt')">TXT</button>
-            </div>
+            <h2>粘贴 B 站链接，一键提炼视频精华</h2>
+            <p>支持 B 站完整链接、分享文案或 BV / av 号。系统自动提取音频、免费语音转文字并生成结构化摘要；登录后可进入「UP 主监控」浏览订阅动态并配置日报样式。</p>
           </div>
 
-          <div class="reader-grid" id="readerGrid">
-            <article class="reader-card" id="summaryPanel">
-              <div class="panel-label hidden" id="summaryPanelLabel">AI 总结</div>
-              <div id="summaryContent"></div>
-            </article>
-            <article class="reader-card hidden" id="transcriptPanel">
-              <div class="panel-label">完整语音转录</div>
-              <div class="transcript-box" id="transcriptContent"></div>
-            </article>
+          <div id="detailView" class="hidden">
+            <section class="video-head">
+              <div class="vh-left">
+                <h1 class="vh-title"><a id="dTitleLink" href="#" target="_blank" rel="noopener">—</a></h1>
+                <div class="vh-pills" id="dPills"></div>
+              </div>
+              <a class="watch-btn" id="dWatchLink" href="#" target="_blank" rel="noopener">
+                <span>在B站观看</span>
+                <svg class="ic" viewBox="0 0 24 24"><path d="M7 17L17 7M7 7h10v10"/></svg>
+              </a>
+            </section>
+
+            <div class="view-bar">
+              <div class="seg-tabs" id="segTabs">
+                <button class="seg-tab active" data-mode="summary" onclick="setViewMode('summary')">AI 总结</button>
+                <button class="seg-tab" data-mode="transcript" onclick="setViewMode('transcript')">完整转录</button>
+                <button class="seg-tab" data-mode="split" onclick="setViewMode('split')">分栏对照</button>
+              </div>
+              <div class="action-group">
+                <button class="act-btn" id="copyBtn" onclick="copyCurrent()">
+                  <svg class="ic" viewBox="0 0 24 24"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>
+                  <span>复制</span>
+                </button>
+                <button class="act-btn" onclick="exportFile('md')">
+                  <svg class="ic" viewBox="0 0 24 24"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+                  <span>导出 MD</span>
+                </button>
+                <button class="act-btn" onclick="exportFile('txt')">
+                  <span>导出 TXT</span>
+                </button>
+              </div>
+            </div>
+
+            <div class="reader-grid" id="readerGrid">
+              <article class="reader-card" id="summaryPanel">
+                <div class="panel-label hidden" id="summaryPanelLabel">AI 总结</div>
+                <div id="summaryContent"></div>
+              </article>
+              <article class="reader-card hidden" id="transcriptPanel">
+                <div class="panel-label">完整语音转录</div>
+                <div class="transcript-box" id="transcriptContent"></div>
+              </article>
+            </div>
+          </div>
+        </div>
+
+        <!-- PAGE 2: MONITORED UP CREATORS FEED (LOGGED-IN SECONDARY PAGE) -->
+        <div id="pageMonitor" class="hidden">
+          <div class="mon-header">
+            <div class="mon-header-info">
+              <h2>UP 主监控动态</h2>
+              <p id="monSummaryLine">正在加载监控配置...</p>
+            </div>
+            <div style="display:flex;gap:8px;flex-wrap:wrap">
+              <button class="btn" onclick="openMonitorModal()">监控与日报设置</button>
+              <button class="btn btn-primary" id="feedRunBtn" onclick="triggerMonitorNow('feedToast')">立即巡检</button>
+            </div>
+          </div>
+          <div class="sb-toast" id="feedToast" style="margin-bottom:14px"></div>
+
+          <div class="mon-grid">
+            <div class="up-nav-card" id="upFeedSidebar"></div>
+            <div class="feed-list" id="upFeedList">
+              <div class="reader-card" style="text-align:center;color:var(--muted)">请选择左侧 UP 主查看最新视频与 AI 摘要</div>
+            </div>
           </div>
         </div>
       </div>
@@ -1148,20 +1363,22 @@ button{cursor:pointer}
 <div class="modal-backdrop hidden" id="loginModal" onclick="if(event.target===this)closeModal('loginModal')">
   <div class="modal">
     <div class="modal-head">
-      <h2>🔐 管理员登录</h2>
-      <button class="icon-btn" onclick="closeModal('loginModal')">✕</button>
+      <h2>管理员登录</h2>
+      <button class="icon-btn" onclick="closeModal('loginModal')" aria-label="关闭">
+        <svg class="ic" viewBox="0 0 24 24"><path d="M18 6L6 18M6 6l12 12"/></svg>
+      </button>
     </div>
     <div class="modal-body">
-      <p style="font-size:13px;color:var(--soft);margin-bottom:14px;line-height:1.6">
-        登录后可在页面直接配置 UP 主监控名单、定时任务时间（自动同步至 Shy Cron）以及自定义日报邮件样式。
+      <p style="font-size:13px;color:var(--soft);margin-bottom:14px;line-height:1.65">
+        登录后可访问「UP 主监控」二级页面，并在线配置监控名单、Shy Cron 定时策略与日报邮件样式。
       </p>
       <div class="field" style="margin-bottom:12px">
         <label>账号</label>
-        <input id="loginUser" type="text" placeholder="请输入管理员账号" value="shiran">
+        <input class="ctrl" id="loginUser" type="text" placeholder="请输入管理员账号" value="shiran">
       </div>
       <div class="field">
         <label>密码</label>
-        <input id="loginPass" type="password" placeholder="请输入管理员密码" onkeydown="if(event.key==='Enter')doLogin()">
+        <input class="ctrl" id="loginPass" type="password" placeholder="请输入管理员密码" onkeydown="if(event.key==='Enter')doLogin()">
       </div>
       <div class="sb-toast" id="loginToast"></div>
     </div>
@@ -1177,38 +1394,40 @@ button{cursor:pointer}
   <div class="modal wide">
     <div class="modal-head">
       <div>
-        <h2>⚙️ 监控与日报样式配置</h2>
+        <h2>监控与日报样式配置</h2>
         <div style="font-size:12px;color:var(--muted);margin-top:2px">配置保存在 Cloudflare R2，定时策略自动同步至 Shy Cron</div>
       </div>
-      <button class="icon-btn" onclick="closeModal('monitorModal')">✕</button>
+      <button class="icon-btn" onclick="closeModal('monitorModal')" aria-label="关闭">
+        <svg class="ic" viewBox="0 0 24 24"><path d="M18 6L6 18M6 6l12 12"/></svg>
+      </button>
     </div>
     <div class="modal-body">
       <div class="m-tabs">
-        <button class="m-tab active" data-mtab="schedule" onclick="switchMonitorTab('schedule')">🕒 定时与 UP 主监控</button>
-        <button class="m-tab" data-mtab="email" onclick="switchMonitorTab('email')">🎨 邮件样式与实时预览</button>
+        <button class="m-tab active" data-mtab="schedule" onclick="switchMonitorTab('schedule')">定时与 UP 主监控</button>
+        <button class="m-tab" data-mtab="email" onclick="switchMonitorTab('email')">邮件样式与实时预览</button>
       </div>
 
-      <!-- TAB 1: SCHEDULE & UPs -->
+      <!-- TAB 1 -->
       <div id="mTabSchedule">
         <div class="form-section">
           <div class="switch-row">
             <div>
-              <div style="font-size:14px;font-weight:700">启用自动定时监控</div>
-              <div style="font-size:12px;color:var(--muted);margin-top:2px">开启后将通过 Shy Cron 按设定时间自动触发 GitHub Actions 抓取新视频</div>
+              <div style="font-size:13.5px;font-weight:700">启用自动定时监控</div>
+              <div style="font-size:12px;color:var(--muted);margin-top:2px">开启后通过 Shy Cron 按设定时间自动触发 GitHub Actions 抓取新视频</div>
             </div>
             <input type="checkbox" id="cfgEnabled" checked>
           </div>
         </div>
 
         <div class="form-section">
-          <h4>
-            <span>定时运行计划（北京时间 UTC+8）</span>
-            <span class="cron-badge" id="cronUtcPreview">UTC: 0 0,12 * * *</span>
-          </h4>
+          <div class="sec-head">
+            <h4>定时运行计划（北京时间 UTC+8）</h4>
+            <span class="cron-badge" id="cronUtcPreview">UTC Cron: 0 0,12 * * *</span>
+          </div>
           <div class="form-row">
             <div class="field">
               <label>调度模式</label>
-              <select id="cfgScheduleMode" onchange="onScheduleModeChange()">
+              <select class="ctrl" id="cfgScheduleMode" onchange="onScheduleModeChange()">
                 <option value="times">指定每天运行时间（北京时间）</option>
                 <option value="every_12h">每 12 小时（08:00 / 20:00）</option>
                 <option value="every_6h">每 6 小时运行一次</option>
@@ -1217,12 +1436,12 @@ button{cursor:pointer}
             </div>
             <div class="field" id="customCronWrap" style="display:none">
               <label>UTC Cron 表达式（5位）</label>
-              <input id="cfgCustomCron" type="text" placeholder="0 0,12 * * *" oninput="updateCronPreview()">
+              <input class="ctrl" id="cfgCustomCron" type="text" placeholder="0 0,12 * * *" oninput="updateCronPreview()">
             </div>
             <div class="field" id="timeAddWrap">
-              <label>添加每日运行时间点（同分钟）</label>
+              <label>添加每日运行时间点</label>
               <div class="inline-add">
-                <input id="newTimeInput" type="time" value="08:00">
+                <input class="ctrl" id="newTimeInput" type="time" value="08:00">
                 <button class="btn" type="button" onclick="addTimeSlot()">+ 添加</button>
               </div>
             </div>
@@ -1232,39 +1451,48 @@ button{cursor:pointer}
         </div>
 
         <div class="form-section">
-          <h4>监控 UP 主列表（<span id="upCountLabel">0</span> 位）</h4>
-          <div class="inline-add" style="margin-bottom:8px">
-            <input id="newUpInput" type="text" placeholder="输入 UP 主 UID 或主页链接（如 346563107 或 https://space.bilibili.com/346563107）" onkeydown="if(event.key==='Enter')addUpCreator()">
+          <div class="sec-head">
+            <h4>监控 UP 主列表（<span id="upCountLabel">0</span> 位）</h4>
+          </div>
+          <div class="inline-add">
+            <input class="ctrl" id="newUpInput" type="text" placeholder="输入 UP 主 UID 或主页链接（如 346563107 或 https://space.bilibili.com/346563107）" onkeydown="if(event.key==='Enter')addUpCreator()">
             <button class="btn btn-primary" type="button" id="addUpBtn" onclick="addUpCreator()">解析并添加</button>
           </div>
           <div class="chip-list" id="upChips"></div>
         </div>
 
-        <div class="form-row">
-          <div class="field">
-            <label>扫描时间窗口</label>
-            <select id="cfgWindowHours">
-              <option value="24">最近 24 小时</option>
-              <option value="48">最近 48 小时</option>
-              <option value="72">最近 72 小时（3天）</option>
-              <option value="168">最近 7 天</option>
-            </select>
+        <div class="form-section" style="margin-bottom:0">
+          <div class="sec-head">
+            <h4>扫描策略</h4>
           </div>
-          <div class="field">
-            <label>单次每位 UP 主最多处理条数</label>
-            <select id="cfgMaxVideos">
-              <option value="3">最多 3 支</option>
-              <option value="5">最多 5 支</option>
-              <option value="10">最多 10 支</option>
-            </select>
+          <div class="form-row">
+            <div class="field">
+              <label>扫描时间窗口</label>
+              <select class="ctrl" id="cfgWindowHours">
+                <option value="24">最近 24 小时</option>
+                <option value="48">最近 48 小时</option>
+                <option value="72">最近 72 小时（3天）</option>
+                <option value="168">最近 7 天</option>
+              </select>
+            </div>
+            <div class="field">
+              <label>单次每位 UP 主最多处理条数</label>
+              <select class="ctrl" id="cfgMaxVideos">
+                <option value="3">最多 3 支</option>
+                <option value="5">最多 5 支</option>
+                <option value="10">最多 10 支</option>
+              </select>
+            </div>
           </div>
         </div>
       </div>
 
-      <!-- TAB 2: EMAIL STYLES & LIVE PREVIEW -->
+      <!-- TAB 2 -->
       <div id="mTabEmail" class="hidden">
         <div class="form-section">
-          <h4>选择日报邮件样式（开源多风格 · 点击卡片实时预览）</h4>
+          <div class="sec-head">
+            <h4>选择日报邮件样式（点击切换实时预览）</h4>
+          </div>
           <div class="style-grid" id="styleGrid">
             <button type="button" class="style-card" data-style="editorial" onclick="selectEmailStyle('editorial')">
               <div class="style-thumb" style="background:#f8fafc">
@@ -1317,18 +1545,18 @@ button{cursor:pointer}
             </button>
           </div>
 
-          <div class="form-row" style="margin-bottom:0">
-            <div class="switch-row" style="padding:8px 12px;background:var(--surface);border:1px solid var(--border);border-radius:9px">
+          <div class="form-row">
+            <div class="switch-row" style="height:38px;padding:0 12px;background:var(--surface);border:1px solid var(--border);border-radius:9px">
               <span style="font-size:12.5px;font-weight:600">多 UP 主合并为同一封日报</span>
               <input type="checkbox" id="cfgMergeEmails" checked onchange="renderEmailPreview()">
             </div>
             <div class="field">
-              <input id="cfgSmtpTo" type="email" placeholder="自定义收件邮箱（留空用默认 Secret）">
+              <input class="ctrl" id="cfgSmtpTo" type="email" placeholder="自定义收件邮箱（留空用默认 Secret）">
             </div>
           </div>
         </div>
 
-        <div style="font-size:12px;font-weight:700;color:var(--soft);margin-bottom:8px">实时仿真日报预览（所见即所得）</div>
+        <div style="font-size:12px;font-weight:700;color:var(--soft);margin-bottom:8px">实时仿真日报预览（标题均可直接跳转 B 站原视频页）</div>
         <iframe id="emailPreviewFrame" class="email-preview-frame" title="邮件样式预览"></iframe>
       </div>
 
@@ -1337,11 +1565,11 @@ button{cursor:pointer}
     <div class="modal-foot">
       <div style="display:flex;gap:8px;align-items:center">
         <button class="btn" type="button" onclick="doLogout()">退出登录</button>
-        <button class="btn" type="button" id="runNowBtn" onclick="triggerMonitorNow()">⚡ 立即运行一次监控</button>
+        <button class="btn" type="button" id="runNowBtn" onclick="triggerMonitorNow('monitorToast')">立即运行一次监控</button>
       </div>
       <div style="display:flex;gap:8px">
         <button class="btn" type="button" onclick="closeModal('monitorModal')">关闭</button>
-        <button class="btn btn-brand" type="button" id="saveMonitorBtn" onclick="saveMonitorConfig()">💾 保存并同步定时任务</button>
+        <button class="btn btn-brand" type="button" id="saveMonitorBtn" onclick="saveMonitorConfig()">保存并同步定时任务</button>
       </div>
     </div>
   </div>
@@ -1353,7 +1581,9 @@ const LS_THEME = 'bilisum_theme_v3';
 const LS_AUTH = 'bilisum_auth_token';
 const LS_USER = 'bilisum_auth_user';
 
+let currentPage = 'workspace';
 let selectedJobId = null;
+let selectedUpMid = null;
 let viewMode = 'summary';
 let batchMode = false;
 let selectedIds = [];
@@ -1377,8 +1607,20 @@ const TPL_PRESETS = {
   quotes: '请提取以下视频中的核心观点与高价值原话金句（5-8条），并附简要背景解读：\n{content}',
 };
 
+const SVG_LOCK = '<svg class="ic" viewBox="0 0 24 24"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>';
+const SVG_SLIDERS = '<svg class="ic" viewBox="0 0 24 24"><line x1="4" y1="21" x2="4" y2="14"/><line x1="4" y1="10" x2="4" y2="3"/><line x1="12" y1="21" x2="12" y2="12"/><line x1="12" y1="8" x2="12" y2="3"/><line x1="20" y1="21" x2="20" y2="16"/><line x1="20" y1="12" x2="20" y2="3"/><line x1="1" y1="14" x2="7" y2="14"/><line x1="9" y1="8" x2="15" y2="8"/><line x1="17" y1="16" x2="23" y2="16"/></svg>';
+const SVG_SUN = '<svg class="ic" viewBox="0 0 24 24"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M6.34 17.66l-1.41 1.41M19.07 4.93l-1.41 1.41"/></svg>';
+const SVG_MOON = '<svg class="ic" viewBox="0 0 24 24"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg>';
+const SVG_CLOSE_SM = '<svg class="ic" viewBox="0 0 24 24"><path d="M18 6L6 18M6 6l12 12"/></svg>';
+
 function esc(s) {
   return String(s || '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}
+
+function normStatus(st) {
+  if (st === 'done' || st === 'success' || st === 'completed') return 'completed';
+  if (st === 'failed' || st === 'error') return 'failed';
+  return 'pending';
 }
 
 function showToast(elId, msg, kind) {
@@ -1386,21 +1628,21 @@ function showToast(elId, msg, kind) {
   if (!el) return;
   el.textContent = msg;
   el.className = 'sb-toast show ' + (kind || 'info');
-  if (kind === 'ok') setTimeout(() => { el.classList.remove('show'); }, 4500);
+  if (kind === 'ok' || kind === 'info') setTimeout(() => { el.classList.remove('show'); }, 4500);
 }
 
 // ── Theme ──
 function initTheme() {
   const saved = localStorage.getItem(LS_THEME) || 'light';
   document.documentElement.setAttribute('data-theme', saved);
-  document.getElementById('themeBtn').textContent = saved === 'dark' ? '☀️' : '🌙';
+  document.getElementById('themeBtn').innerHTML = saved === 'dark' ? SVG_SUN : SVG_MOON;
 }
 function toggleTheme() {
   const cur = document.documentElement.getAttribute('data-theme') || 'light';
   const next = cur === 'dark' ? 'light' : 'dark';
   document.documentElement.setAttribute('data-theme', next);
   localStorage.setItem(LS_THEME, next);
-  document.getElementById('themeBtn').textContent = next === 'dark' ? '☀️' : '🌙';
+  document.getElementById('themeBtn').innerHTML = next === 'dark' ? SVG_SUN : SVG_MOON;
 }
 
 // ── Sidebar Divider Drag ──
@@ -1410,7 +1652,7 @@ function toggleTheme() {
   div.addEventListener('mousedown', () => { dragging = true; div.classList.add('dragging'); document.body.style.userSelect = 'none'; });
   window.addEventListener('mousemove', (e) => {
     if (!dragging) return;
-    const w = Math.max(260, Math.min(520, e.clientX));
+    const w = Math.max(260, Math.min(500, e.clientX));
     document.getElementById('appRoot').style.setProperty('--sidebar-w', w + 'px');
   });
   window.addEventListener('mouseup', () => {
@@ -1422,27 +1664,46 @@ function toggleTheme() {
 // ── Advanced Panel ──
 function toggleAdv() {
   const box = document.getElementById('advBox');
-  const open = box.classList.toggle('hidden');
-  document.getElementById('advArrow').textContent = open ? '▸' : '▾';
+  const btn = document.getElementById('advToggleBtn');
+  const isNowHidden = box.classList.toggle('hidden');
+  btn.classList.toggle('open', !isNowHidden);
 }
 function onTplPreset() {
   const v = document.getElementById('tplPreset').value;
   document.getElementById('customTplWrap').classList.toggle('hidden', v !== 'custom');
 }
 
-// ── Jobs Storage (LocalStorage + R2 sync) ──
+// ── Page Switcher (Workspace vs UP Monitor Secondary Page) ──
+async function switchPage(page) {
+  if (page === 'monitor' && !authUser) {
+    openModal('loginModal');
+    return;
+  }
+  currentPage = page;
+  document.querySelectorAll('#authedNavTabs .nav-tab').forEach(b => b.classList.toggle('active', b.dataset.page === page));
+  document.getElementById('pageWorkspace').classList.toggle('hidden', page !== 'workspace');
+  document.getElementById('pageMonitor').classList.toggle('hidden', page !== 'monitor');
+  if (page === 'monitor') {
+    await loadMonitorPage();
+  }
+}
+
+// ── Jobs Storage ──
 function getJobs() {
-  try { return JSON.parse(localStorage.getItem(LS_JOBS) || localStorage.getItem('b2t_jobs_v2') || '[]'); }
-  catch { return []; }
+  try {
+    const raw = JSON.parse(localStorage.getItem(LS_JOBS) || localStorage.getItem('b2t_jobs_v2') || '[]');
+    return Array.isArray(raw) ? raw.map(j => ({ ...j, status: normStatus(j.status) })) : [];
+  } catch { return []; }
 }
 function saveJobs(jobs, syncR2 = true) {
-  localStorage.setItem(LS_JOBS, JSON.stringify(jobs));
+  const normalized = jobs.map(j => ({ ...j, status: normStatus(j.status) }));
+  localStorage.setItem(LS_JOBS, JSON.stringify(normalized));
   renderList();
   if (syncR2) {
     fetch('/api/history', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ jobs: jobs.slice(0, 100) }),
+      body: JSON.stringify({ jobs: normalized.slice(0, 100) }),
     }).catch(() => {});
   }
 }
@@ -1455,7 +1716,7 @@ async function syncFromR2() {
     if (!Array.isArray(remote) || remote.length === 0) return;
     const local = getJobs();
     const map = new Map();
-    remote.forEach(j => { if (j && j.id) map.set(j.id, j); });
+    remote.forEach(j => { if (j && j.id) map.set(j.id, { ...j, status: normStatus(j.status) }); });
     local.forEach(j => {
       if (j && j.id) {
         const prev = map.get(j.id);
@@ -1470,9 +1731,9 @@ async function syncFromR2() {
 }
 
 // ── Submit Video ──
-async function submitVideo() {
+async function submitVideo(overrideUrl) {
   const input = document.getElementById('videoUrl');
-  const raw = input.value.trim();
+  const raw = (overrideUrl !== undefined ? String(overrideUrl) : input.value).trim();
   if (!raw) { showToast('sbToast', '请输入 B 站视频链接或 BV 号', 'err'); return; }
 
   const preset = document.getElementById('tplPreset').value;
@@ -1485,7 +1746,7 @@ async function submitVideo() {
 
   const btn = document.getElementById('submitBtn');
   btn.disabled = true;
-  btn.textContent = '提交中…';
+  btn.textContent = '提交中...';
 
   try {
     const resp = await fetch('/api/submit', {
@@ -1508,8 +1769,9 @@ async function submitVideo() {
     };
     const jobs = [newJob, ...getJobs().filter(j => j.id !== newJob.id)];
     saveJobs(jobs);
-    input.value = '';
+    if (overrideUrl === undefined) input.value = '';
     showToast('sbToast', '已提交处理队列，约 30~60 秒完成', 'ok');
+    if (currentPage !== 'workspace') switchPage('workspace');
     selectJob(newJob.id);
     startPolling(newJob.id);
   } catch (e) {
@@ -1530,6 +1792,7 @@ function startPolling(jobId) {
       const r = await fetch('/api/jobs/' + encodeURIComponent(jobId));
       if (!r.ok) return;
       const data = await r.json();
+      data.status = normStatus(data.status);
       const jobs = getJobs();
       const idx = jobs.findIndex(j => j.id === jobId);
       if (idx >= 0) {
@@ -1554,6 +1817,12 @@ function fmtShortDate(iso) {
   const p = n => String(n).padStart(2, '0');
   return d.getFullYear() + '/' + p(d.getMonth()+1) + '/' + p(d.getDate()) + ' ' + p(d.getHours()) + ':' + p(d.getMinutes());
 }
+function fmtUnix(ts) {
+  if (!ts) return '';
+  const d = new Date(ts * 1000);
+  const p = n => String(n).padStart(2, '0');
+  return d.getFullYear() + '-' + p(d.getMonth()+1) + '-' + p(d.getDate()) + ' ' + p(d.getHours()) + ':' + p(d.getMinutes());
+}
 
 function renderList() {
   const kw = (document.getElementById('searchInput').value || '').trim().toLowerCase();
@@ -1572,8 +1841,9 @@ function renderList() {
   }
 
   container.innerHTML = filtered.map(j => {
-    const active = j.id === selectedJobId ? ' active' : '';
-    const dotCls = j.status === 'completed' ? 'ok' : (j.status === 'failed' ? 'err' : 'pending');
+    const active = j.id === selectedJobId && currentPage === 'workspace' ? ' active' : '';
+    const st = normStatus(j.status);
+    const dotCls = st === 'completed' ? 'ok' : (st === 'failed' ? 'err' : 'pending');
     const metaParts = [];
     if (j.owner) metaParts.push(j.owner);
     if (j.duration) metaParts.push(j.duration);
@@ -1590,13 +1860,14 @@ function renderList() {
       '</div>' +
       '<div class="h-right">' +
         '<span class="dot ' + dotCls + '"></span>' +
-        (!batchMode ? '<button class="h-del" title="删除" onclick="event.stopPropagation();deleteOneJob(\'' + esc(j.id) + '\')">✕</button>' : '') +
+        (!batchMode ? '<button class="h-del" title="删除" onclick="event.stopPropagation();deleteOneJob(\'' + esc(j.id) + '\')">' + SVG_CLOSE_SM + '</button>' : '') +
       '</div>' +
     '</div>';
   }).join('');
 }
 
 function selectJob(id) {
+  if (currentPage !== 'workspace') switchPage('workspace');
   selectedJobId = id;
   const job = getJobs().find(j => j.id === id);
   renderList();
@@ -1604,7 +1875,7 @@ function selectJob(id) {
   document.getElementById('emptyState').classList.add('hidden');
   document.getElementById('detailView').classList.remove('hidden');
   renderDetail(job);
-  if (job.status === 'pending' || job.status === 'submitted') startPolling(job.id);
+  if (normStatus(job.status) === 'pending') startPolling(job.id);
 }
 
 function deleteOneJob(id) {
@@ -1678,10 +1949,7 @@ function renderRichSummary(md) {
   const lines = md.replace(/\r\n/g, '\n').split('\n');
   const sections = [];
   let cur = { kind: 'body', lines: [] };
-
-  function pushCur() {
-    if (cur.lines.length) sections.push(cur);
-  }
+  function pushCur() { if (cur.lines.length) sections.push(cur); }
 
   for (const raw of lines) {
     const line = raw.trim();
@@ -1689,12 +1957,8 @@ function renderRichSummary(md) {
     if (/^#\s+/.test(line) && !line.startsWith('##')) continue;
 
     const kind = detectSectionKind(line);
-    if (kind) {
-      pushCur();
-      cur = { kind, lines: [] };
-      continue;
-    }
-    const inlineSec = line.match(/^(?:[-*•]\s*)?(?:[📌📋💡🎯✨]\s*)?\*\*(核心主题|要点提炼|总结|核心观点)\*\*\s*[:：]\s*(.+)$/);
+    if (kind) { pushCur(); cur = { kind, lines: [] }; continue; }
+    const inlineSec = line.match(/^(?:[-*•]\s*)?(?:[^\w\u4e00-\u9fa5]*)\*\*(核心主题|要点提炼|总结|核心观点)\*\*\s*[:：]\s*(.+)$/);
     if (inlineSec) {
       pushCur();
       cur = { kind: detectSectionKind(inlineSec[1]) || 'body', lines: [inlineSec[2].trim()] };
@@ -1736,56 +2000,119 @@ function renderRichSummary(md) {
   }).join('');
 }
 
+// ── Failure Diagnostics Renderer ──
+const STAGE_LABELS = {
+  id_parse: '视频 ID 解析',
+  video_info: '获取视频信息',
+  playurl: '解析音频流',
+  cdn_download: '下载 B 站音频',
+  stt: '免费语音转文字',
+  summarize: 'AI 生成总结',
+};
+
+function renderFailureDiagnostics(job) {
+  let stage = job.error_stage || '';
+  let errText = job.error || '';
+  let hint = job.error_hint || '';
+
+  // Smart fallback inference for legacy historical failed records that didn't store error_stage
+  if (!stage) {
+    const bvid = String(job.bvid || '');
+    const totalSec = job.timings && job.timings.total ? Number(job.timings.total) : null;
+    if (/^av\d+$/i.test(bvid) && totalSec !== null && totalSec <= 3) {
+      stage = 'video_info';
+      errText = errText || '旧版后端未兼容 av 号直接查询，或该视频已被删除/设为不可见（耗时 ' + totalSec + 's 即中断）';
+      hint = hint || '当前新版已支持 av 号解析；请确认该视频在 B 站可正常公开打开，然后点击下方「重新处理此视频」重试。';
+    } else if (totalSec !== null && totalSec <= 5) {
+      stage = 'playurl';
+      errText = errText || '在获取视频信息或音频流阶段快速中断（耗时 ' + totalSec + 's）';
+      hint = hint || '常见原因：当时 B 站封禁了 GitHub Actions 节点 (-412)、视频为大会员/充电专属、或稿件已下架。现已接入中继与 WBI 签名，可直接重试。';
+    } else {
+      stage = 'stt';
+      errText = errText || '语音识别阶段未能返回有效文本内容';
+      hint = hint || '常见原因：硅基流动语音识别接口临时波动 (500/超时)、音频无有效人声或文件过大。可点击下方按钮重新处理，或在 GitHub Secrets 配置免费的 GROQ_API_KEY 作为高精度免费通道。';
+    }
+  }
+
+  const stageLabel = STAGE_LABELS[stage] || stage || '处理链路';
+  return '<div class="diag-card">' +
+    '<div class="diag-head">' +
+      '<div class="diag-title">处理失败 · 故障定位</div>' +
+      '<span class="diag-stage">异常环节：' + esc(stageLabel) + '</span>' +
+    '</div>' +
+    '<div class="diag-rows">' +
+      '<div class="diag-row"><span class="diag-key">报错详情</span><span>' + esc(errText || '未能获取视频文字内容') + '</span></div>' +
+      '<div class="diag-row"><span class="diag-key">可能原因</span><span>' + esc(hint || '请检查视频是否公开可播放，或稍后重试。') + '</span></div>' +
+    '</div>' +
+    '<div class="diag-foot">' +
+      '<span style="font-size:12px;color:var(--soft)">视频 ID：<code>' + esc(job.bvid || '') + '</code></span>' +
+      '<button class="btn btn-sm btn-primary" onclick="submitVideo(\'' + esc(job.bvid || '') + '\')">重新处理此视频</button>' +
+    '</div>' +
+  '</div>';
+}
+
 // ── Detail View & Stepper ──
 function renderStepper(job) {
   const bar = document.getElementById('stepperBar');
   bar.classList.remove('hidden');
+  const st = normStatus(job.status);
   let steps = job.gh_steps;
   if (!steps) {
-    const doneAll = job.status === 'completed';
-    const fail = job.status === 'failed';
+    const doneAll = st === 'completed';
+    const fail = st === 'failed';
     steps = [
       { name: '任务创建', done: true, active: false },
       { name: '下载音频', done: doneAll, active: !doneAll && !fail },
       { name: '语音转录', done: doneAll, active: false },
-      { name: 'AI总结', done: doneAll, active: false },
-      { name: '完成', done: doneAll, failed: fail },
+      { name: 'AI 总结', done: doneAll, active: false },
     ];
+  } else {
+    steps = steps.slice(0, 4);
   }
-  bar.innerHTML = steps.map((s, i) => {
-    const isLast = i === steps.length - 1;
-    let cls = 'st-item';
-    let icon = '○';
-    if (isLast && s.done) { cls += ' final-done'; icon = '✓'; }
-    else if (isLast && s.failed) { cls += ' final-err'; icon = '✕'; }
-    else if (s.done) { cls += ' done'; icon = '✓'; }
-    else if (s.active) { cls += ' active'; icon = '●'; }
-    return '<span class="' + cls + '"><span class="st-ic">' + icon + '</span> ' + esc(s.name) + '</span>' +
-      (isLast ? '' : '<span class="st-arrow">→</span>');
+
+  const badgeHtml = st === 'completed'
+    ? '<span class="st-badge ok">已完成</span>'
+    : (st === 'failed' ? '<span class="st-badge err">处理失败</span>' : '<span class="st-badge pending">处理中</span>');
+
+  const items = steps.map((s, i) => {
+    const cls = s.done ? 'st-item done' : (s.active ? 'st-item active' : 'st-item');
+    const dot = s.done ? '<span class="st-dot">&#10003;</span>' : '<span class="st-dot">' + (i + 1) + '</span>';
+    const line = '<span class="st-line' + (s.done ? ' done' : '') + '"></span>';
+    return '<span class="' + cls + '">' + dot + '<span>' + esc(s.name) + '</span></span>' + line;
   }).join('');
+
+  bar.innerHTML = items + badgeHtml;
 }
 
 function renderDetail(job) {
   renderStepper(job);
-  document.getElementById('dTitle').textContent = job.title || job.bvid || '处理中…';
-  document.getElementById('dWatchLink').href = job.video_url || ('https://www.bilibili.com/video/' + job.bvid);
+  const videoUrl = job.video_url || ('https://www.bilibili.com/video/' + job.bvid);
+  const titleLink = document.getElementById('dTitleLink');
+  titleLink.textContent = job.title || job.bvid || '处理中...';
+  titleLink.href = videoUrl;
+  document.getElementById('dWatchLink').href = videoUrl;
 
   const pills = [];
-  if (job.owner) pills.push('UP主: ' + job.owner);
-  if (job.duration) pills.push('⏱ ' + job.duration);
+  if (job.owner) pills.push('UP主：' + job.owner);
+  if (job.duration) pills.push('时长 ' + job.duration);
   if (job.bvid) pills.push(job.bvid);
-  if (job.timings && job.timings.total) pills.push('⚡ 耗时 ' + job.timings.total + 's');
+  if (job.timings && job.timings.total) pills.push('耗时 ' + job.timings.total + 's');
   else if (job.created_at) pills.push(fmtShortDate(job.created_at));
   document.getElementById('dPills').innerHTML = pills.map(p => '<span class="meta-pill">' + esc(p) + '</span>').join('');
 
-  if (job.status === 'pending' || job.status === 'submitted') {
-    document.getElementById('summaryContent').innerHTML = '<div class="pending-banner">⏳ GitHub Actions 正在提取音频、免费语音转文字并生成 AI 摘要，页面会自动刷新…</div>';
-    document.getElementById('transcriptContent').textContent = '等待转录完成…';
-  } else if (job.status === 'failed') {
-    document.getElementById('summaryContent').innerHTML = '<div class="pending-banner" style="color:var(--err-text)">❌ 处理失败：' + esc(job.error || '未能获取视频文字内容') + '</div>';
+  const st = normStatus(job.status);
+  if (st === 'pending') {
+    document.getElementById('summaryContent').innerHTML = '<div class="pending-banner">GitHub Actions 正在提取音频、免费语音转文字并生成 AI 摘要，页面会自动刷新...</div>';
+    document.getElementById('transcriptContent').textContent = '等待转录完成...';
+  } else if (st === 'failed') {
+    document.getElementById('summaryContent').innerHTML = renderFailureDiagnostics(job);
     document.getElementById('transcriptContent').textContent = job.transcript || '无转录内容';
   } else {
-    document.getElementById('summaryContent').innerHTML = renderRichSummary(job.summary || '');
+    let notice = '';
+    if (job.error_hint) {
+      notice = '<div class="sb-toast show info" style="margin:0 0 14px 0">' + esc(job.error_hint) + '</div>';
+    }
+    document.getElementById('summaryContent').innerHTML = notice + renderRichSummary(job.summary || '');
     document.getElementById('transcriptContent').textContent = job.transcript || '（该任务无语音转录文本）';
   }
   applyViewMode();
@@ -1812,7 +2139,11 @@ function copyCurrent() {
   const job = getJobs().find(j => j.id === selectedJobId);
   if (!job) return;
   const txt = viewMode === 'transcript' ? (job.transcript || '') : (job.summary || '');
-  navigator.clipboard.writeText(txt).then(() => showToast('sbToast', '已复制到剪贴板', 'ok')).catch(() => {});
+  navigator.clipboard.writeText(txt).then(() => {
+    const btn = document.getElementById('copyBtn');
+    const span = btn.querySelector('span');
+    if (span) { span.textContent = '已复制'; setTimeout(() => { span.textContent = '复制'; }, 1600); }
+  }).catch(() => {});
 }
 
 function exportFile(ext) {
@@ -1829,10 +2160,9 @@ function exportFile(ext) {
   URL.revokeObjectURL(a.href);
 }
 
-// ── Auth & Modals ──
+// ── Auth & Secondary Navigation ──
 function openModal(id) { document.getElementById(id).classList.remove('hidden'); }
 function closeModal(id) { document.getElementById(id).classList.add('hidden'); }
-
 function getAuthToken() { return localStorage.getItem(LS_AUTH) || ''; }
 
 async function checkAuth() {
@@ -1841,7 +2171,7 @@ async function checkAuth() {
   try {
     const r = await fetch('/api/auth/me', { headers: { 'Authorization': 'Bearer ' + tok } });
     const d = await r.json();
-    if (d.authenticated) { updateAuthUi(d.username); }
+    if (d.authenticated) updateAuthUi(d.username);
     else { localStorage.removeItem(LS_AUTH); updateAuthUi(''); }
   } catch { updateAuthUi(''); }
 }
@@ -1851,14 +2181,18 @@ function updateAuthUi(user) {
   const btn = document.getElementById('monitorBtn');
   const ic = document.getElementById('monitorBtnIcon');
   const tx = document.getElementById('monitorBtnText');
+  document.getElementById('guestNavLabel').classList.toggle('hidden', Boolean(authUser));
+  document.getElementById('authedNavTabs').classList.toggle('hidden', !authUser);
+
   if (authUser) {
     btn.classList.add('authed');
-    ic.textContent = '⚙️';
-    tx.textContent = authUser + ' · 监控与日报设置';
+    ic.innerHTML = SVG_SLIDERS;
+    tx.textContent = authUser + ' · 监控设置';
   } else {
     btn.classList.remove('authed');
-    ic.textContent = '🔐';
-    tx.textContent = '登录 · 监控与日报设置';
+    ic.innerHTML = SVG_LOCK;
+    tx.textContent = '登录管理';
+    if (currentPage === 'monitor') switchPage('workspace');
   }
 }
 
@@ -1868,6 +2202,10 @@ async function openMonitorEntry() {
     setTimeout(() => document.getElementById('loginPass').focus(), 60);
     return;
   }
+  await openMonitorModal();
+}
+
+async function openMonitorModal() {
   openModal('monitorModal');
   await loadMonitorConfig();
 }
@@ -1884,17 +2222,13 @@ async function doLogin() {
       body: JSON.stringify({ username, password }),
     });
     const d = await r.json();
-    if (!r.ok) {
-      showToast('loginToast', d.error || '登录失败', 'err');
-      return;
-    }
+    if (!r.ok) { showToast('loginToast', d.error || '登录失败', 'err'); return; }
     localStorage.setItem(LS_AUTH, d.token);
     localStorage.setItem(LS_USER, d.username);
     updateAuthUi(d.username);
     closeModal('loginModal');
     document.getElementById('loginPass').value = '';
-    openModal('monitorModal');
-    await loadMonitorConfig();
+    await switchPage('monitor');
   } catch (e) {
     showToast('loginToast', '网络错误: ' + e.message, 'err');
   } finally {
@@ -1910,7 +2244,103 @@ function doLogout() {
   showToast('sbToast', '已退出管理员登录', 'info');
 }
 
-// ── Monitor Settings Logic ──
+// ── Secondary Page: Monitored UP Creators & Video Feed ──
+async function loadMonitorPage() {
+  await loadMonitorConfig();
+  const ups = monitorConfig.up_list || [];
+  const styleNames = { editorial: '编辑部日报', minimal: '极简纸刊', bilibili: 'B站元气粉', compact: '极速速览' };
+  const statusStr = monitorConfig.enabled !== false ? '定时监控运行中' : '定时监控已暂停';
+  const timeStr = monitorConfig.schedule_mode === 'times'
+    ? ('北京时间 ' + (monitorConfig.times_cst || []).join('、'))
+    : ('UTC Cron ' + (monitorConfig.cron_utc || ''));
+  document.getElementById('monSummaryLine').textContent =
+    statusStr + ' · ' + timeStr + ' · 共监控 ' + ups.length + ' 位 UP 主 · 样式：' + (styleNames[monitorConfig.email_style] || '编辑部日报');
+
+  const side = document.getElementById('upFeedSidebar');
+  if (!ups.length) {
+    side.innerHTML = '<div style="padding:14px;font-size:12.5px;color:var(--muted)">暂未添加 UP 主，请点击右上角「监控与日报设置」添加</div>';
+    document.getElementById('upFeedList').innerHTML = '';
+    return;
+  }
+
+  if (!selectedUpMid || !ups.some(u => Number(u.mid) === Number(selectedUpMid))) {
+    selectedUpMid = ups[0].mid;
+  }
+
+  side.innerHTML = ups.map(u =>
+    '<button class="up-nav-item' + (Number(u.mid) === Number(selectedUpMid) ? ' active' : '') + '" onclick="selectMonitorUp(' + Number(u.mid) + ')">' +
+      '<div style="min-width:0">' +
+        '<div class="up-nav-name">' + esc(u.name || u.mid) + '</div>' +
+        '<div class="up-nav-uid">UID ' + esc(u.mid) + '</div>' +
+      '</div>' +
+    '</button>'
+  ).join('');
+
+  await fetchUpFeed(selectedUpMid);
+}
+
+async function selectMonitorUp(mid) {
+  selectedUpMid = mid;
+  document.querySelectorAll('#upFeedSidebar .up-nav-item').forEach(btn => {
+    btn.classList.toggle('active', btn.getAttribute('onclick') === 'selectMonitorUp(' + Number(mid) + ')');
+  });
+  await fetchUpFeed(mid);
+}
+
+async function fetchUpFeed(mid) {
+  const listEl = document.getElementById('upFeedList');
+  listEl.innerHTML = '<div class="reader-card" style="text-align:center;color:var(--muted);padding:32px">正在拉取该 UP 主最新视频列表...</div>';
+  try {
+    const r = await fetch('/api/up-videos?mid=' + encodeURIComponent(mid) + '&ps=15', {
+      headers: { 'Authorization': 'Bearer ' + getAuthToken() },
+    });
+    const d = await r.json();
+    if (!r.ok) {
+      listEl.innerHTML = '<div class="reader-card" style="color:var(--err-text)">拉取失败：' + esc(d.error || ('HTTP ' + r.status)) + '</div>';
+      return;
+    }
+    const vids = d.videos || [];
+    if (!vids.length) {
+      listEl.innerHTML = '<div class="reader-card" style="text-align:center;color:var(--muted)">暂未获取到公开视频</div>';
+      return;
+    }
+    listEl.innerHTML = vids.map((v, idx) => {
+      const hasSum = Boolean(v.summary);
+      const sumBlock = hasSum
+        ? '<div class="feed-summary-wrap hidden" id="feed-sum-' + idx + '">' + renderRichSummary(v.summary) + '</div>'
+        : '';
+      return '<div class="feed-card">' +
+        '<div class="feed-top">' +
+          '<a class="feed-title" href="' + esc(v.url) + '" target="_blank" rel="noopener">' + esc(v.title) + '</a>' +
+          (hasSum ? '<span class="st-badge ok">已有日报摘要</span>' : '') +
+        '</div>' +
+        '<div class="feed-meta">' +
+          (v.duration ? '<span>时长 ' + esc(v.duration) + '</span>' : '') +
+          (v.created ? '<span>发布于 ' + esc(fmtUnix(v.created)) + '</span>' : '') +
+          (v.play ? '<span>播放 ' + esc(v.play) + '</span>' : '') +
+          '<span style="font-family:Consolas,monospace">' + esc(v.bvid) + '</span>' +
+        '</div>' +
+        '<div class="feed-actions">' +
+          '<a class="btn btn-sm" href="' + esc(v.url) + '" target="_blank" rel="noopener">打开原视频 ↗</a>' +
+          (hasSum ? '<button class="btn btn-sm" onclick="toggleFeedSummary(' + idx + ', this)">展开摘要</button>' : '') +
+          '<button class="btn btn-sm btn-primary" onclick="submitVideo(\'' + esc(v.bvid) + '\')">' + (hasSum ? '重新生成总结' : '一键总结') + '</button>' +
+        '</div>' +
+        sumBlock +
+      '</div>';
+    }).join('');
+  } catch (e) {
+    listEl.innerHTML = '<div class="reader-card" style="color:var(--err-text)">网络异常：' + esc(e.message) + '</div>';
+  }
+}
+
+function toggleFeedSummary(idx, btn) {
+  const el = document.getElementById('feed-sum-' + idx);
+  if (!el) return;
+  const hidden = el.classList.toggle('hidden');
+  btn.textContent = hidden ? '展开摘要' : '收起摘要';
+}
+
+// ── Monitor Settings Modal Logic ──
 function switchMonitorTab(tab) {
   document.querySelectorAll('.m-tab').forEach(b => b.classList.toggle('active', b.dataset.mtab === tab));
   document.getElementById('mTabSchedule').classList.toggle('hidden', tab !== 'schedule');
@@ -1947,17 +2377,17 @@ function hydrateMonitorForm() {
   if (monitorConfig.last_cron_sync) {
     const s = monitorConfig.last_cron_sync;
     syncEl.innerHTML = s.ok
-      ? ('✅ 已同步至 Shy Cron（任务 ID: <code>' + esc(s.task_id) + '</code> · 下次运行: ' + esc(s.next_run_at || '已调度') + '）')
-      : ('⚠️ 上次 Shy Cron 同步提示：' + esc(s.error || s.reason || '未同步'));
+      ? ('已同步至 Shy Cron（任务 ID: <code>' + esc(s.task_id) + '</code> · 下次运行: ' + esc(s.next_run_at || '已调度') + '）')
+      : ('上次 Shy Cron 同步提示：' + esc(s.error || s.reason || '未同步'));
   } else {
-    syncEl.textContent = '💡 保存后将自动同步至 Shy Cron（cron.shyapi.de5.net）';
+    syncEl.textContent = '保存后将自动同步至 Shy Cron（cron.shyapi.de5.net）';
   }
 }
 
 function onScheduleModeChange() {
   const mode = document.getElementById('cfgScheduleMode').value;
-  document.getElementById('customCronWrap').style.display = mode === 'custom' ? 'block' : 'none';
-  document.getElementById('timeAddWrap').style.display = mode === 'times' ? 'block' : 'none';
+  document.getElementById('customCronWrap').style.display = mode === 'custom' ? 'flex' : 'none';
+  document.getElementById('timeAddWrap').style.display = mode === 'times' ? 'flex' : 'none';
   document.getElementById('timeChips').style.display = mode === 'times' ? 'flex' : 'none';
   updateCronPreview();
 }
@@ -2022,7 +2452,7 @@ async function addUpCreator() {
   if (!q) return;
   const btn = document.getElementById('addUpBtn');
   btn.disabled = true;
-  btn.textContent = '解析中…';
+  btn.textContent = '解析中...';
   try {
     const r = await fetch('/api/up-lookup?q=' + encodeURIComponent(q), {
       headers: { 'Authorization': 'Bearer ' + getAuthToken() },
@@ -2049,7 +2479,7 @@ function removeUp(idx) {
   renderUpChips();
 }
 
-// ── Email Style Preview Engine (Matches Python emailer.py 4 styles 1:1) ──
+// ── Email Style Live Preview (All Titles Clickable to Bilibili!) ──
 const PREVIEW_THEMES = {
   editorial: {
     name:'编辑部日报', pageBg:'#f3f4f6', bodyBg:'#f8fafc', hdBg:'#111827', hdTop:'4px solid #fb7299',
@@ -2090,6 +2520,8 @@ function renderEmailPreview() {
   const pad = th.compact ? '12px 14px' : '18px 20px';
   const fs = th.compact ? '12px' : '13px';
   const hb = st === 'minimal' ? 'border-bottom:1px solid #e5e7eb;' : '';
+  const url1 = 'https://www.bilibili.com/video/BV149ypz6Ehs';
+  const url2 = 'https://www.bilibili.com/video/BV19Vsq6xEW9';
 
   const html = '<!doctype html><html><body style="margin:0;padding:14px;background:' + th.pageBg + ';font-family:-apple-system,PingFang SC,sans-serif;color:#111827">' +
     '<div style="max-width:600px;margin:0 auto">' +
@@ -2100,13 +2532,17 @@ function renderEmailPreview() {
         '<span style="display:inline-block;background:' + th.p2Bg + ';color:' + th.p2C + ';border:1px solid ' + th.p2B + ';border-radius:999px;padding:2px 9px;font-size:11px">共 ' + (merge ? '2' : '1') + ' 支新视频</span>' +
       '</div>' +
       '<div style="background:' + th.bodyBg + ';border:1px solid #e5e7eb;border-top:none;border-radius:0 0 12px 12px;padding:16px">' +
-        (merge ? '<div style="background:#f9fafb;border:1px solid #e5e7eb;border-radius:8px;padding:10px 12px;margin-bottom:14px;font-size:12px;line-height:1.7"><div style="font-size:10px;font-weight:700;color:#6b7280;margin-bottom:4px">本期速览 · TABLE OF CONTENTS</div><div><b style="color:' + th.accent + '">01</b> <b style="color:' + th.accentDark + '">[波士顿圆脸]</b> 前所未见：巴西亚马逊原始部落拖家带口现身求救</div><div><b style="color:' + th.accent + '">02</b> <b style="color:' + th.accentDark + '">[刺客边风]</b> 开源本地光猫配置解析工具实测</div></div>' : '') +
+        (merge ? '<div style="background:#f9fafb;border:1px solid #e5e7eb;border-radius:8px;padding:10px 12px;margin-bottom:14px;font-size:12px;line-height:1.8">' +
+          '<div style="font-size:10px;font-weight:700;color:#6b7280;margin-bottom:4px">本期速览 · TABLE OF CONTENTS</div>' +
+          '<div><b style="color:' + th.accent + ';margin-right:5px">01</b><a href="' + url1 + '" target="_blank" style="color:#1f2937;text-decoration:none;border-bottom:1px solid #e5e7eb"><b style="color:' + th.accentDark + '">[波士顿圆脸]</b> 前所未见：巴西亚马逊原始部落拖家带口现身求救</a></div>' +
+          '<div><b style="color:' + th.accent + ';margin-right:5px">02</b><a href="' + url2 + '" target="_blank" style="color:#1f2937;text-decoration:none;border-bottom:1px solid #e5e7eb"><b style="color:' + th.accentDark + '">[刺客边风]</b> 开源本地光猫配置解析工具实测</a></div>' +
+        '</div>' : '') +
         '<div style="background:#fff;border:1px solid #e5e7eb;border-radius:10px;padding:' + pad + '">' +
           '<div style="margin-bottom:7px"><span style="font-family:Consolas,monospace;font-size:11px;color:#9ca3af;margin-right:6px">#01</span><span style="display:inline-block;background:' + th.bgBadge + ';color:' + th.cBadge + ';border:1px solid ' + th.bBadge + ';border-radius:999px;padding:1px 8px;font-size:11px;font-weight:600;margin-right:6px">波士顿圆脸</span><span style="font-size:11px;color:#9ca3af">时长 11:16 · 11-20 10:49</span></div>' +
-          '<div style="font-size:15px;font-weight:700;margin-bottom:10px">前所未见：巴西亚马逊原始部落拖家带口现身求救</div>' +
+          '<div style="font-size:15px;font-weight:700;margin-bottom:10px"><a href="' + url1 + '" target="_blank" style="color:#111827;text-decoration:none">前所未见：巴西亚马逊原始部落拖家带口现身求救</a></div>' +
           '<div style="background:' + th.thBg + ';border-left:3px solid ' + th.thB + ';border-radius:0 6px 6px 0;padding:9px 12px;margin-bottom:10px"><div style="font-size:10px;font-weight:700;color:' + th.accentDark + ';margin-bottom:3px">核心主题</div><div style="font-size:' + fs + ';line-height:1.6">记录巴西亚马逊与世隔绝原始部落携家带口现身求救事件，剖析雨林生态与现代疾病风险。</div></div>' +
           '<div style="font-size:' + fs + ';line-height:1.65;color:#374151;margin-bottom:10px"><div><b style="color:' + th.accent + '">1.</b> <b>罕见接触</b>：二三十名阿瓦人主动接触原住民哨所索要食物。</div><div><b style="color:' + th.accent + '">2.</b> <b>生存威胁</b>：非法淘金与盗伐加剧，挤压原住民生存空间。</div></div>' +
-          '<div style="display:flex;justify-content:space-between;align-items:center;border-top:1px dashed #e5e7eb;padding-top:9px"><span style="background:' + th.btnBg + ';color:#fff;padding:5px 11px;border-radius:6px;font-size:11.5px;font-weight:600">▶ 前往 B 站观看</span><span style="font-size:11px;color:#9ca3af;font-family:Consolas,monospace">BV149ypz6Ehs</span></div>' +
+          '<div style="display:flex;justify-content:space-between;align-items:center;border-top:1px dashed #e5e7eb;padding-top:9px"><a href="' + url1 + '" target="_blank" style="background:' + th.btnBg + ';color:#fff;padding:5px 11px;border-radius:6px;font-size:11.5px;font-weight:600;text-decoration:none">前往 B 站观看 ↗</a><span style="font-size:11px;color:#9ca3af;font-family:Consolas,monospace">BV149ypz6Ehs</span></div>' +
         '</div>' +
       '</div>' +
     '</div></body></html>';
@@ -2116,7 +2552,7 @@ function renderEmailPreview() {
 async function saveMonitorConfig() {
   const btn = document.getElementById('saveMonitorBtn');
   btn.disabled = true;
-  btn.textContent = '保存并同步中…';
+  btn.textContent = '保存并同步中...';
   const payload = {
     enabled: document.getElementById('cfgEnabled').checked,
     schedule_mode: document.getElementById('cfgScheduleMode').value,
@@ -2142,8 +2578,9 @@ async function saveMonitorConfig() {
     if (!r.ok) { showToast('monitorToast', d.error || '保存失败', 'err'); return; }
     monitorConfig = d.config;
     hydrateMonitorForm();
+    if (currentPage === 'monitor') loadMonitorPage();
     if (d.cron_sync && d.cron_sync.ok) {
-      showToast('monitorToast', '✅ 配置已保存并成功同步至 Shy Cron（' + d.cron_sync.cron_utc + '）', 'ok');
+      showToast('monitorToast', '配置已保存并成功同步至 Shy Cron（' + d.cron_sync.cron_utc + '）', 'ok');
     } else {
       showToast('monitorToast', '已保存到 R2，但 Cron 同步提示：' + (d.cron_sync?.error || d.cron_sync?.reason || '未知'), 'err');
     }
@@ -2151,25 +2588,22 @@ async function saveMonitorConfig() {
     showToast('monitorToast', '保存异常: ' + e.message, 'err');
   } finally {
     btn.disabled = false;
-    btn.textContent = '💾 保存并同步定时任务';
+    btn.textContent = '保存并同步定时任务';
   }
 }
 
-async function triggerMonitorNow() {
-  const btn = document.getElementById('runNowBtn');
-  btn.disabled = true;
+async function triggerMonitorNow(toastId) {
+  const tid = toastId || 'monitorToast';
   try {
     const r = await fetch('/api/monitor-run', {
       method: 'POST',
       headers: { 'Authorization': 'Bearer ' + getAuthToken() },
     });
     const d = await r.json();
-    if (!r.ok) showToast('monitorToast', d.error || '触发失败', 'err');
-    else showToast('monitorToast', '✅ ' + d.message, 'ok');
+    if (!r.ok) showToast(tid, d.error || '触发失败', 'err');
+    else showToast(tid, d.message || '已触发监控任务', 'ok');
   } catch (e) {
-    showToast('monitorToast', '触发异常: ' + e.message, 'err');
-  } finally {
-    btn.disabled = false;
+    showToast(tid, '触发异常: ' + e.message, 'err');
   }
 }
 
@@ -2179,7 +2613,7 @@ checkAuth();
 renderList();
 const initJobs = getJobs();
 if (initJobs.length > 0) selectJob(initJobs[0].id);
-initJobs.forEach(j => { if (j.status === 'pending' || j.status === 'submitted') startPolling(j.id); });
+initJobs.forEach(j => { if (normStatus(j.status) === 'pending') startPolling(j.id); });
 syncFromR2();
 </script>
 </body>
@@ -2202,6 +2636,9 @@ export default {
       if (path === '/api/monitor-config' && request.method === 'GET') return await handleGetMonitorConfig(request, env);
       if (path === '/api/monitor-config' && request.method === 'POST') return await handleSaveMonitorConfig(request, env);
       if (path === '/api/up-lookup' && request.method === 'GET') return await handleUpLookup(request, env);
+      if (path === '/api/up-videos' && request.method === 'GET') return await handleGetUpVideos(request, env);
+      if (path === '/api/monitor-archive' && request.method === 'GET') return await handleGetMonitorArchive(request, env);
+      if (path === '/api/monitor-archive' && request.method === 'POST') return await handlePostMonitorArchive(request, env);
       if (path === '/api/cron-trigger' && (request.method === 'POST' || request.method === 'GET')) return await handleCronTrigger(request, env);
       if (path === '/api/monitor-run' && request.method === 'POST') return await handleManualMonitorRun(request, env);
 
