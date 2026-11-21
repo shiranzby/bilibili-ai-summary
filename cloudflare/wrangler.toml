@@ -10,7 +10,13 @@ bucket_name = "bilibili-summary"
 # ──────────────────────────────────────────────
 # Environment Variables (set via wrangler secret)
 # ──────────────────────────────────────────────
-# GH_OWNER   — GitHub repo owner (e.g. shiranzby)
-# GH_REPO    — GitHub repo name (e.g. bilibili-ai-summary)
-# GH_TOKEN   — GitHub Personal Access Token with repo & workflow scope
-# GH_REF     — Git branch (default: main)
+# GH_OWNER            — GitHub repo owner (e.g. shiranzby)
+# GH_REPO             — GitHub repo name (e.g. bilibili-ai-summary)
+# GH_TOKEN            — GitHub Personal Access Token with repo & workflow scope
+# GH_REF              — Git branch (default: main)
+# ADMIN_USERNAME      — Web 管理后台登录账号 (默认 shiran)
+# ADMIN_PASSWORD      — Web 管理后台登录密码 (开启监控配置弹窗必需)
+# CRON_BASE_URL       — 外部定时平台地址 (如 https://cron.shyapi.de5.net)
+# CRON_USERNAME       — 定时平台登录账号
+# CRON_PASSWORD       — 定时平台登录密码
+# CRON_TRIGGER_SECRET — Worker /api/cron-trigger 与 GHA 拉取在线配置的共享密钥
