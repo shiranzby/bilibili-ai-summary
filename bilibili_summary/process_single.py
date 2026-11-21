@@ -52,23 +52,35 @@ def clean_transcript(text: str) -> str:
     return re.sub(r"[\U0001F3BC\U0001F3B5\U0001F3B6\U0001F3A4\U0001F3A7]", "", text)
 
 
-def process(bvid: str, job_id: str = "", summary_template: str = "") -> dict:
+def process(bvid: str, job_id: str = "", summary_template: str = "", p: int = 1) -> dict:
     """处理单条视频，返回结果字典"""
     # 获取标题
-    print(f"[处理] 获取视频信息: {bvid}", file=sys.stderr)
+    print(f"[处理] 获取视频信息: {bvid} (P{p})", file=sys.stderr)
     t0 = time.time()
     info = get_video_info(bvid)
     title = (info.get("title") if info else None) or bvid
     owner = (info.get("owner", {}).get("name") if info else None) or ""
     pic = ((info.get("pic") if info else None) or "").replace("http://", "https://")
     pubdate = (info.get("pubdate") if info else None)
+    pages = (info.get("pages") if info else None) or []
+    target_cid = ""
     duration_sec = (info.get("duration") if info else 0) or 0
+    if pages and p >= 1:
+        matched_page = next((pg for pg in pages if int(pg.get("page") or 0) == p), None)
+        if matched_page:
+            target_cid = str(matched_page.get("cid") or "")
+            if matched_page.get("duration"):
+                duration_sec = matched_page.get("duration")
+            if len(pages) > 1 and matched_page.get("part"):
+                title = f"{title} [P{p}: {matched_page.get('part')}]"
     duration_str = format_duration(duration_sec) if duration_sec else ""
     t_title = round(time.time() - t0, 1)
     print(f"[处理] 标题: {title} ({t_title}s)", file=sys.stderr)
 
+    video_url = f"https://www.bilibili.com/video/{bvid}" + (f"?p={p}" if p > 1 else "")
     result = {
         "bvid": bvid,
+        "p": p,
         "job_id": job_id,
         "title": title,
         "owner": owner,
@@ -82,17 +94,19 @@ def process(bvid: str, job_id: str = "", summary_template: str = "") -> dict:
         "error_stage": "",
         "error_hint": "",
         "timings": {},
-        "video_url": f"https://www.bilibili.com/video/{bvid}",
+        "video_url": video_url,
     }
 
-    # Step 1: 音频 + 语音识别
-    print(f"[处理] 开始语音识别...", file=sys.stderr)
+    # Step 1: 字幕优先 -> 音频 + 语音识别
+    print(f"[处理] 开始提取文本 (字幕优先/语音识别)...", file=sys.stderr)
     t1 = time.time()
     audio_text = get_text_from_audio(
         bvid,
         siliconflow_api_key=SILICONFLOW_API_KEY,
         siliconflow_stt_model=SILICONFLOW_STT_MODEL,
         on_stage=lambda st: report_stage(job_id, st),
+        cid=target_cid,
+        p=p,
     )
     t_stt = round(time.time() - t1, 1)
     result["timings"]["stt"] = t_stt
@@ -152,11 +166,12 @@ def main():
     parser.add_argument("--job-id", help="Worker 任务 ID", default="")
     parser.add_argument("--callback-url", help="Worker 回调 URL", default="")
     parser.add_argument("--summary-template", help="自定义总结模板（含 {content} 占位符）", default="")
+    parser.add_argument("--p", type=int, help="分P序号 (默认 1)", default=1)
 
     args = parser.parse_args()
     # 优先使用 --summary-template 参数，否则回退到环境变量
     summary_template = args.summary_template or os.environ.get("SUMMARY_TEMPLATE", "")
-    result = process(args.bvid, job_id=args.job_id, summary_template=summary_template)
+    result = process(args.bvid, job_id=args.job_id, summary_template=summary_template, p=max(1, args.p))
 
     # 输出 JSON 到文件 (供后续步骤使用)
     with open("result.json", "w", encoding="utf-8") as f:

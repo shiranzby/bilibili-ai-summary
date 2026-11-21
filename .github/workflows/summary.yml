@@ -38,6 +38,11 @@ on:
         required: false
         default: 'true'
         type: string
+      p:
+        description: '分P序号 (默认 1)'
+        required: false
+        default: '1'
+        type: string
 
 permissions:
   contents: write
@@ -131,7 +136,7 @@ jobs:
           WORKER_URL: ${{ secrets.WORKER_URL || 'https://bilibili-ai-summary-api.shy2958779577.workers.dev' }}
         run: |
           cd bilibili_summary
-          python process_single.py "$BVID" --job-id "${{ inputs.job_id }}"
+          python process_single.py "$BVID" --job-id "${{ inputs.job_id }}" --p "${{ inputs.p || '1' }}"
       - name: 发送邮件通知
         if: ${{ (success() || failure()) && inputs.send_email != 'false' }}
         env:

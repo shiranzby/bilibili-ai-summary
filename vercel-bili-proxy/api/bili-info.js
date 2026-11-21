@@ -108,7 +108,7 @@ export default async function handler(req, res) {
     duration: info.duration || 0,
     pubdate: info.pubdate || null,
     owner: info.owner || {},
-    pages: (info.pages || []).slice(0, 5).map(p => ({ cid: p.cid, page: p.page, part: p.part })),
+    pages: (info.pages || []).slice(0, 50).map(p => ({ cid: p.cid, page: p.page, part: p.part, duration: p.duration || 0 })),
   } : null;
 
   return res.status(200).json({

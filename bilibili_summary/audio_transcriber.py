@@ -408,16 +408,45 @@ def transcribe_with_siliconflow(audio_path: str, api_key: str = "", model: str =
 
 # ==================== 一站式入口 ====================
 
+def fetch_bili_subtitles_fast(bvid: str, cid: str = "", p: int = 1, timeout: int = 4) -> Optional[str]:
+    """
+    快速尝试获取 B站 CC / AI 字幕（非阻塞，3-4秒超时）。
+    很多视频没有公开字幕，未命中时立即返回 None 并回退音频下载 + STT。
+    """
+    proxy = get_bili_proxy_url()
+    if not proxy or not bvid.startswith("BV"):
+        return None
+    try:
+        params = {"bvid": bvid, "p": str(p or 1)}
+        if cid:
+            params["cid"] = str(cid)
+        resp = requests.get(f"{proxy}/api/bili-subtitle", params=params, timeout=timeout)
+        if resp.status_code == 200:
+            data = resp.json()
+            text = (data.get("text") or "").strip()
+            if data.get("ok") and len(text) >= 40:
+                print(f"    [字幕] ✅ 命中B站字幕 ({data.get('lan') or 'auto'}, {data.get('lines_count', 0)} 行, 免下载音频)")
+                return text
+    except Exception as e:
+        print(f"    [字幕] 跳过字幕直取 ({e})")
+    return None
+
+
 def get_text_from_audio(
     bvid: str,
     siliconflow_api_key: str = "",
     siliconflow_stt_model: str = "",
     on_stage=None,
+    cid: str = "",
+    p: int = 1,
 ) -> Optional[str]:
     """
-    一站式: B站音频下载 → 直接上传硅基流动语音识别
+    一站式: 优先快速拉取字幕 → 无字幕时自动回退 B站音频下载 → 语音识别
     """
     _set_diag("", "", "")
+    sub_text = fetch_bili_subtitles_fast(bvid, cid=cid, p=p)
+    if sub_text:
+        return sub_text
     if callable(on_stage):
         try:
             on_stage("downloading")
@@ -428,7 +457,7 @@ def get_text_from_audio(
         m4a_path = os.path.join(tmpdir, f"{bvid}.m4a")
 
         print("    [音频] 获取视频音频直链...")
-        all_urls = get_audio_urls_from_playurl(bvid)
+        all_urls = get_audio_urls_from_playurl(bvid, cid=cid or None)
         if not all_urls:
             print("    [音频] ❌ 无法获取音频直链")
             if not _last_diag["stage"]:

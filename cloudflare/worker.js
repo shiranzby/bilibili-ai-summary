@@ -1129,11 +1129,12 @@ async function handleSubmit(request, env, ctx) {
   }
 
   // Resolve real video title / owner / duration immediately so pending card never shows bare BV id
+  const pNum = Math.max(1, parseInt(body.p || '1', 10) || 1);
   let title = String(body.title || '').trim();
   let owner = String(body.owner || '').trim();
   let duration = String(body.duration || '').trim();
   let pic = String(body.pic || '').trim().replace(/^http:\/\//, 'https://');
-  if (!title && /^BV/i.test(bvid)) {
+  if ((!title || pNum > 1) && /^BV/i.test(bvid)) {
     try {
       const ctrl = new AbortController();
       const timer = setTimeout(() => ctrl.abort(), 3200);
@@ -1144,9 +1145,14 @@ async function handleSubmit(request, env, ctx) {
         const idata = await ir.json();
         const info = idata?.info;
         if (info) {
-          if (!title) title = info.title || '';
+          const pages = Array.isArray(info.pages) ? info.pages : [];
+          const matchedPage = pages.find(pg => Number(pg.page) === pNum);
+          if (!title) {
+            title = info.title || '';
+            if (pages.length > 1 && matchedPage?.part) title = `${title} [P${pNum}: ${matchedPage.part}]`;
+          }
           if (!owner) owner = info.owner?.name || '';
-          if (!duration) duration = formatSecDuration(info.duration);
+          if (!duration) duration = formatSecDuration(matchedPage?.duration || info.duration);
           if (!pic && info.pic) pic = String(info.pic).replace(/^http:\/\//, 'https://');
         }
       }
@@ -1155,7 +1161,7 @@ async function handleSubmit(request, env, ctx) {
 
   const jobId = uuid();
   const job = {
-    id: jobId, bvid, url: bvid, status: 'pending',
+    id: jobId, bvid, p: pNum, url: bvid, status: 'pending',
     created_at: nowISO(), updated_at: nowISO(),
     summary: null, title: title || bvid, owner, duration, pic,
     error: '', email_style, send_email,
@@ -1168,6 +1174,7 @@ async function handleSubmit(request, env, ctx) {
   }
 
   const inputs = { bvid, job_id: jobId, send_email: send_email ? 'true' : 'false' };
+  if (pNum > 1) inputs.p = String(pNum);
   if (summary_template) inputs.summary_template = summary_template;
   if (custom_email) inputs.email = custom_email;
   if (email_style) inputs.email_style = email_style;
@@ -1517,6 +1524,141 @@ async function handleResummarize(request, env) {
     return jsonResponse({ ok: true, summary: content, model, style, elapsed });
   } catch (e) {
     return errorResponse('AI 重生成失败：' + e.message, 502);
+  }
+}
+
+async function handleBiliInfo(request, env) {
+  const url = new URL(request.url);
+  const bvid = (url.searchParams.get('bvid') || '').trim();
+  if (!/^BV[0-9A-Za-z]{6,}$/.test(bvid)) return errorResponse('无效 BV 号', 400);
+  const proxyBase = (env.BILI_PROXY_URL || BILI_PROXY_DEF).replace(/\/+$/, '');
+  try {
+    const r = await fetch(`${proxyBase}/api/bili-info?bvid=${encodeURIComponent(bvid)}`, { signal: AbortSignal.timeout(6000) });
+    const data = await r.json();
+    return jsonResponse(data);
+  } catch (e) {
+    return errorResponse('获取视频信息失败: ' + e.message, 502);
+  }
+}
+
+async function handleBiliPreview(request, env) {
+  const url = new URL(request.url);
+  const bvid = (url.searchParams.get('bvid') || '').trim();
+  const p = (url.searchParams.get('p') || '1').trim();
+  if (!/^BV[0-9A-Za-z]{6,}$/.test(bvid)) return errorResponse('无效 BV 号', 400);
+  const proxyBase = (env.BILI_PROXY_URL || BILI_PROXY_DEF).replace(/\/+$/, '');
+  try {
+    const r = await fetch(`${proxyBase}/api/bili-preview?bvid=${encodeURIComponent(bvid)}&p=${encodeURIComponent(p)}`, {
+      signal: AbortSignal.timeout(7000),
+    });
+    const data = await r.json();
+    return jsonResponse(data);
+  } catch (e) {
+    return jsonResponse({ ok: false, bvid, error: e.message, video_urls: [] });
+  }
+}
+
+async function handleBiliMedia(request) {
+  const reqUrl = new URL(request.url);
+  const target = (reqUrl.searchParams.get('url') || '').trim();
+  if (!target) return errorResponse('缺少 url', 400);
+  let parsed;
+  try {
+    parsed = new URL(target);
+  } catch {
+    return errorResponse('非法 url', 400);
+  }
+  const host = parsed.hostname.toLowerCase();
+  const allowed = host.endsWith('.bilivideo.com') || host.endsWith('.bilivideo.cn') || host.endsWith('.hdslb.com') || host.endsWith('.akamaized.net');
+  if (!allowed || (parsed.protocol !== 'https:' && parsed.protocol !== 'http:')) {
+    return errorResponse('不允许的媒体源域名', 403);
+  }
+  const fwdHeaders = {
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
+    'Referer': 'https://www.bilibili.com/',
+    'Origin': 'https://www.bilibili.com',
+  };
+  const range = request.headers.get('Range');
+  if (range) fwdHeaders['Range'] = range;
+  try {
+    const upstream = await fetch(parsed.toString(), { headers: fwdHeaders });
+    const respHeaders = new Headers(CORS_HEADERS);
+    for (const h of ['Content-Type', 'Content-Length', 'Content-Range', 'Accept-Ranges', 'Cache-Control']) {
+      const val = upstream.headers.get(h);
+      if (val) respHeaders.set(h, val);
+    }
+    if (!respHeaders.has('Content-Type')) respHeaders.set('Content-Type', 'video/mp4');
+    if (!respHeaders.has('Accept-Ranges')) respHeaders.set('Accept-Ranges', 'bytes');
+    return new Response(upstream.body, { status: upstream.status, headers: respHeaders });
+  } catch (e) {
+    return errorResponse('媒体流代理失败: ' + e.message, 502);
+  }
+}
+
+async function handleBiliFav(request, env) {
+  const url = new URL(request.url);
+  const fid = (url.searchParams.get('fid') || '').trim();
+  const pn = (url.searchParams.get('pn') || '1').trim();
+  if (!fid) return errorResponse('请提供收藏夹 ID 或链接', 400);
+  const proxyBase = (env.BILI_PROXY_URL || BILI_PROXY_DEF).replace(/\/+$/, '');
+  try {
+    const r = await fetch(`${proxyBase}/api/bili-fav?fid=${encodeURIComponent(fid)}&pn=${encodeURIComponent(pn)}`, {
+      signal: AbortSignal.timeout(8000),
+    });
+    const data = await r.json();
+    return jsonResponse(data);
+  } catch (e) {
+    return errorResponse('拉取 B 站收藏夹失败: ' + e.message, 502);
+  }
+}
+
+async function handleBiliSearch(request, env) {
+  const url = new URL(request.url);
+  const kw = (url.searchParams.get('kw') || '').trim();
+  const page = (url.searchParams.get('page') || '1').trim();
+  if (!kw) return errorResponse('请输入搜索关键词', 400);
+  const proxyBase = (env.BILI_PROXY_URL || BILI_PROXY_DEF).replace(/\/+$/, '');
+  try {
+    const r = await fetch(`${proxyBase}/api/bili-search?kw=${encodeURIComponent(kw)}&page=${encodeURIComponent(page)}`, {
+      signal: AbortSignal.timeout(8000),
+    });
+    const data = await r.json();
+    return jsonResponse(data);
+  } catch (e) {
+    return errorResponse('搜索 B 站视频失败: ' + e.message, 502);
+  }
+}
+
+async function handleSynthesize(request, env) {
+  const body = await request.json().catch(() => ({}));
+  const items = Array.isArray(body.items) ? body.items.slice(0, 6) : [];
+  const topic = String(body.topic || '').trim();
+  if (items.length < 2) {
+    return errorResponse('请至少选择 2 条已完成摘要的视频进行主题综述', 400);
+  }
+  const blocks = items.map((it, i) => {
+    const sum = String(it.summary || '').slice(0, 1400);
+    return `【视频 ${i + 1}】${it.title || it.bvid}（UP主：${it.owner || '未知'}）\n${sum}`;
+  }).join('\n\n---\n\n');
+  const sys = `你是一个资深知识策展人与研究分析师。请综合用户提供的多条视频摘要，提炼出一份跨视频的深度主题综述，严格使用以下 Markdown 结构：
+
+**跨视频核心共识**
+用 2-3 句话总结这些视频共同指向的核心趋势或结论。
+
+**视角对比与关键洞察**
+用编号列表列出 4-6 条跨视频提炼的知识点或差异对比（标注来自哪个视频/UP主视角），格式为「**主题关键词**：具体对比与洞察」。
+
+**行动建议与延伸学习路线**
+给出 3 条可落地的实践建议或下一步研究方向。`;
+  const userMsg = (topic ? `关注主题：${topic}\n\n` : '') + `以下是待综合的 ${items.length} 条视频摘要：\n\n${blocks}`;
+  try {
+    const { content, model } = await callFreeSiliconFlowChat(env, [
+      { role: 'system', content: sys },
+      { role: 'user', content: userMsg },
+    ], 1500);
+    return jsonResponse({ ok: true, synthesis: content, model });
+  } catch (e) {
+    return errorResponse('跨视频综述生成失败：' + e.message, 502);
   }
 }
 
@@ -2099,6 +2241,27 @@ select.c-select-native{position:absolute!important;opacity:0!important;pointer-e
 .v-qbtn:hover{background:rgba(15,17,22,.64);transform:scale(1.04)}
 .v-qbtn.wl-on{background:rgba(37,99,235,.62);border-color:rgba(147,197,253,.65);color:#fff}
 .v-qbtn.fav-on{background:rgba(217,119,6,.66);border-color:rgba(252,211,77,.7);color:#fff}
+.v-preview-vid{position:absolute;inset:0;width:100%;height:100%;object-fit:cover;z-index:2;background:#000;pointer-events:none;border-radius:12px}
+.v-preview-hint{position:absolute;left:8px;bottom:8px;z-index:4;background:rgba(15,17,22,.62);backdrop-filter:blur(6px);color:#fff;font-size:10.5px;font-weight:600;padding:2px 7px;border-radius:6px;pointer-events:none;border:1px solid rgba(255,255,255,.22)}
+.v-dur,.v-sum-badge{z-index:4}
+.mon-filter-bar{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:14px}
+.ts-jump{color:var(--brand-dark);background:var(--brand-soft);border:1px solid var(--brand-border);padding:1px 6px;border-radius:5px;font-size:11.5px;font-weight:700;text-decoration:none;font-variant-numeric:tabular-nums;margin-right:3px;display:inline-block}
+.ts-jump:hover{background:var(--brand);color:#fff;border-color:var(--brand)}
+.vpm-modal{max-width:840px;width:min(92vw,840px);padding:0;overflow:hidden}
+.vpm-stage{position:relative;width:100%;aspect-ratio:16/9;background:#000}
+.vpm-stage video{width:100%;height:100%;display:block;outline:none}
+.vpm-foot{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:12px 18px;border-top:1px solid var(--border);background:var(--surface);flex-wrap:wrap}
+.vpm-kbd{font-size:11.5px;color:var(--muted);display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+.vpm-kbd kbd{padding:2px 6px;border-radius:5px;border:1px solid var(--border-strong);background:var(--surface-2);font-family:var(--mono);font-size:11px;color:var(--text)}
+.cmd-modal{max-width:640px;width:min(92vw,640px);padding:0;overflow:hidden}
+.cmd-input-wrap{display:flex;align-items:center;gap:10px;padding:14px 18px;border-bottom:1px solid var(--border)}
+.cmd-input-wrap input{flex:1;border:none;outline:none;background:transparent;font-size:15px;color:var(--text)}
+.cmd-results{max-height:420px;overflow-y:auto;padding:8px}
+.cmd-item{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:10px 12px;border-radius:10px;cursor:pointer;transition:background .12s}
+.cmd-item:hover{background:var(--surface-hover)}
+.cmd-item-title{font-size:13.5px;font-weight:600;color:var(--text);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.cmd-item-sub{font-size:11.5px;color:var(--muted)}
+.cmd-badge{font-size:11px;padding:2px 7px;border-radius:999px;background:var(--surface-3);color:var(--soft);font-weight:600;flex-shrink:0}
 
 /* Dark-Theme Inversion for All 4 Video Cover Overlay Controls (反色处理) */
 [data-theme="dark"] .v-dur,
@@ -2810,6 +2973,15 @@ theme-button{flex-shrink:0}
                 <button class="btn btn-primary" onclick="triggerMonitorNow('feedToast')">立即巡检</button>
               </div>
             </div>
+            <div class="mon-filter-bar" id="monFilterBar">
+              <div class="search-box" style="width:220px">
+                <span class="s-ic"><svg class="ic" viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4.3-4.3"/></svg></span>
+                <input class="ctrl" id="monFeedFilterKw" type="text" placeholder="筛选动态标题..." oninput="applyFeedFilters()">
+              </div>
+              <button type="button" class="folder-chip" id="monHideShortBtn" onclick="toggleMonHideShort()">隐藏 &lt;2 分钟</button>
+              <button type="button" class="folder-chip" id="monOnlyUnsumBtn" onclick="toggleMonOnlyUnsum()">仅看未总结</button>
+              <button type="button" class="folder-chip" onclick="openRadarModal()" style="margin-left:auto">关键词雷达</button>
+            </div>
             <div class="sb-toast" id="feedToast" style="margin-bottom:14px"></div>
             <div class="video-grid" id="upFeedGrid"></div>
             <div class="feed-footer" id="feedFooter"></div>
@@ -2833,6 +3005,7 @@ theme-button{flex-shrink:0}
                 <button class="seg-tab" data-wlf="todo" onclick="setWlFilter('todo')">待总结</button>
                 <button class="seg-tab" data-wlf="done" onclick="setWlFilter('done')">已有摘要</button>
               </div>
+              <button class="btn" onclick="openBiliFavImportModal()">导入 B 站收藏夹</button>
               <button class="btn" id="wlSelectAllBtn" onclick="toggleWlSelectAll()">全选待总结</button>
               <button class="btn btn-primary" id="wlBatchSumBtn" onclick="batchSummarizeWatchLater()">批量 AI 总结</button>
               <button class="btn" onclick="clearDoneWatchLater()">清理已总结</button>
@@ -2855,6 +3028,8 @@ theme-button{flex-shrink:0}
                 <span class="s-ic"><svg class="ic" viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4.3-4.3"/></svg></span>
                 <input class="ctrl" id="favSearchInput" type="text" placeholder="搜索收藏视频或摘要..." oninput="renderFavoritesPage()">
               </div>
+              <button class="btn" onclick="openSynthesizeModal('fav')">AI 主题综述</button>
+              <button class="btn" onclick="batchExportMarkdown('fav')">批量导出 MD</button>
               <button class="btn btn-brand" onclick="openTagManagerModal('fav')">+ 新建收藏夹</button>
             </div>
           </div>
@@ -2884,6 +3059,8 @@ theme-button{flex-shrink:0}
                 <button class="seg-tab" data-hf="pending" onclick="setHistStatus('pending')">处理中</button>
                 <button class="seg-tab" data-hf="failed" onclick="setHistStatus('failed')">失败</button>
               </div>
+              <button class="btn" onclick="openSynthesizeModal('hist')">AI 主题综述</button>
+              <button class="btn" onclick="batchExportMarkdown('hist')">批量导出 MD</button>
               <button class="btn" id="histBatchBtn" onclick="toggleHistBatchMode()">批量管理</button>
             </div>
           </div>
@@ -3369,7 +3546,11 @@ theme-button{flex-shrink:0}
       <div id="submitSinglePane">
         <div class="field">
           <label>B 站视频链接或 BV / AV 号</label>
-          <input class="ctrl" id="modalVideoUrl" type="text" placeholder="https://www.bilibili.com/video/BV..." onkeydown="if(event.key==='Enter')submitModalSingle()">
+          <input class="ctrl" id="modalVideoUrl" type="text" placeholder="https://www.bilibili.com/video/BV..." oninput="onModalVideoUrlInput()" onkeydown="if(event.key==='Enter')submitModalSingle()">
+        </div>
+        <div class="field hidden" id="submitMultiPWrap">
+          <label>选择分 P（检测到合集/多 P 视频）</label>
+          <select class="ctrl" id="submitPageSelect"></select>
         </div>
         <div class="field">
           <label>总结模板</label>
@@ -3416,6 +3597,124 @@ theme-button{flex-shrink:0}
       <button class="btn" onclick="closeModal('submitModal')">取消</button>
       <button class="btn btn-primary" id="modalSubmitBtn" onclick="handleModalSubmit()">开始总结</button>
     </div>
+  </div>
+</div>
+
+<!-- MEDIUM VIDEO PREVIEW MODAL (Click or Enter on hovered cover, Space=Play/Pause, Esc=Close) -->
+<div class="modal-backdrop hidden" id="videoPreviewModal" onclick="if(event.target===this)closeVideoPreviewModal()">
+  <div class="modal vpm-modal">
+    <div class="modal-head" style="padding:12px 18px">
+      <h2 id="vpmTitle" style="font-size:15px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:680px">视频预览</h2>
+      <button class="icon-btn" onclick="closeVideoPreviewModal()" aria-label="关闭">
+        <svg class="ic" viewBox="0 0 24 24"><path d="M18 6L6 18M6 6l12 12"/></svg>
+      </button>
+    </div>
+    <div class="vpm-stage">
+      <video id="vpmVideo" controls playsinline preload="metadata"></video>
+    </div>
+    <div class="vpm-foot">
+      <div class="vpm-kbd">
+        <span><kbd>Space</kbd> 播放/暂停</span>
+        <span><kbd>Esc</kbd> 关闭弹窗</span>
+      </div>
+      <div style="display:flex;gap:8px;align-items:center">
+        <a class="btn btn-sm" id="vpmWatchLink" href="#" target="_blank" rel="noopener">在B站观看</a>
+        <button class="btn btn-sm btn-primary" id="vpmSumBtn" onclick="summarizeFromPreviewModal()">一键总结</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- IMPORT BILIBILI PUBLIC FAVORITES MODAL -->
+<div class="modal-backdrop hidden" id="biliFavImportModal" onclick="if(event.target===this)closeModal('biliFavImportModal')">
+  <div class="modal">
+    <div class="modal-head">
+      <div>
+        <h2>导入 B 站公开收藏夹</h2>
+        <div style="font-size:12px;color:var(--muted);margin-top:2px">输入公开收藏夹 ID（fid）或空间收藏夹链接，一键导入到「稍后再看」</div>
+      </div>
+      <button class="icon-btn" onclick="closeModal('biliFavImportModal')" aria-label="关闭">
+        <svg class="ic" viewBox="0 0 24 24"><path d="M18 6L6 18M6 6l12 12"/></svg>
+      </button>
+    </div>
+    <div class="modal-body">
+      <div class="field">
+        <label>收藏夹 ID 或链接</label>
+        <div style="display:flex;gap:8px">
+          <input class="ctrl" id="biliFavFidInput" type="text" placeholder="例如：3248912345 或 https://space.bilibili.com/.../favlist?fid=..." onkeydown="if(event.key==='Enter')fetchBiliFavPreview()">
+          <button class="btn btn-primary" id="biliFavFetchBtn" onclick="fetchBiliFavPreview()">拉取</button>
+        </div>
+      </div>
+      <div id="biliFavPreviewList" style="max-height:280px;overflow-y:auto;margin-top:10px"></div>
+    </div>
+    <div class="modal-foot">
+      <button class="btn" onclick="closeModal('biliFavImportModal')">关闭</button>
+      <button class="btn btn-primary hidden" id="biliFavConfirmBtn" onclick="confirmImportBiliFav()">导入到稍后再看</button>
+    </div>
+  </div>
+</div>
+
+<!-- KEYWORD RADAR MODAL -->
+<div class="modal-backdrop hidden" id="radarModal" onclick="if(event.target===this)closeModal('radarModal')">
+  <div class="modal" style="max-width:760px">
+    <div class="modal-head">
+      <div>
+        <h2>关键词雷达</h2>
+        <div style="font-size:12px;color:var(--muted);margin-top:2px">订阅技术或主题关键词，实时搜索 B 站最新投稿并一键总结或加入稍后再看</div>
+      </div>
+      <button class="icon-btn" onclick="closeModal('radarModal')" aria-label="关闭">
+        <svg class="ic" viewBox="0 0 24 24"><path d="M18 6L6 18M6 6l12 12"/></svg>
+      </button>
+    </div>
+    <div class="modal-body">
+      <div style="display:flex;gap:8px;margin-bottom:10px">
+        <input class="ctrl" id="radarKwInput" type="text" placeholder="输入关键词搜索或订阅（如 Agent、DeepSeek、Rust）..." onkeydown="if(event.key==='Enter')runRadarSearch()">
+        <button class="btn btn-primary" id="radarSearchBtn" onclick="runRadarSearch()">搜索</button>
+        <button class="btn" onclick="addRadarKeyword()">订阅词</button>
+      </div>
+      <div class="folder-bar" id="radarSavedChips" style="margin-bottom:12px"></div>
+      <div id="radarResultsBox" style="max-height:380px;overflow-y:auto"></div>
+    </div>
+  </div>
+</div>
+
+<!-- CROSS-VIDEO AI SYNTHESIS MODAL -->
+<div class="modal-backdrop hidden" id="synthesizeModal" onclick="if(event.target===this)closeModal('synthesizeModal')">
+  <div class="modal" style="max-width:780px">
+    <div class="modal-head">
+      <div>
+        <h2>AI 跨视频主题综述</h2>
+        <div style="font-size:12px;color:var(--muted);margin-top:2px">勾选 2–6 条已完成摘要，免费生成跨视频共识对比与学习路线</div>
+      </div>
+      <button class="icon-btn" onclick="closeModal('synthesizeModal')" aria-label="关闭">
+        <svg class="ic" viewBox="0 0 24 24"><path d="M18 6L6 18M6 6l12 12"/></svg>
+      </button>
+    </div>
+    <div class="modal-body">
+      <div class="field">
+        <label>关注主题（可选，帮助 AI 聚焦对比方向）</label>
+        <input class="ctrl" id="synthTopicInput" type="text" placeholder="例如：对比这几个方案的成本与落地难度">
+      </div>
+      <div id="synthPickList" style="max-height:200px;overflow-y:auto;border:1px solid var(--border);border-radius:10px;padding:8px;margin-bottom:12px"></div>
+      <div id="synthResultBox" class="reader-card hidden" style="max-height:300px;overflow-y:auto;padding:16px"></div>
+    </div>
+    <div class="modal-foot">
+      <button class="btn" onclick="closeModal('synthesizeModal')">关闭</button>
+      <button class="btn hidden" id="synthCopyBtn" onclick="copySynthResult()">复制综述</button>
+      <button class="btn btn-primary" id="synthRunBtn" onclick="runCrossVideoSynthesis()">开始 AI 综述</button>
+    </div>
+  </div>
+</div>
+
+<!-- SPOTLIGHT COMMAND PALETTE MODAL (Ctrl+K / Cmd+K) -->
+<div class="modal-backdrop hidden" id="cmdPaletteModal" onclick="if(event.target===this)closeModal('cmdPaletteModal')">
+  <div class="modal cmd-modal">
+    <div class="cmd-input-wrap">
+      <svg class="ic" viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4.3-4.3"/></svg>
+      <input id="cmdPaletteInput" type="text" placeholder="搜索历史摘要、转录、UP主，或直接粘贴 B 站视频链接/BV 号总结..." oninput="renderCmdPalette()" onkeydown="onCmdPaletteKey(event)">
+      <button class="btn btn-sm" onclick="closeModal('cmdPaletteModal');openSubmitModal('single')">完整表单</button>
+    </div>
+    <div class="cmd-results" id="cmdPaletteResults"></div>
   </div>
 </div>
 
@@ -4114,14 +4413,44 @@ document.addEventListener('click', () => closeAllCustomSelects());
 function openModal(id) { document.getElementById(id).classList.remove('hidden'); }
 function closeModal(id) { document.getElementById(id).classList.add('hidden'); }
 
-// Global Ctrl+K / Cmd+K & Escape shortcut
+// Global Ctrl+K / Cmd+K, Escape, Space (Play/Pause) & Enter (Enlarge Hovered Video)
 document.addEventListener('keydown', (e) => {
+  const tag = (e.target && e.target.tagName) ? e.target.tagName.toUpperCase() : '';
+  const isTyping = tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || (e.target && e.target.isContentEditable);
+
   if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'k' && authUser) {
-    e.preventDefault(); openSubmitModal('single');
-  } else if (e.key === 'Escape') {
+    e.preventDefault();
+    openCmdPalette();
+    return;
+  }
+  if (e.key === 'Escape') {
     closeTagPopover();
-    ['submitModal', 'addMonitorModal', 'tagManagerModal', 'summaryModal', 'favPickModal', 'favRemoveModal'].forEach(closeModal);
+    closeVideoPreviewModal();
+    ['submitModal', 'addMonitorModal', 'tagManagerModal', 'summaryModal', 'favPickModal', 'favRemoveModal', 'biliFavImportModal', 'radarModal', 'synthesizeModal', 'cmdPaletteModal'].forEach(closeModal);
     toggleMobileNav(false);
+    return;
+  }
+  if (isTyping) return;
+
+  const vpm = document.getElementById('videoPreviewModal');
+  const vpmOpen = vpm && !vpm.classList.contains('hidden');
+  if (e.code === 'Space' || e.key === ' ') {
+    if (vpmOpen) {
+      e.preventDefault();
+      const vid = document.getElementById('vpmVideo');
+      if (vid) { if (vid.paused) vid.play().catch(() => {}); else vid.pause(); }
+      return;
+    }
+    const inlineVid = document.querySelector('.v-preview-vid');
+    if (inlineVid) {
+      e.preventDefault();
+      if (inlineVid.paused) inlineVid.play().catch(() => {}); else inlineVid.pause();
+      return;
+    }
+  }
+  if (e.key === 'Enter' && !vpmOpen && hoveredPreviewBvid && !document.querySelector('.modal-backdrop:not(.hidden)')) {
+    e.preventDefault();
+    openVideoPreviewModal(hoveredPreviewBvid);
   }
 });
 
@@ -4702,13 +5031,43 @@ function handleModalSubmit() {
   if (submitModalTab === 'batch') submitBatchVideos();
   else submitModalSingle();
 }
+let modalMultiPTimer = null;
+function onModalVideoUrlInput() {
+  clearTimeout(modalMultiPTimer);
+  const wrap = document.getElementById('submitMultiPWrap');
+  const sel = document.getElementById('submitPageSelect');
+  if (!wrap || !sel) return;
+  const raw = (document.getElementById('modalVideoUrl').value || '').trim();
+  const bvM = raw.match(/BV[a-zA-Z0-9]{8,12}/);
+  if (!bvM) { wrap.classList.add('hidden'); sel.innerHTML = ''; return; }
+  const bvid = bvM[0];
+  modalMultiPTimer = setTimeout(async () => {
+    try {
+      const r = await apiFetch('/api/bili-info?bvid=' + encodeURIComponent(bvid));
+      const d = await r.json();
+      const pages = (d && d.info && Array.isArray(d.info.pages)) ? d.info.pages : [];
+      if (pages.length > 1) {
+        const pMatch = raw.match(/[?&]p=(\d+)/i);
+        const defP = pMatch ? pMatch[1] : '1';
+        sel.innerHTML = pages.map(pg => '<option value="' + pg.page + '"' + (String(pg.page) === defP ? ' selected' : '') + '>P' + pg.page + ' · ' + esc(pg.part || ('分P ' + pg.page)) + (pg.duration ? ' (' + esc(formatSecDuration(pg.duration)) + ')' : '') + '</option>').join('');
+        wrap.classList.remove('hidden');
+      } else {
+        wrap.classList.add('hidden');
+        sel.innerHTML = '';
+      }
+    } catch { wrap.classList.add('hidden'); }
+  }, 450);
+}
 async function submitModalSingle() {
   const inp = document.getElementById('modalVideoUrl');
   const raw = inp.value.trim();
   if (!raw) { toast('请输入 B 站视频链接或 BV 号', true); return; }
+  const sel = document.getElementById('submitPageSelect');
+  const pVal = (sel && !document.getElementById('submitMultiPWrap').classList.contains('hidden')) ? (parseInt(sel.value || '1', 10) || 1) : 1;
   inp.value = '';
+  document.getElementById('submitMultiPWrap').classList.add('hidden');
   closeModal('submitModal');
-  await submitVideo(raw);
+  await submitVideo(raw, pVal > 1 ? { p: pVal } : undefined);
 }
 async function submitInlineVideo() {
   const inp = document.getElementById('inlineVideoUrl');
@@ -4768,6 +5127,7 @@ async function submitVideo(overrideUrl, meta, stayOnPage) {
 
   try {
     const reqBody = { url: raw, summary_template: tpl, email, email_style, send_email };
+    if (meta && meta.p && Number(meta.p) > 1) reqBody.p = Number(meta.p);
     if (meta && meta.title) reqBody.title = meta.title;
     if (meta && meta.owner) reqBody.owner = meta.owner;
     if (meta && meta.duration) reqBody.duration = meta.duration;
@@ -5541,11 +5901,20 @@ function renderDetailTagBar(job) {
 }
 
 // ── Rich Markdown, Mindmap, Re-summarize, Transcript Search, AI Chat, Poster PNG ──
+function linkifyTimestamps(html, bvid) {
+  if (!bvid || !/^BV/i.test(bvid)) return html;
+  return html.replace(/\[(\d{1,2}):(\d{2})(?::(\d{2}))?\]/g, (m, a, b, c) => {
+    const sec = c !== undefined ? (parseInt(a, 10) * 3600 + parseInt(b, 10) * 60 + parseInt(c, 10)) : (parseInt(a, 10) * 60 + parseInt(b, 10));
+    return '<a class="ts-jump" href="https://www.bilibili.com/video/' + esc(bvid) + '?t=' + sec + '" target="_blank" rel="noopener" title="点击跳转到 B 站对应时间点">' + m + '</a>';
+  });
+}
 function inlineMd(text) {
   let s = esc(text);
   s = s.replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>');
   s = s.replace(/\x60([^\x60]+)\x60/g, '<code class="md-code">$1</code>');
   s = s.replace(/\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g, '<a href="$2" target="_blank" style="color:var(--brand);text-decoration:none">$1</a>');
+  const curJob = getJobs().find(j => j.id === selectedJobId);
+  if (curJob && curJob.bvid) s = linkifyTimestamps(s, curJob.bvid);
   return s;
 }
 function detectSectionKind(line) {
@@ -5718,11 +6087,17 @@ function highlightTranscript() {
   const raw = (job && job.transcript) || '（该任务无语音转录文本）';
   const kw = (document.getElementById('trSearchInput').value || '').trim();
   trMatchIndex = -1;
-  if (!kw) { box.textContent = raw; countEl.textContent = ''; return; }
+  if (!kw) {
+    box.innerHTML = (job && job.bvid) ? linkifyTimestamps(esc(raw), job.bvid) : esc(raw);
+    countEl.textContent = '';
+    return;
+  }
   const safeKw = kw.replace(new RegExp('[.*+?^$' + '{}()|[\\]\\\\]', 'g'), '\\$&');
   const re = new RegExp(safeKw, 'gi');
   let n = 0;
-  box.innerHTML = esc(raw).replace(re, m => { n++; return '<mark>' + m + '</mark>'; });
+  let html = esc(raw).replace(re, m => { n++; return '<mark>' + m + '</mark>'; });
+  if (job && job.bvid) html = linkifyTimestamps(html, job.bvid);
+  box.innerHTML = html;
   countEl.textContent = n ? ('0 / ' + n) : '0 处匹配';
   if (n > 0) jumpTrMatch(1);
 }
@@ -5773,9 +6148,10 @@ async function sendVideoChat(presetText) {
   finally { btn.disabled = false; btn.textContent = '发送'; }
 }
 
-function exportPosterPng() {
+async function exportPosterPng() {
   const job = getJobs().find(j => j.id === selectedJobId);
   if (!job || !job.summary || job.summary.startsWith('（AI总结失败')) { toast('当前没有可导出的有效 AI 总结', true); return; }
+  const isDark = document.documentElement.getAttribute('data-theme') === 'dark';
   const sections = parseSummarySections(job.summary);
   const scale = 2, W = 760, pad = 44;
   const wrapText = (ctx, text, maxW) => {
@@ -5787,11 +6163,25 @@ function exportPosterPng() {
     }
     return out;
   };
+  let coverImg = null;
+  if (job.pic) {
+    try {
+      coverImg = await new Promise((resolve) => {
+        const im = new Image();
+        im.crossOrigin = 'anonymous';
+        const tm = setTimeout(() => resolve(null), 2500);
+        im.onload = () => { clearTimeout(tm); resolve(im); };
+        im.onerror = () => { clearTimeout(tm); resolve(null); };
+        im.src = '/api/bili-cover?url=' + encodeURIComponent(job.pic.replace(/^http:\/\//, 'https://'));
+      });
+    } catch {}
+  }
   const tmp = document.createElement('canvas').getContext('2d');
   let y = 136;
-  tmp.font = 'bold 24px -apple-system,PingFang SC,Microsoft YaHei,sans-serif';
-  const titleLines = wrapText(tmp, job.title || job.bvid, W - pad * 2);
-  y += titleLines.length * 34 + 34;
+  const titleMaxW = coverImg ? (W - pad * 2 - 176) : (W - pad * 2);
+  tmp.font = 'bold 23px -apple-system,PingFang SC,Microsoft YaHei,sans-serif';
+  const titleLines = wrapText(tmp, job.title || job.bvid, titleMaxW);
+  y += Math.max(coverImg ? 98 : 0, titleLines.length * 33) + 34;
   const blocks = [];
   sections.forEach(s => {
     const label = s.kind === 'theme' ? '核心主题' : (s.kind === 'points' ? '要点提炼' : (s.kind === 'conclusion' ? '总结洞察' : '内容'));
@@ -5808,7 +6198,7 @@ function exportPosterPng() {
   const canvas = document.createElement('canvas');
   canvas.width = W * scale; canvas.height = H * scale;
   const ctx = canvas.getContext('2d'); ctx.scale(scale, scale);
-  ctx.fillStyle = '#F6F7F9'; ctx.fillRect(0, 0, W, H);
+  ctx.fillStyle = isDark ? '#0B0F17' : '#F6F7F9'; ctx.fillRect(0, 0, W, H);
   const grad = ctx.createLinearGradient(0, 0, W, 110); grad.addColorStop(0, '#0F172A'); grad.addColorStop(1, '#1E293B');
   ctx.fillStyle = grad; ctx.fillRect(0, 0, W, 108);
   ctx.fillStyle = '#FB7299'; ctx.fillRect(0, 105, W, 3);
@@ -5817,16 +6207,26 @@ function exportPosterPng() {
   ctx.fillStyle = '#94A3B8'; ctx.font = '13px -apple-system,sans-serif';
   ctx.fillText([job.owner, job.duration, job.bvid].filter(Boolean).join('  ·  '), pad, 92);
   let cy = 148;
-  ctx.fillStyle = '#111827'; ctx.font = 'bold 24px -apple-system,PingFang SC,Microsoft YaHei,sans-serif';
-  titleLines.forEach(tl => { ctx.fillText(tl, pad, cy); cy += 34; });
-  cy += 12;
+  if (coverImg) {
+    ctx.save();
+    ctx.beginPath();
+    ctx.roundRect(pad, 132, 160, 90, 8);
+    ctx.clip();
+    ctx.drawImage(coverImg, pad, 132, 160, 90);
+    ctx.restore();
+  }
+  const titleX = coverImg ? (pad + 176) : pad;
+  ctx.fillStyle = isDark ? '#F1F5F9' : '#111827'; ctx.font = 'bold 23px -apple-system,PingFang SC,Microsoft YaHei,sans-serif';
+  let tY = cy;
+  titleLines.forEach(tl => { ctx.fillText(tl, titleX, tY); tY += 33; });
+  cy = Math.max(tY + 12, coverImg ? 242 : (tY + 12));
   blocks.forEach(b => {
     const bh = 36 + b.lines.length * 25 + 14;
-    ctx.fillStyle = b.kind === 'theme' ? '#FFF1F5' : '#FFFFFF'; ctx.fillRect(pad, cy, W - pad * 2, bh);
-    ctx.strokeStyle = b.kind === 'theme' ? '#FECDD3' : '#E5E7EB'; ctx.lineWidth = 1; ctx.strokeRect(pad, cy, W - pad * 2, bh);
+    ctx.fillStyle = b.kind === 'theme' ? (isDark ? '#2A121D' : '#FFF1F5') : (isDark ? '#151B26' : '#FFFFFF'); ctx.fillRect(pad, cy, W - pad * 2, bh);
+    ctx.strokeStyle = b.kind === 'theme' ? (isDark ? '#831843' : '#FECDD3') : (isDark ? '#273244' : '#E5E7EB'); ctx.lineWidth = 1; ctx.strokeRect(pad, cy, W - pad * 2, bh);
     if (b.kind === 'theme') { ctx.fillStyle = '#FB7299'; ctx.fillRect(pad, cy, 4, bh); }
-    ctx.fillStyle = b.kind === 'theme' ? '#E11D48' : '#4B5563'; ctx.font = 'bold 13px -apple-system,PingFang SC,sans-serif'; ctx.fillText(b.label, pad + 16, cy + 24);
-    ctx.fillStyle = '#1F2937'; ctx.font = '15px -apple-system,PingFang SC,Microsoft YaHei,sans-serif';
+    ctx.fillStyle = b.kind === 'theme' ? '#FB7299' : (isDark ? '#94A3B8' : '#4B5563'); ctx.font = 'bold 13px -apple-system,PingFang SC,sans-serif'; ctx.fillText(b.label, pad + 16, cy + 24);
+    ctx.fillStyle = isDark ? '#E2E8F0' : '#1F2937'; ctx.font = '15px -apple-system,PingFang SC,Microsoft YaHei,sans-serif';
     let ly = cy + 48; b.lines.forEach(l => { ctx.fillText(l, pad + 16, ly); ly += 25; });
     cy += bh + 16;
   });
@@ -6391,24 +6791,55 @@ function renderFeedFooter() {
   else footer.innerHTML = '<div class="feed-meta-note">已加载全部 ' + count + ' 条公开视频</div>';
 }
 
+let monHideShort = false;
+let monOnlyUnsum = false;
+function getFilteredFeedEntries() {
+  const kw = ((document.getElementById('monFeedFilterKw') && document.getElementById('monFeedFilterKw').value) || '').trim().toLowerCase();
+  const sumBvids = new Set(getJobs().filter(j => normStatus(j.status) === 'completed' && j.summary).map(j => j.bvid));
+  const out = [];
+  currentFeedVideos.forEach((v, idx) => {
+    if (kw && !(v.title || '').toLowerCase().includes(kw) && !(v.author || '').toLowerCase().includes(kw) && !(v.bvid || '').toLowerCase().includes(kw)) return;
+    if (monHideShort && parseDurationSec(v.duration) > 0 && parseDurationSec(v.duration) < 120) return;
+    if (monOnlyUnsum && (v.summary || sumBvids.has(v.bvid))) return;
+    out.push({ v, idx });
+  });
+  return out;
+}
+function applyFeedFilters() {
+  const grid = document.getElementById('upFeedGrid');
+  if (!grid) return;
+  const entries = getFilteredFeedEntries();
+  if (!currentFeedVideos.length) { grid.innerHTML = '<div class="reader-card" style="grid-column:1/-1;text-align:center;color:var(--muted);padding:36px">暂未获取到公开视频</div>'; renderFeedFooter(); return; }
+  if (!entries.length) { grid.innerHTML = '<div class="reader-card" style="grid-column:1/-1;text-align:center;color:var(--muted);padding:36px">当前筛选条件下暂无匹配视频</div>'; renderFeedFooter(); return; }
+  grid.innerHTML = entries.map(e => buildVideoCardHtml(e.v, e.idx, { pool: 'feed' })).join('');
+  renderFeedFooter();
+}
+function toggleMonHideShort() {
+  monHideShort = !monHideShort;
+  const btn = document.getElementById('monHideShortBtn');
+  if (btn) btn.classList.toggle('active', monHideShort);
+  applyFeedFilters();
+}
+function toggleMonOnlyUnsum() {
+  monOnlyUnsum = !monOnlyUnsum;
+  const btn = document.getElementById('monOnlyUnsumBtn');
+  if (btn) btn.classList.toggle('active', monOnlyUnsum);
+  applyFeedFilters();
+}
 function renderFeedCards(vids, key) {
   const grid = document.getElementById('upFeedGrid');
   const sig = vids.length + ':' + (vids[0] ? vids[0].bvid : '') + ':' + (vids[vids.length - 1] ? vids[vids.length - 1].bvid : '');
   currentFeedVideos = vids.slice();
-  if (key && lastRenderedFeedKey === key && lastRenderedFeedSig === sig && grid.children.length > 0) { renderFeedFooter(); return; }
+  if (key && lastRenderedFeedKey === key && lastRenderedFeedSig === sig && grid.children.length > 0 && !monHideShort && !monOnlyUnsum && !((document.getElementById('monFeedFilterKw') && document.getElementById('monFeedFilterKw').value) || '').trim()) { renderFeedFooter(); return; }
   lastRenderedFeedKey = key || ''; lastRenderedFeedSig = sig;
-  if (!vids.length) { grid.innerHTML = '<div class="reader-card" style="grid-column:1/-1;text-align:center;color:var(--muted);padding:36px">暂未获取到公开视频</div>'; renderFeedFooter(); return; }
-  grid.innerHTML = vids.map((v, idx) => buildVideoCardHtml(v, idx, { pool: 'feed' })).join('');
-  renderFeedFooter();
+  applyFeedFilters();
 }
 function appendFeedCards(newVids) {
   const grid = document.getElementById('upFeedGrid');
   if (!grid || !newVids.length) { renderFeedFooter(); return; }
-  const startIdx = currentFeedVideos.length;
   currentFeedVideos.push(...newVids);
-  grid.insertAdjacentHTML('beforeend', newVids.map((v, i) => buildVideoCardHtml(v, startIdx + i, { pool: 'feed' })).join(''));
   lastRenderedFeedSig = currentFeedVideos.length + ':' + (currentFeedVideos[0] ? currentFeedVideos[0].bvid : '') + ':' + (currentFeedVideos[currentFeedVideos.length - 1] ? currentFeedVideos[currentFeedVideos.length - 1].bvid : '');
-  renderFeedFooter();
+  applyFeedFilters();
 }
 
 function prefetchTopUpsQuietly() {
@@ -7235,6 +7666,380 @@ async function triggerMonitorNow(toastId) {
   } catch (e) { toast('触发异常: ' + e.message, true); }
 }
 
+// ── Hover Video Preview + Medium Modal Player ──
+let hoveredPreviewBvid = '';
+let hoveredPreviewThumb = null;
+let hoverPreviewTimer = null;
+let previewModalBvid = '';
+const previewUrlCache = new Map();
+
+async function resolvePlayablePreviewUrl(bvid) {
+  if (!bvid || !/^BV/i.test(bvid)) return '';
+  if (previewUrlCache.has(bvid)) return previewUrlCache.get(bvid);
+  try {
+    const r = await apiFetch('/api/bili-preview?bvid=' + encodeURIComponent(bvid));
+    const d = await r.json();
+    const raw = (d && d.ok && Array.isArray(d.video_urls) && d.video_urls[0]) ? d.video_urls[0] : '';
+    const proxied = raw ? ('/api/bili-media?url=' + encodeURIComponent(raw)) : '';
+    if (proxied) previewUrlCache.set(bvid, proxied);
+    return proxied;
+  } catch { return ''; }
+}
+function cleanupInlinePreview(thumb) {
+  if (!thumb) return;
+  thumb.querySelectorAll('.v-preview-vid, .v-preview-hint').forEach(el => {
+    if (el.tagName === 'VIDEO') { try { el.pause(); el.removeAttribute('src'); el.load(); } catch {} }
+    el.remove();
+  });
+}
+function extractBvidFromThumb(el) {
+  const card = el.closest('[data-bvid]');
+  if (card && card.dataset.bvid) return card.dataset.bvid;
+  const href = el.getAttribute('href') || '';
+  const m = href.match(/BV[a-zA-Z0-9]{8,12}/);
+  return m ? m[0] : '';
+}
+document.addEventListener('mouseover', (e) => {
+  const thumb = e.target && e.target.closest ? e.target.closest('.v-thumb-link, .fav-item-thumb') : null;
+  if (!thumb) return;
+  if (e.relatedTarget && thumb.contains(e.relatedTarget)) return;
+  const bvid = extractBvidFromThumb(thumb);
+  if (!bvid) return;
+  hoveredPreviewBvid = bvid;
+  hoveredPreviewThumb = thumb;
+  clearTimeout(hoverPreviewTimer);
+  hoverPreviewTimer = setTimeout(async () => {
+    if (hoveredPreviewThumb !== thumb || hoveredPreviewBvid !== bvid) return;
+    const mediaUrl = await resolvePlayablePreviewUrl(bvid);
+    if (!mediaUrl || hoveredPreviewThumb !== thumb) return;
+    cleanupInlinePreview(thumb);
+    const vid = document.createElement('video');
+    vid.className = 'v-preview-vid';
+    vid.muted = true;
+    vid.autoplay = true;
+    vid.loop = true;
+    vid.playsInline = true;
+    vid.src = mediaUrl;
+    const hint = document.createElement('span');
+    hint.className = 'v-preview-hint';
+    hint.textContent = '点击 / Enter 放大';
+    thumb.appendChild(vid);
+    thumb.appendChild(hint);
+    vid.play().catch(() => {});
+  }, 350);
+});
+document.addEventListener('mouseout', (e) => {
+  const thumb = e.target && e.target.closest ? e.target.closest('.v-thumb-link, .fav-item-thumb') : null;
+  if (!thumb) return;
+  if (e.relatedTarget && thumb.contains(e.relatedTarget)) return;
+  clearTimeout(hoverPreviewTimer);
+  cleanupInlinePreview(thumb);
+  if (hoveredPreviewThumb === thumb) {
+    hoveredPreviewThumb = null;
+    hoveredPreviewBvid = '';
+  }
+});
+document.addEventListener('click', (e) => {
+  const thumb = e.target && e.target.closest ? e.target.closest('.v-thumb-link, .fav-item-thumb') : null;
+  if (!thumb) return;
+  if (e.target.closest('.v-quick-acts') || e.target.closest('.v-chk-wrap')) return;
+  const bvid = extractBvidFromThumb(thumb);
+  if (!bvid) return;
+  e.preventDefault();
+  cleanupInlinePreview(thumb);
+  openVideoPreviewModal(bvid);
+});
+
+async function openVideoPreviewModal(bvid) {
+  if (!bvid) return;
+  previewModalBvid = bvid;
+  const meta = videoMetaRegistry.get(bvid) || getJobs().find(j => j.bvid === bvid) || {};
+  document.getElementById('vpmTitle').textContent = meta.title || bvid;
+  document.getElementById('vpmWatchLink').href = 'https://www.bilibili.com/video/' + encodeURIComponent(bvid);
+  const vid = document.getElementById('vpmVideo');
+  vid.pause();
+  vid.removeAttribute('src');
+  openModal('videoPreviewModal');
+  const mediaUrl = await resolvePlayablePreviewUrl(bvid);
+  if (previewModalBvid !== bvid) return;
+  if (!mediaUrl) {
+    toast('该视频暂不支持直链预览，请点击「在B站观看」', true);
+    return;
+  }
+  vid.src = mediaUrl;
+  vid.play().catch(() => {});
+}
+function closeVideoPreviewModal() {
+  const modal = document.getElementById('videoPreviewModal');
+  if (!modal || modal.classList.contains('hidden')) return;
+  const vid = document.getElementById('vpmVideo');
+  if (vid) { try { vid.pause(); vid.removeAttribute('src'); vid.load(); } catch {} }
+  previewModalBvid = '';
+  closeModal('videoPreviewModal');
+}
+function summarizeFromPreviewModal() {
+  const bvid = previewModalBvid;
+  if (!bvid) return;
+  const meta = videoMetaRegistry.get(bvid) || {};
+  closeVideoPreviewModal();
+  submitVideo(bvid, { title: meta.title || '', owner: meta.author || meta.owner || '', duration: meta.duration || '', pic: meta.pic || '' });
+}
+
+// ── Import Bilibili Public Favorites ──
+let biliFavFetchedItems = [];
+function openBiliFavImportModal() {
+  biliFavFetchedItems = [];
+  document.getElementById('biliFavFidInput').value = '';
+  document.getElementById('biliFavPreviewList').innerHTML = '';
+  document.getElementById('biliFavConfirmBtn').classList.add('hidden');
+  openModal('biliFavImportModal');
+  setTimeout(() => document.getElementById('biliFavFidInput').focus(), 40);
+}
+async function fetchBiliFavPreview() {
+  const raw = (document.getElementById('biliFavFidInput').value || '').trim();
+  if (!raw) { toast('请输入收藏夹 ID 或链接', true); return; }
+  const btn = document.getElementById('biliFavFetchBtn');
+  btn.disabled = true; btn.textContent = '拉取中...';
+  try {
+    const r = await apiFetch('/api/bili-fav?fid=' + encodeURIComponent(raw));
+    const d = await r.json();
+    if (!d.ok || !Array.isArray(d.items) || !d.items.length) {
+      document.getElementById('biliFavPreviewList').innerHTML = '<div style="padding:18px;text-align:center;color:var(--muted);font-size:13px">' + esc(d.error || '未获取到公开收藏视频，请确认收藏夹为公开状态') + '</div>';
+      document.getElementById('biliFavConfirmBtn').classList.add('hidden');
+      return;
+    }
+    biliFavFetchedItems = d.items;
+    document.getElementById('biliFavPreviewList').innerHTML =
+      '<div style="font-size:12px;color:var(--soft);margin-bottom:8px">收藏夹「' + esc(d.title || d.fid) + '」共 ' + d.items.length + ' 条公开视频：</div>' +
+      d.items.map(it => '<div style="display:flex;align-items:center;justify-content:space-between;gap:8px;padding:7px 8px;border-bottom:1px solid var(--border);font-size:12.5px"><span style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap">' + esc(it.title) + '</span><span style="color:var(--muted);flex-shrink:0">' + esc(it.owner && it.owner.name || '') + ' · ' + esc(formatSecDuration(it.duration)) + '</span></div>').join('');
+    document.getElementById('biliFavConfirmBtn').classList.remove('hidden');
+  } catch (e) { toast('拉取失败: ' + e.message, true); }
+  finally { btn.disabled = false; btn.textContent = '拉取'; }
+}
+function confirmImportBiliFav() {
+  if (!biliFavFetchedItems.length) return;
+  let added = 0;
+  biliFavFetchedItems.forEach(it => {
+    if (!it.bvid || isWatchLater(it.bvid)) return;
+    libraryState.watch_later.unshift({
+      bvid: it.bvid,
+      title: it.title || it.bvid,
+      author: (it.owner && it.owner.name) || '',
+      pic: it.cover || '',
+      duration: formatSecDuration(it.duration),
+      url: it.link || ('https://www.bilibili.com/video/' + it.bvid),
+      added_at: new Date().toISOString(),
+    });
+    added++;
+  });
+  saveLibraryLocalAndCloud();
+  updateNavBadges();
+  if (currentRoute === 'watch-later') renderWatchLaterPage();
+  closeModal('biliFavImportModal');
+  toast('已导入 ' + added + ' 条视频到「稍后再看」');
+}
+
+// ── Keyword Radar ──
+const LS_RADAR_KWS = 'bilisum_radar_kws_v1';
+let radarResults = [];
+function getRadarKeywords() {
+  try { return JSON.parse(localStorage.getItem(LS_RADAR_KWS) || '["AI Agent","DeepSeek","开源项目"]'); } catch { return ['AI Agent', 'DeepSeek']; }
+}
+function saveRadarKeywords(arr) {
+  try { localStorage.setItem(LS_RADAR_KWS, JSON.stringify(arr.slice(0, 12))); } catch {}
+}
+function openRadarModal() {
+  renderRadarChips();
+  openModal('radarModal');
+  const kws = getRadarKeywords();
+  if (kws.length && !document.getElementById('radarKwInput').value.trim()) {
+    document.getElementById('radarKwInput').value = kws[0];
+    runRadarSearch(kws[0]);
+  }
+}
+function renderRadarChips() {
+  const kws = getRadarKeywords();
+  const box = document.getElementById('radarSavedChips');
+  if (!box) return;
+  box.innerHTML = kws.map(k =>
+    '<span class="folder-chip" style="display:inline-flex;align-items:center;gap:6px">' +
+      '<span onclick="document.getElementById(\'radarKwInput\').value=\'' + esc(k) + '\';runRadarSearch(\'' + esc(k) + '\')">' + esc(k) + '</span>' +
+      '<span style="opacity:.6;cursor:pointer" onclick="event.stopPropagation();removeRadarKeyword(\'' + esc(k) + '\')">×</span>' +
+    '</span>'
+  ).join('');
+}
+function addRadarKeyword() {
+  const kw = (document.getElementById('radarKwInput').value || '').trim();
+  if (!kw) return;
+  const kws = getRadarKeywords();
+  if (!kws.includes(kw)) { kws.unshift(kw); saveRadarKeywords(kws); renderRadarChips(); toast('已订阅关键词：' + kw); }
+}
+function removeRadarKeyword(kw) {
+  saveRadarKeywords(getRadarKeywords().filter(x => x !== kw));
+  renderRadarChips();
+}
+async function runRadarSearch(overrideKw) {
+  const kw = String(overrideKw !== undefined ? overrideKw : (document.getElementById('radarKwInput').value || '')).trim();
+  if (!kw) { toast('请输入搜索关键词', true); return; }
+  const box = document.getElementById('radarResultsBox');
+  box.innerHTML = '<div style="padding:28px;text-align:center;color:var(--muted)">正在搜索 B 站最新视频...</div>';
+  try {
+    const r = await apiFetch('/api/bili-search?kw=' + encodeURIComponent(kw));
+    const d = await r.json();
+    radarResults = Array.isArray(d.items) ? d.items : [];
+    if (!radarResults.length) {
+      box.innerHTML = '<div style="padding:28px;text-align:center;color:var(--muted)">未搜索到相关视频</div>';
+      return;
+    }
+    box.innerHTML = radarResults.map((v, idx) =>
+      '<div style="display:flex;align-items:center;justify-content:space-between;gap:12px;padding:10px 8px;border-bottom:1px solid var(--border)">' +
+        '<div style="min-width:0;flex:1">' +
+          '<div style="font-size:13.5px;font-weight:700;color:var(--text);overflow:hidden;text-overflow:ellipsis;white-space:nowrap">' + esc(v.title) + '</div>' +
+          '<div style="font-size:11.5px;color:var(--muted);margin-top:2px">' + esc((v.owner && v.owner.name) || '') + ' · ' + esc(formatSecDuration(v.duration)) + ' · ' + esc(v.bvid) + '</div>' +
+        '</div>' +
+        '<div style="display:flex;gap:6px;flex-shrink:0">' +
+          '<button class="btn btn-sm" onclick="radarQuickWl(' + idx + ')">稍后再看</button>' +
+          '<button class="btn btn-sm btn-primary" onclick="radarQuickSum(' + idx + ')">一键总结</button>' +
+        '</div>' +
+      '</div>'
+    ).join('');
+  } catch (e) { box.innerHTML = '<div style="padding:24px;text-align:center;color:var(--err)">搜索失败：' + esc(e.message) + '</div>'; }
+}
+function radarQuickWl(idx) {
+  const v = radarResults[idx];
+  if (!v) return;
+  toggleWatchLaterVideo({ bvid: v.bvid, title: v.title, author: v.owner && v.owner.name || '', pic: v.cover || '', duration: formatSecDuration(v.duration), url: 'https://www.bilibili.com/video/' + v.bvid });
+}
+function radarQuickSum(idx) {
+  const v = radarResults[idx];
+  if (!v) return;
+  closeModal('radarModal');
+  submitVideo(v.bvid, { title: v.title, owner: v.owner && v.owner.name || '', duration: formatSecDuration(v.duration), pic: v.cover || '' });
+}
+
+// ── Cross-Video AI Synthesis ──
+let lastSynthMarkdown = '';
+function openSynthesizeModal(scope) {
+  let completed = getJobs().filter(j => normStatus(j.status) === 'completed' && j.summary);
+  if (scope === 'fav') {
+    const favBvids = new Set(getAllFavoritesMerged().map(v => v.bvid));
+    const favJobs = completed.filter(j => j.starred || favBvids.has(j.bvid));
+    if (favJobs.length >= 2) completed = favJobs;
+  }
+  const listEl = document.getElementById('synthPickList');
+  document.getElementById('synthResultBox').classList.add('hidden');
+  document.getElementById('synthCopyBtn').classList.add('hidden');
+  if (completed.length < 2) {
+    listEl.innerHTML = '<div style="padding:18px;text-align:center;color:var(--muted);font-size:13px">至少需要 2 条已完成摘要才能进行跨视频综述</div>';
+  } else {
+    listEl.innerHTML = completed.slice(0, 30).map((j, i) =>
+      '<label style="display:flex;align-items:center;gap:8px;padding:6px 4px;border-bottom:1px solid var(--border);font-size:13px;cursor:pointer">' +
+        '<input type="checkbox" class="synth-chk" value="' + esc(j.id) + '"' + (i < 3 ? ' checked' : '') + '>' +
+        '<span style="flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">' + esc(j.title || j.bvid) + '</span>' +
+        '<span style="color:var(--muted);font-size:11.5px;flex-shrink:0">' + esc(j.owner || '') + '</span>' +
+      '</label>'
+    ).join('');
+  }
+  openModal('synthesizeModal');
+}
+async function runCrossVideoSynthesis() {
+  const ids = Array.from(document.querySelectorAll('.synth-chk:checked')).map(el => el.value).slice(0, 6);
+  if (ids.length < 2) { toast('请勾选至少 2 条摘要（最多 6 条）', true); return; }
+  const jobs = getJobs();
+  const items = ids.map(id => jobs.find(j => j.id === id)).filter(Boolean).map(j => ({ bvid: j.bvid, title: j.title, owner: j.owner, summary: j.summary }));
+  const topic = (document.getElementById('synthTopicInput').value || '').trim();
+  const btn = document.getElementById('synthRunBtn');
+  btn.disabled = true; btn.textContent = 'AI 综合分析中...';
+  const box = document.getElementById('synthResultBox');
+  box.classList.remove('hidden');
+  box.innerHTML = '<div style="padding:20px;text-align:center;color:var(--muted)">正在调用免费 AI 模型进行跨视频深度综述...</div>';
+  try {
+    const r = await apiFetch('/api/synthesize', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ items, topic }),
+    });
+    const d = await r.json();
+    if (!r.ok || !d.ok) { box.innerHTML = '<div style="color:var(--err)">' + esc(d.error || '生成失败') + '</div>'; return; }
+    lastSynthMarkdown = d.synthesis || '';
+    box.innerHTML = renderRichSummary(lastSynthMarkdown);
+    document.getElementById('synthCopyBtn').classList.remove('hidden');
+  } catch (e) { box.innerHTML = '<div style="color:var(--err)">网络异常：' + esc(e.message) + '</div>'; }
+  finally { btn.disabled = false; btn.textContent = '开始 AI 综述'; }
+}
+function copySynthResult() {
+  if (!lastSynthMarkdown) return;
+  navigator.clipboard.writeText(lastSynthMarkdown).then(() => toast('跨视频综述已复制')).catch(() => {});
+}
+
+// ── Batch Markdown Export ──
+function batchExportMarkdown(scope) {
+  let jobs = getJobs().filter(j => normStatus(j.status) === 'completed' && j.summary);
+  if (scope === 'fav') {
+    const favBvids = new Set(getAllFavoritesMerged().map(v => v.bvid));
+    jobs = jobs.filter(j => j.starred || favBvids.has(j.bvid));
+  } else if (histSelectedIds && histSelectedIds.size > 0) {
+    jobs = jobs.filter(j => histSelectedIds.has(j.id));
+  }
+  if (!jobs.length) { toast('没有可导出的已完成摘要', true); return; }
+  const md = jobs.map(j =>
+    '# ' + (j.title || j.bvid) + '\n\n' +
+    '- UP主：' + (j.owner || '未知') + '\n' +
+    '- 时长：' + (j.duration || '-') + '\n' +
+    '- BV号：' + (j.bvid || '') + '\n' +
+    '- 链接：https://www.bilibili.com/video/' + (j.bvid || '') + '\n\n' +
+    (j.summary || '') + '\n\n---\n\n'
+  ).join('');
+  const blob = new Blob([md], { type: 'text/markdown;charset=utf-8' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = 'bilisum-' + scope + '-' + new Date().toISOString().slice(0, 10) + '.md';
+  a.click();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+  toast('已批量导出 ' + jobs.length + ' 条摘要为 Markdown');
+}
+
+// ── Spotlight Command Palette (Ctrl+K) ──
+function openCmdPalette() {
+  openModal('cmdPaletteModal');
+  const inp = document.getElementById('cmdPaletteInput');
+  inp.value = '';
+  renderCmdPalette();
+  setTimeout(() => inp.focus(), 40);
+}
+function renderCmdPalette() {
+  const q = (document.getElementById('cmdPaletteInput').value || '').trim();
+  const ql = q.toLowerCase();
+  const box = document.getElementById('cmdPaletteResults');
+  const rows = [];
+  if (/BV[a-zA-Z0-9]{6,}|bilibili\.com\/video\//i.test(q)) {
+    rows.push('<div class="cmd-item" onclick="closeModal(\'cmdPaletteModal\');submitVideo(\'' + esc(q) + '\')"><div><div class="cmd-item-title">立即总结：' + esc(q) + '</div><div class="cmd-item-sub">按 Enter 立即提交云端 AI 摘要</div></div><span class="cmd-badge">新任务</span></div>');
+  }
+  const jobs = getJobs();
+  const matchedJobs = (ql ? jobs.filter(j => (j.title || '').toLowerCase().includes(ql) || (j.owner || '').toLowerCase().includes(ql) || (j.bvid || '').toLowerCase().includes(ql) || (j.transcript || '').toLowerCase().includes(ql) || (j.summary || '').toLowerCase().includes(ql)) : jobs).slice(0, 8);
+  matchedJobs.forEach(j => {
+    rows.push('<div class="cmd-item" onclick="closeModal(\'cmdPaletteModal\');selectJob(\'' + esc(j.id) + '\',true)"><div style="min-width:0;flex:1"><div class="cmd-item-title">' + esc(j.title || j.bvid) + '</div><div class="cmd-item-sub">' + esc(j.owner || '') + ' · ' + esc(j.bvid || '') + '</div></div><span class="cmd-badge">摘要</span></div>');
+  });
+  const matchedUps = (monitorConfig.up_list || []).filter(u => !ql || (u.name || '').toLowerCase().includes(ql) || String(u.mid).includes(ql)).slice(0, 5);
+  matchedUps.forEach(u => {
+    rows.push('<div class="cmd-item" onclick="closeModal(\'cmdPaletteModal\');activateRoute(\'monitor\',\'\',true);selectMonitorUp(' + Number(u.mid) + ')"><div style="min-width:0;flex:1"><div class="cmd-item-title">' + esc(u.name || u.mid) + '</div><div class="cmd-item-sub">UID ' + esc(String(u.mid)) + '</div></div><span class="cmd-badge">UP 主</span></div>');
+  });
+  if (!rows.length) rows.push('<div style="padding:24px;text-align:center;color:var(--muted);font-size:13px">未找到匹配结果，可直接粘贴 B 站视频链接或 BV 号</div>');
+  box.innerHTML = rows.join('');
+}
+function onCmdPaletteKey(e) {
+  if (e.key !== 'Enter') return;
+  const q = (document.getElementById('cmdPaletteInput').value || '').trim();
+  if (/BV[a-zA-Z0-9]{6,}|bilibili\.com\/video\//i.test(q)) {
+    e.preventDefault();
+    closeModal('cmdPaletteModal');
+    submitVideo(q);
+    return;
+  }
+  const first = document.querySelector('#cmdPaletteResults .cmd-item');
+  if (first) { e.preventDefault(); first.click(); }
+}
+
 // ── Boot ──
 initTheme();
 initCustomSelects();
@@ -7263,6 +8068,11 @@ export default {
       if (path === '/api/monitor-config' && request.method === 'GET') return await handleGetMonitorConfig(request, env);
       if (path === '/api/monitor-config' && request.method === 'POST') return await handleSaveMonitorConfig(request, env);
       if (path === '/api/up-lookup' && request.method === 'GET') return await handleUpLookup(request, env);
+      if (path === '/api/bili-info' && request.method === 'GET') return await handleBiliInfo(request, env);
+      if (path === '/api/bili-preview' && request.method === 'GET') return await handleBiliPreview(request, env);
+      if (path === '/api/bili-media' && request.method === 'GET') return await handleBiliMedia(request);
+      if (path === '/api/bili-fav' && request.method === 'GET') return await handleBiliFav(request, env);
+      if (path === '/api/bili-search' && request.method === 'GET') return await handleBiliSearch(request, env);
       if (path === '/api/bili-cover' && request.method === 'GET') return await handleBiliCover(request, env, ctx);
       if (path === '/api/up-videos' && request.method === 'GET') return await handleGetUpVideos(request, env, ctx);
       if (path === '/api/monitor-archive' && request.method === 'GET') return await handleGetMonitorArchive(request, env);
@@ -7279,7 +8089,7 @@ export default {
       if (path === '/' || path === '/index.html') return htmlResponse(generateFrontendPage());
 
       // Protected personal workspace APIs (require single-device persistent cookie or Bearer token)
-      const authedPaths = ['/api/library', '/api/submit', '/api/history', '/api/jobs', '/api/resummarize', '/api/chat'];
+      const authedPaths = ['/api/library', '/api/submit', '/api/history', '/api/jobs', '/api/resummarize', '/api/chat', '/api/synthesize'];
       if (authedPaths.some(p => path === p || path.startsWith('/api/jobs/'))) {
         const sess = await verifySessionToken(request, env);
         if (!sess) return errorResponse('请先登录账号', 401);
@@ -7296,6 +8106,7 @@ export default {
       if (path.startsWith('/api/jobs/') && request.method === 'DELETE') return await handleDeleteJob(request, env, path.replace('/api/jobs/', ''));
       if (path === '/api/resummarize' && request.method === 'POST') return await handleResummarize(request, env);
       if (path === '/api/chat' && request.method === 'POST') return await handleVideoChat(request, env);
+      if (path === '/api/synthesize' && request.method === 'POST') return await handleSynthesize(request, env);
 
       return errorResponse('Not Found', 404);
     } catch (err) {
