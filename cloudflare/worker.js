@@ -30,12 +30,12 @@ const DEFAULT_MONITOR_CONFIG = {
   times_cst: ['08:00', '20:00'],
   cron_utc: '0 0,12 * * *',
   up_list: [
-    { mid: 21131684, name: '刺客边风' },
-    { mid: 448165099, name: '军情D7处' },
-    { mid: 346563107, name: '波士顿圆脸' },
-    { mid: 72275943, name: '古必的精读书柜' },
-    { mid: 413486376, name: '十万个挑战' },
-    { mid: 406636263, name: 'HOLA小测佬' },
+    { mid: 21131684, name: '刺客边风', face: 'https://i2.hdslb.com/bfs/face/7d8e287d403f0b3f2fcc6b5f61417ed9ee7b530d.jpg' },
+    { mid: 448165099, name: '军情D7处', face: 'https://i1.hdslb.com/bfs/face/5e9ad8be00b4bcc62681d46ea4549bc44b3a88b2.jpg' },
+    { mid: 346563107, name: '波士顿圆脸', face: 'https://i2.hdslb.com/bfs/face/f8f0fc4114bb06a87481abe12faa006a383cbe6d.jpg' },
+    { mid: 72275943, name: '古必的精读书柜', face: 'https://i0.hdslb.com/bfs/face/7a6f456f98dff1ad76e95157d2278e092b35a99f.jpg' },
+    { mid: 413486376, name: '十万个挑战', face: 'https://i0.hdslb.com/bfs/face/95774d9dc096c918dc908e59c0c687c671acb3b2.jpg' },
+    { mid: 406636263, name: 'HOLA小测佬', face: 'https://i0.hdslb.com/bfs/face/8d076e9dffc6457c18d050b20195aba05c9996ea.jpg' },
   ],
   email_style: 'editorial',
   merge_emails: true,
@@ -299,12 +299,21 @@ function cstTimesToUtcCron(timesCst, scheduleMode, customCron) {
 }
 
 async function readMonitorConfig(env) {
+  const defaultFaceMap = new Map(DEFAULT_MONITOR_CONFIG.up_list.map(u => [Number(u.mid), u.face]));
   if (!env.BILIBILI_BUCKET) return { ...DEFAULT_MONITOR_CONFIG };
   try {
     const obj = await env.BILIBILI_BUCKET.get(MONITOR_CONFIG_KEY);
     if (!obj) return { ...DEFAULT_MONITOR_CONFIG };
     const saved = await obj.json();
-    return { ...DEFAULT_MONITOR_CONFIG, ...saved };
+    const merged = { ...DEFAULT_MONITOR_CONFIG, ...saved };
+    if (Array.isArray(merged.up_list)) {
+      merged.up_list = merged.up_list.map(u => ({
+        mid: Number(u.mid),
+        name: u.name || String(u.mid),
+        face: (u.face || defaultFaceMap.get(Number(u.mid)) || '').replace(/^http:\/\//, 'https://'),
+      }));
+    }
+    return merged;
   } catch {
     return { ...DEFAULT_MONITOR_CONFIG };
   }
@@ -437,9 +446,11 @@ async function handleSaveMonitorConfig(request, env) {
       const mid = parseInt(typeof item === 'object' ? item.mid : item, 10);
       if (Number.isFinite(mid) && mid > 0 && !seen.has(mid)) {
         seen.add(mid);
+        const rawFace = (typeof item === 'object' && item.face) ? String(item.face).trim() : '';
         upList.push({
           mid,
           name: typeof item === 'object' && item.name ? String(item.name).slice(0, 60) : String(mid),
+          face: rawFace.replace(/^http:\/\//, 'https://').slice(0, 240),
         });
       }
     }
@@ -496,11 +507,17 @@ async function handleUpLookup(request, env) {
     const r = await fetch(`${proxyBase}/api/bili-card?mid=${mid}`);
     const d = await r.json();
     if (d.ok) {
-      return jsonResponse({ ok: true, mid: Number(mid), name: d.name || mid, fans: d.fans || 0 });
+      return jsonResponse({
+        ok: true,
+        mid: Number(mid),
+        name: d.name || mid,
+        face: (d.face || '').replace(/^http:\/\//, 'https://'),
+        fans: d.fans || 0,
+      });
     }
-    return jsonResponse({ ok: true, mid: Number(mid), name: mid, note: '未查到昵称，已按 UID 添加' });
+    return jsonResponse({ ok: true, mid: Number(mid), name: mid, face: '', note: '未查到昵称，已按 UID 添加' });
   } catch {
-    return jsonResponse({ ok: true, mid: Number(mid), name: mid, note: '昵称解析超时，已按 UID 添加' });
+    return jsonResponse({ ok: true, mid: Number(mid), name: mid, face: '', note: '昵称解析超时，已按 UID 添加' });
   }
 }
 
@@ -596,39 +613,70 @@ async function handleGetUpVideos(request, env) {
   if (!sess) return errorResponse('需要登录管理员账号', 401);
 
   const reqUrl = new URL(request.url);
-  const mid = (reqUrl.searchParams.get('mid') || '').trim();
-  const ps = Math.min(parseInt(reqUrl.searchParams.get('ps') || '15', 10) || 15, 30);
-  if (!/^\d+$/.test(mid)) return errorResponse('无效的 UP 主 UID', 400);
+  const midParam = (reqUrl.searchParams.get('mid') || '').trim();
+  const ps = Math.min(parseInt(reqUrl.searchParams.get('ps') || '16', 10) || 16, 30);
 
   const proxyBase = (env.BILI_PROXY_URL || BILI_PROXY_DEF).replace(/\/+$/, '');
+  const cfg = await readMonitorConfig(env);
+  const upMetaMap = new Map((cfg.up_list || []).map(u => [Number(u.mid), u]));
   const archive = await readMonitorArchive(env);
   const summaryMap = new Map();
   archive.forEach(v => { if (v && v.bvid) summaryMap.set(v.bvid, v); });
 
-  try {
-    const r = await fetch(`${proxyBase}/api/bili-up?mid=${mid}&pn=1&ps=${ps}`);
-    const d = await r.json();
-    const vlist = d?.data?.list?.vlist || [];
-    const items = vlist.map(v => {
+  const mapVlist = (vlist, midNum) => {
+    const meta = upMetaMap.get(midNum) || {};
+    return (vlist || []).map(v => {
       const arch = summaryMap.get(v.bvid);
+      const rawPic = (v.pic || '').replace(/^http:\/\//, 'https://');
       return {
         bvid: v.bvid,
+        mid: midNum,
+        author: v.author || meta.name || String(midNum),
+        face: (meta.face || '').replace(/^http:\/\//, 'https://'),
         title: v.title || v.bvid,
         description: v.description || '',
         duration: v.length || '',
         created: v.created || 0,
         play: v.play || 0,
-        pic: v.pic || '',
+        danmaku: v.video_review || 0,
+        pic: rawPic,
         url: `https://www.bilibili.com/video/${v.bvid}`,
         summary: arch ? arch.summary : '',
         archived: Boolean(arch && arch.summary),
       };
     });
-    return jsonResponse({ ok: true, mid: Number(mid), videos: items, code: d.code });
+  };
+
+  // Support aggregated feed across all monitored UPs (mid=all)
+  if (midParam === 'all') {
+    const ups = (cfg.up_list || []).slice(0, 12);
+    const perUp = Math.max(4, Math.min(8, Math.ceil(24 / Math.max(1, ups.length))));
+    const results = await Promise.all(
+      ups.map(async u => {
+        try {
+          const r = await fetch(`${proxyBase}/api/bili-up?mid=${u.mid}&pn=1&ps=${perUp}`);
+          const d = await r.json();
+          return mapVlist(d?.data?.list?.vlist || [], Number(u.mid));
+        } catch {
+          return [];
+        }
+      })
+    );
+    const merged = results.flat().sort((a, b) => (b.created || 0) - (a.created || 0)).slice(0, 40);
+    return jsonResponse({ ok: true, mid: 'all', videos: merged });
+  }
+
+  if (!/^\d+$/.test(midParam)) return errorResponse('无效的 UP 主 UID', 400);
+  const midNum = Number(midParam);
+
+  try {
+    const r = await fetch(`${proxyBase}/api/bili-up?mid=${midNum}&pn=1&ps=${ps}`);
+    const d = await r.json();
+    const items = mapVlist(d?.data?.list?.vlist || [], midNum);
+    return jsonResponse({ ok: true, mid: midNum, videos: items, code: d.code });
   } catch (e) {
-    // Fallback to archived items only
-    const fallback = archive.filter(v => Number(v.mid) === Number(mid));
-    return jsonResponse({ ok: true, mid: Number(mid), videos: fallback, warning: '实时列表拉取失败，仅显示历史归档: ' + e.message });
+    const fallback = archive.filter(v => Number(v.mid) === midNum);
+    return jsonResponse({ ok: true, mid: midNum, videos: fallback, warning: '实时列表拉取失败，仅显示历史归档: ' + e.message });
   }
 }
 
@@ -915,10 +963,17 @@ textarea.ctrl{height:auto;min-height:78px;padding:9px 12px;resize:vertical;line-
 
 /* Sidebar */
 .sidebar{background:var(--surface);display:flex;flex-direction:column;height:100vh;overflow:hidden;padding:18px 18px 16px}
-.brand{display:flex;align-items:center;gap:10px;margin-bottom:16px}
+.brand{display:flex;align-items:center;gap:10px;margin-bottom:14px}
 .brand-icon{width:34px;height:34px;border-radius:10px;background:var(--brand);display:flex;align-items:center;justify-content:center;flex-shrink:0;box-shadow:0 3px 10px rgba(251,114,153,.26)}
 .brand-title{font-size:17px;font-weight:800;letter-spacing:-.2px;color:var(--text)}
 .brand-sub{font-size:11px;color:var(--muted);margin-top:1px}
+
+/* Top-Left Mode Switcher inside Sidebar */
+.side-switcher{display:grid;grid-template-columns:1fr 1fr;gap:4px;background:var(--surface-2);padding:3px;border-radius:10px;border:1px solid var(--border);margin-bottom:14px;flex-shrink:0}
+.side-sw-btn{border:none;background:transparent;height:32px;border-radius:7px;font-size:13px;font-weight:600;color:var(--soft);white-space:nowrap;transition:all .15s;display:inline-flex;align-items:center;justify-content:center;gap:5px}
+.side-sw-btn:hover{color:var(--text)}
+.side-sw-btn.active{background:var(--surface);color:var(--text);box-shadow:var(--shadow-sm)}
+.side-pane{flex:1;min-height:0;display:flex;flex-direction:column;overflow:hidden}
 
 /* Submit Bar */
 .input-shell{display:flex;align-items:center;gap:6px;background:var(--bg);border:1px solid var(--border);border-radius:11px;padding:4px 4px 4px 12px;transition:border-color .15s,box-shadow .15s}
@@ -945,11 +1000,17 @@ textarea.ctrl{height:auto;min-height:78px;padding:9px 12px;resize:vertical;line-
 .sb-toast.err{background:var(--err-soft);color:var(--err-text);border:1px solid var(--err-border)}
 .sb-toast.info{background:var(--surface-2);color:var(--soft)}
 
-/* History Section */
+/* History & Monitored UP Lists in Sidebar */
 .history-wrap{flex:1;min-height:0;display:flex;flex-direction:column;margin-top:14px;padding-top:14px;border-top:1px solid var(--border)}
-.search-box{position:relative;margin-bottom:12px}
+.search-box{position:relative;margin-bottom:10px}
 .search-box .ctrl{padding-left:34px;background-color:var(--bg);height:36px}
 .search-box .s-ic{position:absolute;left:11px;top:50%;transform:translateY(-50%);color:var(--muted);pointer-events:none;display:flex}
+.quick-add-box{padding:10px;background:var(--bg);border:1px solid var(--border);border-radius:10px;margin-bottom:12px}
+.quick-add-label{font-size:11.5px;font-weight:600;color:var(--soft);margin-bottom:6px;display:block}
+.quick-add-row{display:flex;gap:6px;align-items:center}
+.quick-add-row .ctrl{height:34px;font-size:12.5px;flex:1;min-width:0}
+.quick-add-row .btn{height:34px;padding:0 12px;font-size:12.5px}
+
 .history-head{display:flex;align-items:center;justify-content:space-between;margin-bottom:8px;padding:0 2px}
 .history-head h3{font-size:12.5px;font-weight:700;color:var(--soft);display:inline-flex;align-items:center;gap:6px}
 .count-pill{font-size:11px;font-weight:600;color:var(--muted);background:var(--surface-2);padding:1px 7px;border-radius:999px}
@@ -979,17 +1040,25 @@ textarea.ctrl{height:auto;min-height:78px;padding:9px 12px;resize:vertical;line-
 .h-del:hover{color:var(--err);background:var(--err-soft)}
 .h-chk{margin-top:3px;accent-color:var(--brand)}
 
+/* Sidebar Monitored UP Card */
+.up-side-card{padding:9px 11px;border:1px solid var(--border);border-radius:11px;background:var(--surface);cursor:pointer;transition:border-color .15s,background .15s;display:flex;align-items:center;gap:10px}
+.up-side-card:hover{background:var(--surface-hover);border-color:var(--border-strong)}
+.up-side-card.active{border-color:var(--brand);background:var(--brand-soft)}
+.up-ava{width:34px;height:34px;border-radius:50%;object-fit:cover;background:var(--surface-2);flex-shrink:0;border:1px solid var(--border)}
+.up-ava-fb{width:34px;height:34px;border-radius:50%;background:var(--surface-2);color:var(--soft);font-size:13px;font-weight:700;display:flex;align-items:center;justify-content:center;flex-shrink:0;border:1px solid var(--border)}
+.up-side-info{flex:1;min-width:0}
+.up-side-name{font-size:13.5px;font-weight:600;color:var(--text);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.up-side-uid{font-size:11.5px;color:var(--muted);font-family:Consolas,monospace;margin-top:1px}
+.up-side-card .h-del{opacity:0}
+.up-side-card:hover .h-del{opacity:1}
+
 /* Main Workspace */
 .main{display:flex;flex-direction:column;height:100vh;overflow:hidden;background:var(--bg);min-width:0}
 
-/* Top Navigation Bar — Single Clean Row, Never Overflows */
+/* Topbar */
 .topbar{display:flex;align-items:center;justify-content:space-between;gap:12px;height:56px;padding:0 28px;border-bottom:1px solid var(--border);background:var(--surface);flex-shrink:0}
-.nav-tabs{display:inline-flex;align-items:center;gap:4px;background:var(--surface-2);padding:3px;border-radius:9px;border:1px solid var(--border)}
-.nav-tab{border:none;background:transparent;padding:5px 13px;border-radius:7px;font-size:13px;font-weight:600;color:var(--soft);white-space:nowrap;transition:all .15s}
-.nav-tab:hover{color:var(--text)}
-.nav-tab.active{background:var(--surface);color:var(--text);box-shadow:var(--shadow-sm)}
-.nav-guest-label{font-size:13px;font-weight:600;color:var(--soft);white-space:nowrap}
-
+.topbar-title{font-size:14px;font-weight:700;color:var(--text);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.topbar-sub{font-size:12px;color:var(--muted);font-weight:400;margin-left:10px}
 .topbar-actions{display:flex;align-items:center;gap:8px;flex-shrink:0}
 .pill-btn{display:inline-flex;align-items:center;gap:6px;height:34px;padding:0 12px;border:1px solid var(--border);border-radius:9px;background:var(--surface);color:var(--text);font-size:12.5px;font-weight:600;white-space:nowrap;transition:border-color .15s,background .15s}
 .pill-btn:hover{border-color:var(--border-strong);background:var(--surface-hover)}
@@ -998,9 +1067,10 @@ textarea.ctrl{height:auto;min-height:78px;padding:9px 12px;resize:vertical;line-
 .icon-btn:hover{border-color:var(--border-strong);color:var(--text);background:var(--surface-hover)}
 
 .content-scroll{flex:1;overflow-y:auto;padding:20px 28px 44px}
-.content-inner{max-width:960px;margin:0 auto}
+.content-inner{max-width:960px;margin:0 auto;transition:max-width .15s}
+.content-inner.wide-feed{max-width:1400px}
 
-/* Stepper inside content column — Clean full-width, no ugly scrollbar */
+/* Stepper */
 .stepper{display:flex;align-items:center;justify-content:space-between;gap:6px;background:var(--surface);border:1px solid var(--border);border-radius:11px;padding:9px 16px;margin-bottom:14px;font-size:12.5px}
 .st-item{display:inline-flex;align-items:center;gap:6px;color:var(--muted);white-space:nowrap;font-weight:500}
 .st-item.done{color:var(--text)}
@@ -1066,45 +1136,55 @@ textarea.ctrl{height:auto;min-height:78px;padding:9px 12px;resize:vertical;line-
 .transcript-box{font-size:13.8px;line-height:1.85;color:var(--soft);white-space:pre-wrap;word-break:break-word;max-height:72vh;overflow-y:auto}
 .pending-banner{padding:28px 20px;text-align:center;color:var(--soft);font-size:14px}
 
-/* Structured Diagnostic Card for Failed Jobs */
+/* Failure Diagnostic Card */
 .diag-card{background:var(--err-soft);border:1px solid var(--err-border);border-radius:12px;padding:18px 20px}
 .diag-head{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:12px;flex-wrap:wrap}
-.diag-title{font-size:14.5px;font-weight:700;color:var(--err-text);display:inline-flex;align-items:center;gap:7px}
+.diag-title{font-size:14.5px;font-weight:700;color:var(--err-text)}
 .diag-stage{font-size:11.5px;font-weight:600;padding:2px 9px;border-radius:999px;background:var(--surface);border:1px solid var(--err-border);color:var(--err-text)}
 .diag-rows{display:flex;flex-direction:column;gap:8px;font-size:13px;line-height:1.65;color:var(--text)}
 .diag-row{display:grid;grid-template-columns:76px 1fr;gap:8px}
 .diag-key{color:var(--soft);font-weight:600}
 .diag-foot{margin-top:14px;padding-top:12px;border-top:1px dashed var(--err-border);display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap}
 
-/* Secondary Page: Monitored UP Creators Feed */
-.mon-header{background:var(--surface);border:1px solid var(--border);border-radius:14px;padding:16px 20px;margin-bottom:16px;display:flex;align-items:center;justify-content:space-between;gap:14px;flex-wrap:wrap;box-shadow:var(--shadow-sm)}
-.mon-header-info h2{font-size:17px;font-weight:800;margin-bottom:4px}
-.mon-header-info p{font-size:12.5px;color:var(--soft)}
-.mon-grid{display:grid;grid-template-columns:240px 1fr;gap:16px;align-items:start}
-.up-nav-card{background:var(--surface);border:1px solid var(--border);border-radius:14px;padding:10px;display:flex;flex-direction:column;gap:5px;box-shadow:var(--shadow-sm)}
-.up-nav-item{display:flex;align-items:center;justify-content:space-between;gap:8px;width:100%;text-align:left;padding:10px 12px;border:1px solid transparent;border-radius:9px;background:transparent;transition:all .15s}
-.up-nav-item:hover{background:var(--surface-2)}
-.up-nav-item.active{background:var(--brand-soft);border-color:var(--brand-border);color:var(--brand-dark)}
-.up-nav-name{font-size:13.5px;font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.up-nav-uid{font-size:11px;color:var(--muted);font-family:Consolas,monospace}
-.feed-list{display:flex;flex-direction:column;gap:12px}
-.feed-card{background:var(--surface);border:1px solid var(--border);border-radius:13px;padding:16px 18px;box-shadow:var(--shadow-sm)}
-.feed-top{display:flex;align-items:flex-start;justify-content:space-between;gap:12px;margin-bottom:8px}
-.feed-title{font-size:15px;font-weight:700;line-height:1.45;color:var(--text);text-decoration:none}
-.feed-title:hover{color:var(--brand-dark)}
-.feed-meta{display:flex;flex-wrap:wrap;gap:8px;font-size:12px;color:var(--muted);margin-bottom:10px}
-.feed-actions{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
-.feed-summary-wrap{margin-top:12px;padding-top:12px;border-top:1px solid var(--border)}
+/* UP Monitor Feed — Bilibili / YouTube Video Cover Grid */
+.mon-toolbar{display:flex;align-items:center;justify-content:space-between;gap:14px;flex-wrap:wrap;margin-bottom:18px;padding:14px 18px;background:var(--surface);border:1px solid var(--border);border-radius:14px;box-shadow:var(--shadow-sm)}
+.mon-tb-left h2{font-size:16.5px;font-weight:800;margin-bottom:3px}
+.mon-tb-left p{font-size:12.5px;color:var(--soft)}
+.mon-tb-actions{display:flex;gap:8px;flex-wrap:wrap}
+
+.video-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(256px,1fr));gap:22px 16px}
+.v-card{display:flex;flex-direction:column;min-width:0}
+.v-thumb-link{position:relative;display:block;width:100%;aspect-ratio:16/9;border-radius:12px;overflow:hidden;background:var(--surface-2);border:1px solid var(--border);text-decoration:none}
+.v-thumb-link img{width:100%;height:100%;object-fit:cover;display:block;transition:transform .28s ease}
+.v-card:hover .v-thumb-link img{transform:scale(1.035)}
+.v-dur{position:absolute;right:8px;bottom:8px;background:rgba(15,17,22,.82);color:#fff;font-size:11.5px;font-weight:600;padding:2px 6px;border-radius:5px;line-height:1.3;font-variant-numeric:tabular-nums;letter-spacing:.2px}
+.v-sum-badge{position:absolute;left:8px;top:8px;background:rgba(16,185,129,.92);color:#fff;font-size:11px;font-weight:600;padding:2px 8px;border-radius:999px}
+.v-body{display:flex;align-items:flex-start;gap:10px;padding-top:10px}
+.v-ava{width:34px;height:34px;border-radius:50%;object-fit:cover;background:var(--surface-2);border:1px solid var(--border);flex-shrink:0;margin-top:2px}
+.v-ava-fb{width:34px;height:34px;border-radius:50%;background:var(--surface-2);color:var(--soft);font-size:13px;font-weight:700;display:flex;align-items:center;justify-content:center;border:1px solid var(--border);flex-shrink:0;margin-top:2px}
+.v-meta-col{flex:1;min-width:0}
+.v-title{display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;font-size:14px;font-weight:700;line-height:1.42;color:var(--text);text-decoration:none;margin-bottom:5px;word-break:break-word}
+.v-title:hover{color:var(--brand-dark)}
+.v-author{font-size:12.5px;color:var(--soft);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;margin-bottom:2px}
+.v-stats{font-size:12px;color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;margin-bottom:7px}
+.v-foot{display:flex;align-items:center;justify-content:space-between;gap:8px}
+.v-time-pill{display:inline-block;background:var(--surface-2);color:var(--soft);font-size:11px;font-weight:500;padding:2px 8px;border-radius:999px;white-space:nowrap}
+.v-act-row{display:inline-flex;align-items:center;gap:6px}
+.v-act-btn{border:1px solid var(--border);background:var(--surface);color:var(--text);font-size:11.5px;font-weight:600;padding:3px 9px;border-radius:7px;white-space:nowrap;transition:all .15s}
+.v-act-btn:hover{border-color:var(--brand);color:var(--brand-dark);background:var(--brand-soft)}
+.v-act-btn.primary{background:var(--cta);color:var(--cta-text);border-color:transparent}
+.v-act-btn.primary:hover{background:var(--cta-hover);color:var(--cta-text)}
 
 /* Modals */
 .modal-backdrop{position:fixed;inset:0;background:rgba(10,12,18,.52);backdrop-filter:blur(4px);z-index:200;display:flex;align-items:center;justify-content:center;padding:20px}
 .modal{background:var(--surface);border:1px solid var(--border);border-radius:16px;box-shadow:var(--shadow-lg);width:100%;max-width:420px;max-height:90vh;display:flex;flex-direction:column;overflow:hidden}
 .modal.wide{max-width:860px}
-.modal-head{display:flex;align-items:center;justify-content:space-between;padding:18px 22px;border-bottom:1px solid var(--border)}
-.modal-head h2{font-size:16px;font-weight:800}
+.modal.reader{max-width:740px}
+.modal-head{display:flex;align-items:center;justify-content:space-between;padding:18px 22px;border-bottom:1px solid var(--border);gap:12px}
+.modal-head h2{font-size:16px;font-weight:800;line-height:1.4}
 .modal-body{padding:20px 22px;overflow-y:auto;flex:1}
 .modal-foot{padding:14px 22px;border-top:1px solid var(--border);display:flex;align-items:center;justify-content:space-between;gap:10px;background:var(--bg);flex-wrap:wrap}
-.btn{display:inline-flex;align-items:center;justify-content:center;gap:6px;height:36px;padding:0 14px;border-radius:9px;font-size:13px;font-weight:600;border:1px solid var(--border);background:var(--surface);color:var(--text);white-space:nowrap;transition:background .15s,border-color .15s}
+.btn{display:inline-flex;align-items:center;justify-content:center;gap:6px;height:36px;padding:0 14px;border-radius:9px;font-size:13px;font-weight:600;border:1px solid var(--border);background:var(--surface);color:var(--text);white-space:nowrap;text-decoration:none;transition:background .15s,border-color .15s}
 .btn:hover{background:var(--surface-hover);border-color:var(--border-strong)}
 .btn-sm{height:30px;padding:0 11px;font-size:12px;border-radius:7px}
 .btn-primary{background:var(--cta);color:var(--cta-text);border-color:transparent}
@@ -1146,18 +1226,17 @@ textarea.ctrl{height:auto;min-height:78px;padding:9px 12px;resize:vertical;line-
 .style-desc{font-size:11px;color:var(--muted);margin-top:2px}
 .email-preview-frame{width:100%;height:370px;border:1px solid var(--border);border-radius:10px;background:#fff}
 
-/* Responsive Breakpoints */
+/* Responsive */
 @media(max-width:1100px){
   .app{grid-template-columns:300px 1px 1fr}
   .topbar{padding:0 18px}
   .content-scroll{padding:18px}
-  .mon-grid{grid-template-columns:200px 1fr}
 }
 @media(max-width:860px){
   html,body{overflow:auto;height:auto}
   .app{grid-template-columns:1fr;height:auto;min-height:100vh}
   .sidebar{height:auto;overflow:visible;border-bottom:1px solid var(--border)}
-  .history-list{max-height:240px}
+  .history-list{max-height:260px}
   .divider{display:none}
   .main{height:auto;overflow:visible}
   .topbar{padding:10px 16px;height:auto}
@@ -1166,9 +1245,9 @@ textarea.ctrl{height:auto;min-height:78px;padding:9px 12px;resize:vertical;line-
   .st-dot{width:14px;height:14px}
   .video-head{flex-direction:column}
   .reader-grid.split{grid-template-columns:1fr}
-  .mon-grid{grid-template-columns:1fr}
   .style-grid{grid-template-columns:repeat(2,1fr)}
   .form-row{grid-template-columns:1fr}
+  .video-grid{grid-template-columns:repeat(auto-fill,minmax(220px,1fr))}
 }
 </style>
 </head>
@@ -1190,64 +1269,99 @@ textarea.ctrl{height:auto;min-height:78px;padding:9px 12px;resize:vertical;line-
       </div>
     </div>
 
-    <div class="input-shell">
-      <input id="videoUrl" type="text" placeholder="输入B站视频链接或 BV 号..." autocomplete="off" onkeydown="if(event.key==='Enter')submitVideo()">
-      <button class="btn-submit" id="submitBtn" onclick="submitVideo()">开始总结</button>
+    <!-- Top-Left Sidebar Mode Switcher -->
+    <div class="side-switcher" id="sideSwitcher">
+      <button class="side-sw-btn active" data-page="workspace" onclick="switchPage('workspace')">单条摘要</button>
+      <button class="side-sw-btn" data-page="monitor" onclick="switchPage('monitor')">UP主监控</button>
     </div>
 
-    <button class="adv-toggle" id="advToggleBtn" type="button" onclick="toggleAdv()">
-      <span>高级配置（模板 / 邮箱 / 样式）</span>
-      <svg class="ic caret" viewBox="0 0 24 24"><path d="M6 9l6 6 6-6"/></svg>
-    </button>
+    <!-- SIDEBAR PANE A: SINGLE VIDEO WORKSPACE -->
+    <div class="side-pane" id="sidebarWorkspace">
+      <div class="input-shell">
+        <input id="videoUrl" type="text" placeholder="输入B站视频链接或 BV 号..." autocomplete="off" onkeydown="if(event.key==='Enter')submitVideo()">
+        <button class="btn-submit" id="submitBtn" onclick="submitVideo()">开始总结</button>
+      </div>
 
-    <div class="adv-box hidden" id="advBox">
-      <div class="field">
-        <label>总结模板</label>
-        <select class="ctrl" id="tplPreset" onchange="onTplPreset()">
-          <option value="">默认精炼日报模板</option>
-          <option value="notes">深度结构化笔记</option>
-          <option value="quotes">金句与核心观点提取</option>
-          <option value="custom">自定义提示词模板</option>
-        </select>
+      <button class="adv-toggle" id="advToggleBtn" type="button" onclick="toggleAdv()">
+        <span>高级配置（模板 / 邮箱 / 样式）</span>
+        <svg class="ic caret" viewBox="0 0 24 24"><path d="M6 9l6 6 6-6"/></svg>
+      </button>
+
+      <div class="adv-box hidden" id="advBox">
+        <div class="field">
+          <label>总结模板</label>
+          <select class="ctrl" id="tplPreset" onchange="onTplPreset()">
+            <option value="">默认精炼日报模板</option>
+            <option value="notes">深度结构化笔记</option>
+            <option value="quotes">金句与核心观点提取</option>
+            <option value="custom">自定义提示词模板</option>
+          </select>
+        </div>
+        <div class="field hidden" id="customTplWrap">
+          <label>自定义模板（含 {content} 占位符）</label>
+          <textarea class="ctrl" id="customTpl" placeholder="请根据以下视频内容提取核心干货：\n{content}"></textarea>
+        </div>
+        <div class="field">
+          <label>单条结果接收邮箱（可选）</label>
+          <input class="ctrl" id="customEmail" type="email" placeholder="留空则发至默认邮箱">
+        </div>
+        <div class="field">
+          <label>单条邮件样式</label>
+          <select class="ctrl" id="singleEmailStyle">
+            <option value="editorial">编辑部日报（深色报头 · 默认）</option>
+            <option value="minimal">极简纸刊（纯白 Notion 风）</option>
+            <option value="bilibili">B站元气粉（樱花粉渐变）</option>
+            <option value="compact">极速速览（高密度紧凑）</option>
+          </select>
+        </div>
       </div>
-      <div class="field hidden" id="customTplWrap">
-        <label>自定义模板（含 {content} 占位符）</label>
-        <textarea class="ctrl" id="customTpl" placeholder="请根据以下视频内容提取核心干货：\n{content}"></textarea>
-      </div>
-      <div class="field">
-        <label>单条结果接收邮箱（可选）</label>
-        <input class="ctrl" id="customEmail" type="email" placeholder="留空则发至默认邮箱">
-      </div>
-      <div class="field">
-        <label>单条邮件样式</label>
-        <select class="ctrl" id="singleEmailStyle">
-          <option value="editorial">编辑部日报（深色报头 · 默认）</option>
-          <option value="minimal">极简纸刊（纯白 Notion 风）</option>
-          <option value="bilibili">B站元气粉（樱花粉渐变）</option>
-          <option value="compact">极速速览（高密度紧凑）</option>
-        </select>
+
+      <div class="sb-toast" id="sbToast"></div>
+
+      <div class="history-wrap">
+        <div class="search-box">
+          <span class="s-ic">
+            <svg class="ic" viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4.3-4.3"/></svg>
+          </span>
+          <input class="ctrl" id="searchInput" type="text" placeholder="搜索历史记录..." oninput="renderList()">
+        </div>
+        <div class="history-head">
+          <h3>历史记录 <span class="count-pill" id="countPill">0</span></h3>
+          <button class="text-btn" id="batchToggleBtn" onclick="toggleBatchMode()">管理</button>
+        </div>
+        <div class="batch-bar hidden" id="batchBar">
+          <button class="text-btn" onclick="selectAllJobs()">全选</button>
+          <button class="text-btn" onclick="invertSelectJobs()">反选</button>
+          <button class="text-btn danger" style="margin-left:auto" onclick="deleteSelectedJobs()">删除已选</button>
+        </div>
+        <div class="history-list" id="historyList"></div>
       </div>
     </div>
 
-    <div class="sb-toast" id="sbToast"></div>
-
-    <div class="history-wrap">
+    <!-- SIDEBAR PANE B: MONITORED UP CREATORS -->
+    <div class="side-pane hidden" id="sidebarMonitor">
       <div class="search-box">
         <span class="s-ic">
           <svg class="ic" viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4.3-4.3"/></svg>
         </span>
-        <input class="ctrl" id="searchInput" type="text" placeholder="搜索历史记录..." oninput="renderList()">
+        <input class="ctrl" id="upSearchInput" type="text" placeholder="搜索已监控 UP 主（昵称或 UID）..." oninput="renderUpSidebar()">
       </div>
+
+      <!-- Quick Add Monitor Control between Search Box and UP List -->
+      <div class="quick-add-box">
+        <span class="quick-add-label">添加监控 UP 主</span>
+        <div class="quick-add-row">
+          <input class="ctrl" id="sideAddUpInput" type="text" placeholder="输入 UID 或主页链接..." onkeydown="if(event.key==='Enter')quickAddMonitorUp()">
+          <button class="btn btn-primary" type="button" id="sideAddUpBtn" onclick="quickAddMonitorUp()">添加</button>
+        </div>
+        <div class="sb-toast" id="sideUpToast" style="margin-top:8px"></div>
+      </div>
+
       <div class="history-head">
-        <h3>历史记录 <span class="count-pill" id="countPill">0</span></h3>
-        <button class="text-btn" id="batchToggleBtn" onclick="toggleBatchMode()">管理</button>
+        <h3>已监控 UP 主 <span class="count-pill" id="upSideCount">0</span></h3>
+        <button class="text-btn" onclick="openMonitorModal()">完整配置</button>
       </div>
-      <div class="batch-bar hidden" id="batchBar">
-        <button class="text-btn" onclick="selectAllJobs()">全选</button>
-        <button class="text-btn" onclick="invertSelectJobs()">反选</button>
-        <button class="text-btn danger" style="margin-left:auto" onclick="deleteSelectedJobs()">删除已选</button>
-      </div>
-      <div class="history-list" id="historyList"></div>
+      <div class="history-list" id="upSideList"></div>
     </div>
   </aside>
 
@@ -1256,12 +1370,9 @@ textarea.ctrl{height:auto;min-height:78px;padding:9px 12px;resize:vertical;line-
   <!-- RIGHT MAIN PANEL -->
   <main class="main">
     <header class="topbar">
-      <div id="topNavLeft">
-        <div class="nav-guest-label" id="guestNavLabel">视频分析工作台</div>
-        <div class="nav-tabs hidden" id="authedNavTabs">
-          <button class="nav-tab active" data-page="workspace" onclick="switchPage('workspace')">单条摘要</button>
-          <button class="nav-tab" data-page="monitor" onclick="switchPage('monitor')">UP 主监控</button>
-        </div>
+      <div style="min-width:0;display:flex;align-items:baseline">
+        <span class="topbar-title" id="topbarTitle">单条视频摘要</span>
+        <span class="topbar-sub" id="topbarSub"></span>
       </div>
 
       <div class="topbar-actions">
@@ -1274,7 +1385,7 @@ textarea.ctrl{height:auto;min-height:78px;padding:9px 12px;resize:vertical;line-
     </header>
 
     <div class="content-scroll">
-      <div class="content-inner">
+      <div class="content-inner" id="contentInner">
         <!-- PAGE 1: SINGLE VIDEO WORKSPACE -->
         <div id="pageWorkspace">
           <div class="stepper hidden" id="stepperBar"></div>
@@ -1284,7 +1395,7 @@ textarea.ctrl{height:auto;min-height:78px;padding:9px 12px;resize:vertical;line-
               <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="5 3 19 12 5 21 5 3"/></svg>
             </div>
             <h2>粘贴 B 站链接，一键提炼视频精华</h2>
-            <p>支持 B 站完整链接、分享文案或 BV / av 号。系统自动提取音频、免费语音转文字并生成结构化摘要；登录后可进入「UP 主监控」浏览订阅动态并配置日报样式。</p>
+            <p>支持 B 站完整链接、分享文案或 BV / av 号。系统自动提取音频、免费语音转文字并生成结构化摘要；切换左侧「UP主监控」可浏览全部订阅 UP 主的封面动态流。</p>
           </div>
 
           <div id="detailView" class="hidden">
@@ -1333,30 +1444,46 @@ textarea.ctrl{height:auto;min-height:78px;padding:9px 12px;resize:vertical;line-
           </div>
         </div>
 
-        <!-- PAGE 2: MONITORED UP CREATORS FEED (LOGGED-IN SECONDARY PAGE) -->
+        <!-- PAGE 2: MONITORED UP CREATORS VIDEO COVER GRID -->
         <div id="pageMonitor" class="hidden">
-          <div class="mon-header">
-            <div class="mon-header-info">
-              <h2>UP 主监控动态</h2>
+          <div class="mon-toolbar">
+            <div class="mon-tb-left">
+              <h2 id="monFeedHeading">全部监控 UP 主动态</h2>
               <p id="monSummaryLine">正在加载监控配置...</p>
             </div>
-            <div style="display:flex;gap:8px;flex-wrap:wrap">
-              <button class="btn" onclick="openMonitorModal()">监控与日报设置</button>
-              <button class="btn btn-primary" id="feedRunBtn" onclick="triggerMonitorNow('feedToast')">立即巡检</button>
+            <div class="mon-tb-actions">
+              <button class="btn" onclick="fetchUpFeed(selectedUpMid)">刷新动态</button>
+              <button class="btn" onclick="openMonitorModal()">定时与样式设置</button>
+              <button class="btn btn-primary" onclick="triggerMonitorNow('feedToast')">立即巡检</button>
             </div>
           </div>
           <div class="sb-toast" id="feedToast" style="margin-bottom:14px"></div>
 
-          <div class="mon-grid">
-            <div class="up-nav-card" id="upFeedSidebar"></div>
-            <div class="feed-list" id="upFeedList">
-              <div class="reader-card" style="text-align:center;color:var(--muted)">请选择左侧 UP 主查看最新视频与 AI 摘要</div>
-            </div>
-          </div>
+          <div class="video-grid" id="upFeedGrid"></div>
         </div>
       </div>
     </div>
   </main>
+</div>
+
+<!-- INLINE SUMMARY READER MODAL (FOR VIDEO COVER CARDS) -->
+<div class="modal-backdrop hidden" id="summaryModal" onclick="if(event.target===this)closeModal('summaryModal')">
+  <div class="modal reader">
+    <div class="modal-head">
+      <h2 id="smTitle">视频 AI 摘要</h2>
+      <button class="icon-btn" onclick="closeModal('summaryModal')" aria-label="关闭">
+        <svg class="ic" viewBox="0 0 24 24"><path d="M18 6L6 18M6 6l12 12"/></svg>
+      </button>
+    </div>
+    <div class="modal-body" id="smBody"></div>
+    <div class="modal-foot">
+      <a class="btn" id="smWatchLink" href="#" target="_blank" rel="noopener">在B站观看 ↗</a>
+      <div style="display:flex;gap:8px">
+        <button class="btn" id="smCopyBtn" onclick="copyModalSummary()">复制摘要</button>
+        <button class="btn btn-primary" onclick="closeModal('summaryModal')">关闭</button>
+      </div>
+    </div>
+  </div>
 </div>
 
 <!-- LOGIN MODAL -->
@@ -1370,7 +1497,7 @@ textarea.ctrl{height:auto;min-height:78px;padding:9px 12px;resize:vertical;line-
     </div>
     <div class="modal-body">
       <p style="font-size:13px;color:var(--soft);margin-bottom:14px;line-height:1.65">
-        登录后可访问「UP 主监控」二级页面，并在线配置监控名单、Shy Cron 定时策略与日报邮件样式。
+        登录后可切换「UP主监控」浏览订阅封面动态流，并在线配置监控名单、Shy Cron 定时策略与日报邮件样式。
       </p>
       <div class="field" style="margin-bottom:12px">
         <label>账号</label>
@@ -1583,7 +1710,9 @@ const LS_USER = 'bilisum_auth_user';
 
 let currentPage = 'workspace';
 let selectedJobId = null;
-let selectedUpMid = null;
+let selectedUpMid = 'all';
+let currentFeedVideos = [];
+let modalSummaryRaw = '';
 let viewMode = 'summary';
 let batchMode = false;
 let selectedIds = [];
@@ -1631,6 +1760,31 @@ function showToast(elId, msg, kind) {
   if (kind === 'ok' || kind === 'info') setTimeout(() => { el.classList.remove('show'); }, 4500);
 }
 
+function fmtCount(n) {
+  const num = Number(n) || 0;
+  if (num >= 100000000) return (num / 100000000).toFixed(1).replace(/\.0$/, '') + ' 亿次';
+  if (num >= 10000) return (num / 10000).toFixed(1).replace(/\.0$/, '') + ' 万次';
+  return num + ' 次';
+}
+
+function fmtDanmaku(n) {
+  const num = Number(n) || 0;
+  if (num >= 10000) return (num / 10000).toFixed(1).replace(/\.0$/, '') + ' 万弹幕';
+  return num + ' 弹幕';
+}
+
+function fmtRelativeTime(unixSec) {
+  if (!unixSec) return '';
+  const diff = Math.max(0, Math.floor(Date.now() / 1000) - Number(unixSec));
+  if (diff < 3600) return Math.max(1, Math.floor(diff / 60)) + '分钟前';
+  if (diff < 86400) return Math.floor(diff / 3600) + '小时前';
+  const days = Math.floor(diff / 86400);
+  if (days < 7) return days + '天前';
+  if (days < 30) return Math.floor(days / 7) + '个星期前';
+  if (days < 365) return Math.floor(days / 30) + '个月前';
+  return Math.floor(days / 365) + '年前';
+}
+
 // ── Theme ──
 function initTheme() {
   const saved = localStorage.getItem(LS_THEME) || 'light';
@@ -1652,7 +1806,7 @@ function toggleTheme() {
   div.addEventListener('mousedown', () => { dragging = true; div.classList.add('dragging'); document.body.style.userSelect = 'none'; });
   window.addEventListener('mousemove', (e) => {
     if (!dragging) return;
-    const w = Math.max(260, Math.min(500, e.clientX));
+    const w = Math.max(260, Math.min(480, e.clientX));
     document.getElementById('appRoot').style.setProperty('--sidebar-w', w + 'px');
   });
   window.addEventListener('mouseup', () => {
@@ -1673,17 +1827,26 @@ function onTplPreset() {
   document.getElementById('customTplWrap').classList.toggle('hidden', v !== 'custom');
 }
 
-// ── Page Switcher (Workspace vs UP Monitor Secondary Page) ──
+// ── Top-Left Sidebar Switcher (Single Video vs UP Monitor) ──
 async function switchPage(page) {
   if (page === 'monitor' && !authUser) {
     openModal('loginModal');
+    setTimeout(() => document.getElementById('loginPass').focus(), 60);
     return;
   }
   currentPage = page;
-  document.querySelectorAll('#authedNavTabs .nav-tab').forEach(b => b.classList.toggle('active', b.dataset.page === page));
+  document.querySelectorAll('#sideSwitcher .side-sw-btn').forEach(b => b.classList.toggle('active', b.dataset.page === page));
+  document.getElementById('sidebarWorkspace').classList.toggle('hidden', page !== 'workspace');
+  document.getElementById('sidebarMonitor').classList.toggle('hidden', page !== 'monitor');
   document.getElementById('pageWorkspace').classList.toggle('hidden', page !== 'workspace');
   document.getElementById('pageMonitor').classList.toggle('hidden', page !== 'monitor');
-  if (page === 'monitor') {
+  document.getElementById('contentInner').classList.toggle('wide-feed', page === 'monitor');
+
+  if (page === 'workspace') {
+    document.getElementById('topbarTitle').textContent = '单条视频摘要';
+    document.getElementById('topbarSub').textContent = '';
+  } else {
+    document.getElementById('topbarTitle').textContent = 'UP主监控动态';
     await loadMonitorPage();
   }
 }
@@ -1771,7 +1934,7 @@ async function submitVideo(overrideUrl) {
     saveJobs(jobs);
     if (overrideUrl === undefined) input.value = '';
     showToast('sbToast', '已提交处理队列，约 30~60 秒完成', 'ok');
-    if (currentPage !== 'workspace') switchPage('workspace');
+    if (currentPage !== 'workspace') await switchPage('workspace');
     selectJob(newJob.id);
     startPolling(newJob.id);
   } catch (e) {
@@ -1816,12 +1979,6 @@ function fmtShortDate(iso) {
   if (isNaN(d.getTime())) return '';
   const p = n => String(n).padStart(2, '0');
   return d.getFullYear() + '/' + p(d.getMonth()+1) + '/' + p(d.getDate()) + ' ' + p(d.getHours()) + ':' + p(d.getMinutes());
-}
-function fmtUnix(ts) {
-  if (!ts) return '';
-  const d = new Date(ts * 1000);
-  const p = n => String(n).padStart(2, '0');
-  return d.getFullYear() + '-' + p(d.getMonth()+1) + '-' + p(d.getDate()) + ' ' + p(d.getHours()) + ':' + p(d.getMinutes());
 }
 
 function renderList() {
@@ -1943,9 +2100,7 @@ function detectSectionKind(line) {
 }
 
 function renderRichSummary(md) {
-  if (!md || !md.trim()) {
-    return '<div class="pending-banner">暂无 AI 总结内容</div>';
-  }
+  if (!md || !md.trim()) return '<div class="pending-banner">暂无 AI 总结内容</div>';
   const lines = md.replace(/\r\n/g, '\n').split('\n');
   const sections = [];
   let cur = { kind: 'body', lines: [] };
@@ -2015,7 +2170,6 @@ function renderFailureDiagnostics(job) {
   let errText = job.error || '';
   let hint = job.error_hint || '';
 
-  // Smart fallback inference for legacy historical failed records that didn't store error_stage
   if (!stage) {
     const bvid = String(job.bvid || '');
     const totalSec = job.timings && job.timings.total ? Number(job.timings.total) : null;
@@ -2030,7 +2184,7 @@ function renderFailureDiagnostics(job) {
     } else {
       stage = 'stt';
       errText = errText || '语音识别阶段未能返回有效文本内容';
-      hint = hint || '常见原因：硅基流动语音识别接口临时波动 (500/超时)、音频无有效人声或文件过大。可点击下方按钮重新处理，或在 GitHub Secrets 配置免费的 GROQ_API_KEY 作为高精度免费通道。';
+      hint = hint || '常见原因：硅基流动语音识别接口临时波动 (500/超时)、音频无有效人声或文件过大。可点击下方按钮重新处理，或在 GitHub Secrets 配置免费的 GROQ_API_KEY。';
     }
   }
 
@@ -2109,9 +2263,7 @@ function renderDetail(job) {
     document.getElementById('transcriptContent').textContent = job.transcript || '无转录内容';
   } else {
     let notice = '';
-    if (job.error_hint) {
-      notice = '<div class="sb-toast show info" style="margin:0 0 14px 0">' + esc(job.error_hint) + '</div>';
-    }
+    if (job.error_hint) notice = '<div class="sb-toast show info" style="margin:0 0 14px 0">' + esc(job.error_hint) + '</div>';
     document.getElementById('summaryContent').innerHTML = notice + renderRichSummary(job.summary || '');
     document.getElementById('transcriptContent').textContent = job.transcript || '（该任务无语音转录文本）';
   }
@@ -2160,7 +2312,7 @@ function exportFile(ext) {
   URL.revokeObjectURL(a.href);
 }
 
-// ── Auth & Secondary Navigation ──
+// ── Auth ──
 function openModal(id) { document.getElementById(id).classList.remove('hidden'); }
 function closeModal(id) { document.getElementById(id).classList.add('hidden'); }
 function getAuthToken() { return localStorage.getItem(LS_AUTH) || ''; }
@@ -2181,8 +2333,6 @@ function updateAuthUi(user) {
   const btn = document.getElementById('monitorBtn');
   const ic = document.getElementById('monitorBtnIcon');
   const tx = document.getElementById('monitorBtnText');
-  document.getElementById('guestNavLabel').classList.toggle('hidden', Boolean(authUser));
-  document.getElementById('authedNavTabs').classList.toggle('hidden', !authUser);
 
   if (authUser) {
     btn.classList.add('authed');
@@ -2244,9 +2394,15 @@ function doLogout() {
   showToast('sbToast', '已退出管理员登录', 'info');
 }
 
-// ── Secondary Page: Monitored UP Creators & Video Feed ──
+// ── UP Monitor Sidebar + Video Cover Grid ──
 async function loadMonitorPage() {
   await loadMonitorConfig();
+  updateMonitorHeaderSummary();
+  renderUpSidebar();
+  await fetchUpFeed(selectedUpMid || 'all');
+}
+
+function updateMonitorHeaderSummary() {
   const ups = monitorConfig.up_list || [];
   const styleNames = { editorial: '编辑部日报', minimal: '极简纸刊', bilibili: 'B站元气粉', compact: '极速速览' };
   const statusStr = monitorConfig.enabled !== false ? '定时监控运行中' : '定时监控已暂停';
@@ -2255,89 +2411,201 @@ async function loadMonitorPage() {
     : ('UTC Cron ' + (monitorConfig.cron_utc || ''));
   document.getElementById('monSummaryLine').textContent =
     statusStr + ' · ' + timeStr + ' · 共监控 ' + ups.length + ' 位 UP 主 · 样式：' + (styleNames[monitorConfig.email_style] || '编辑部日报');
+}
 
-  const side = document.getElementById('upFeedSidebar');
-  if (!ups.length) {
-    side.innerHTML = '<div style="padding:14px;font-size:12.5px;color:var(--muted)">暂未添加 UP 主，请点击右上角「监控与日报设置」添加</div>';
-    document.getElementById('upFeedList').innerHTML = '';
-    return;
-  }
+function renderUpSidebar() {
+  const kw = (document.getElementById('upSearchInput').value || '').trim().toLowerCase();
+  const ups = monitorConfig.up_list || [];
+  document.getElementById('upSideCount').textContent = String(ups.length);
 
-  if (!selectedUpMid || !ups.some(u => Number(u.mid) === Number(selectedUpMid))) {
-    selectedUpMid = ups[0].mid;
-  }
+  const filtered = kw ? ups.filter(u =>
+    String(u.name || '').toLowerCase().includes(kw) || String(u.mid || '').includes(kw)
+  ) : ups;
 
-  side.innerHTML = ups.map(u =>
-    '<button class="up-nav-item' + (Number(u.mid) === Number(selectedUpMid) ? ' active' : '') + '" onclick="selectMonitorUp(' + Number(u.mid) + ')">' +
-      '<div style="min-width:0">' +
-        '<div class="up-nav-name">' + esc(u.name || u.mid) + '</div>' +
-        '<div class="up-nav-uid">UID ' + esc(u.mid) + '</div>' +
+  const listEl = document.getElementById('upSideList');
+  let html = '';
+
+  if (!kw) {
+    html += '<div class="up-side-card' + (selectedUpMid === 'all' ? ' active' : '') + '" onclick="selectMonitorUp(\'all\')">' +
+      '<div class="up-ava-fb">全</div>' +
+      '<div class="up-side-info">' +
+        '<div class="up-side-name">全部监控 UP 主</div>' +
+        '<div class="up-side-uid">聚合最新动态 · ' + ups.length + ' 位</div>' +
       '</div>' +
-    '</button>'
-  ).join('');
+    '</div>';
+  }
 
-  await fetchUpFeed(selectedUpMid);
+  if (!filtered.length) {
+    html += '<div style="text-align:center;padding:24px 12px;color:var(--muted);font-size:12.5px">暂无匹配的 UP 主</div>';
+  } else {
+    html += filtered.map(u => {
+      const active = String(selectedUpMid) === String(u.mid) ? ' active' : '';
+      const faceUrl = u.face ? (u.face.replace(/^http:\/\//, 'https://') + '@96w_96h_1c.webp') : '';
+      const ava = faceUrl
+        ? '<img class="up-ava" src="' + esc(faceUrl) + '" referrerpolicy="no-referrer" alt="">'
+        : '<div class="up-ava-fb">' + esc((u.name || String(u.mid)).slice(0, 1)) + '</div>';
+      return '<div class="up-side-card' + active + '" onclick="selectMonitorUp(' + Number(u.mid) + ')">' +
+        ava +
+        '<div class="up-side-info">' +
+          '<div class="up-side-name">' + esc(u.name || u.mid) + '</div>' +
+          '<div class="up-side-uid">UID ' + esc(u.mid) + '</div>' +
+        '</div>' +
+        '<button class="h-del" title="取消监控" onclick="event.stopPropagation();quickRemoveMonitorUp(' + Number(u.mid) + ')">' + SVG_CLOSE_SM + '</button>' +
+      '</div>';
+    }).join('');
+  }
+  listEl.innerHTML = html;
 }
 
 async function selectMonitorUp(mid) {
   selectedUpMid = mid;
-  document.querySelectorAll('#upFeedSidebar .up-nav-item').forEach(btn => {
-    btn.classList.toggle('active', btn.getAttribute('onclick') === 'selectMonitorUp(' + Number(mid) + ')');
-  });
+  renderUpSidebar();
+  const ups = monitorConfig.up_list || [];
+  if (mid === 'all') {
+    document.getElementById('monFeedHeading').textContent = '全部监控 UP 主动态';
+    document.getElementById('topbarSub').textContent = '全部 UP 主';
+  } else {
+    const found = ups.find(u => Number(u.mid) === Number(mid));
+    const label = found ? found.name : ('UID ' + mid);
+    document.getElementById('monFeedHeading').textContent = label + ' · 最新视频';
+    document.getElementById('topbarSub').textContent = label + ' (' + mid + ')';
+  }
   await fetchUpFeed(mid);
 }
 
-async function fetchUpFeed(mid) {
-  const listEl = document.getElementById('upFeedList');
-  listEl.innerHTML = '<div class="reader-card" style="text-align:center;color:var(--muted);padding:32px">正在拉取该 UP 主最新视频列表...</div>';
+async function quickAddMonitorUp() {
+  const inp = document.getElementById('sideAddUpInput');
+  const q = inp.value.trim();
+  if (!q) return;
+  const btn = document.getElementById('sideAddUpBtn');
+  btn.disabled = true;
+  btn.textContent = '添加中...';
   try {
-    const r = await fetch('/api/up-videos?mid=' + encodeURIComponent(mid) + '&ps=15', {
+    const r = await fetch('/api/up-lookup?q=' + encodeURIComponent(q), {
+      headers: { 'Authorization': 'Bearer ' + getAuthToken() },
+    });
+    const d = await r.json();
+    if (!r.ok) { showToast('sideUpToast', d.error || '解析失败', 'err'); return; }
+    if (!monitorConfig.up_list) monitorConfig.up_list = [];
+    const exists = monitorConfig.up_list.some(x => Number(x.mid) === Number(d.mid));
+    if (!exists) {
+      monitorConfig.up_list.push({ mid: Number(d.mid), name: d.name || String(d.mid), face: d.face || '' });
+      const sr = await fetch('/api/monitor-config', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + getAuthToken() },
+        body: JSON.stringify(monitorConfig),
+      });
+      const sd = await sr.json();
+      if (sr.ok && sd.config) monitorConfig = sd.config;
+    }
+    inp.value = '';
+    updateMonitorHeaderSummary();
+    renderUpSidebar();
+    showToast('sideUpToast', '已添加监控：' + (d.name || d.mid), 'ok');
+    await selectMonitorUp(Number(d.mid));
+  } catch (e) {
+    showToast('sideUpToast', '添加异常：' + e.message, 'err');
+  } finally {
+    btn.disabled = false;
+    btn.textContent = '添加';
+  }
+}
+
+async function quickRemoveMonitorUp(mid) {
+  const found = (monitorConfig.up_list || []).find(u => Number(u.mid) === Number(mid));
+  if (!confirm('确定取消监控「' + (found ? found.name : mid) + '」？')) return;
+  monitorConfig.up_list = (monitorConfig.up_list || []).filter(u => Number(u.mid) !== Number(mid));
+  try {
+    const sr = await fetch('/api/monitor-config', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + getAuthToken() },
+      body: JSON.stringify(monitorConfig),
+    });
+    const sd = await sr.json();
+    if (sr.ok && sd.config) monitorConfig = sd.config;
+    if (String(selectedUpMid) === String(mid)) selectedUpMid = 'all';
+    updateMonitorHeaderSummary();
+    renderUpSidebar();
+    await selectMonitorUp(selectedUpMid);
+  } catch (e) {
+    showToast('sideUpToast', '移除失败：' + e.message, 'err');
+  }
+}
+
+async function fetchUpFeed(mid) {
+  const grid = document.getElementById('upFeedGrid');
+  grid.innerHTML = '<div class="reader-card" style="grid-column:1/-1;text-align:center;color:var(--muted);padding:36px">正在加载视频封面与最新动态...</div>';
+  try {
+    const r = await fetch('/api/up-videos?mid=' + encodeURIComponent(mid || 'all') + '&ps=16', {
       headers: { 'Authorization': 'Bearer ' + getAuthToken() },
     });
     const d = await r.json();
     if (!r.ok) {
-      listEl.innerHTML = '<div class="reader-card" style="color:var(--err-text)">拉取失败：' + esc(d.error || ('HTTP ' + r.status)) + '</div>';
+      grid.innerHTML = '<div class="reader-card" style="grid-column:1/-1;color:var(--err-text)">拉取失败：' + esc(d.error || ('HTTP ' + r.status)) + '</div>';
       return;
     }
     const vids = d.videos || [];
+    currentFeedVideos = vids;
     if (!vids.length) {
-      listEl.innerHTML = '<div class="reader-card" style="text-align:center;color:var(--muted)">暂未获取到公开视频</div>';
+      grid.innerHTML = '<div class="reader-card" style="grid-column:1/-1;text-align:center;color:var(--muted);padding:36px">暂未获取到公开视频</div>';
       return;
     }
-    listEl.innerHTML = vids.map((v, idx) => {
+
+    grid.innerHTML = vids.map((v, idx) => {
+      const coverUrl = v.pic ? (v.pic.replace(/^http:\/\//, 'https://') + '@672w_378h_1c.webp') : '';
+      const faceUrl = v.face ? (v.face.replace(/^http:\/\//, 'https://') + '@96w_96h_1c.webp') : '';
       const hasSum = Boolean(v.summary);
-      const sumBlock = hasSum
-        ? '<div class="feed-summary-wrap hidden" id="feed-sum-' + idx + '">' + renderRichSummary(v.summary) + '</div>'
-        : '';
-      return '<div class="feed-card">' +
-        '<div class="feed-top">' +
-          '<a class="feed-title" href="' + esc(v.url) + '" target="_blank" rel="noopener">' + esc(v.title) + '</a>' +
-          (hasSum ? '<span class="st-badge ok">已有日报摘要</span>' : '') +
+      const statsStr = [fmtCount(v.play), fmtDanmaku(v.danmaku)].join(' · ');
+      const relTime = fmtRelativeTime(v.created);
+
+      const avaHtml = faceUrl
+        ? '<img class="v-ava" src="' + esc(faceUrl) + '" referrerpolicy="no-referrer" alt="">'
+        : '<div class="v-ava-fb">' + esc((v.author || 'UP').slice(0, 1)) + '</div>';
+
+      return '<article class="v-card">' +
+        '<a class="v-thumb-link" href="' + esc(v.url) + '" target="_blank" rel="noopener">' +
+          (coverUrl ? '<img src="' + esc(coverUrl) + '" referrerpolicy="no-referrer" loading="lazy" alt="">' : '') +
+          (hasSum ? '<span class="v-sum-badge">已有摘要</span>' : '') +
+          (v.duration ? '<span class="v-dur">' + esc(v.duration) + '</span>' : '') +
+        '</a>' +
+        '<div class="v-body">' +
+          avaHtml +
+          '<div class="v-meta-col">' +
+            '<a class="v-title" href="' + esc(v.url) + '" target="_blank" rel="noopener" title="' + esc(v.title) + '">' + esc(v.title) + '</a>' +
+            '<div class="v-author">' + esc(v.author || '') + '</div>' +
+            '<div class="v-stats">' + esc(statsStr) + '</div>' +
+            '<div class="v-foot">' +
+              (relTime ? '<span class="v-time-pill">' + esc(relTime) + '</span>' : '<span></span>') +
+              '<div class="v-act-row">' +
+                (hasSum ? '<button class="v-act-btn" onclick="openFeedSummaryModal(' + idx + ')">查看摘要</button>' : '') +
+                '<button class="v-act-btn primary" onclick="submitVideo(\'' + esc(v.bvid) + '\')">' + (hasSum ? '重算' : '一键总结') + '</button>' +
+              '</div>' +
+            '</div>' +
+          '</div>' +
         '</div>' +
-        '<div class="feed-meta">' +
-          (v.duration ? '<span>时长 ' + esc(v.duration) + '</span>' : '') +
-          (v.created ? '<span>发布于 ' + esc(fmtUnix(v.created)) + '</span>' : '') +
-          (v.play ? '<span>播放 ' + esc(v.play) + '</span>' : '') +
-          '<span style="font-family:Consolas,monospace">' + esc(v.bvid) + '</span>' +
-        '</div>' +
-        '<div class="feed-actions">' +
-          '<a class="btn btn-sm" href="' + esc(v.url) + '" target="_blank" rel="noopener">打开原视频 ↗</a>' +
-          (hasSum ? '<button class="btn btn-sm" onclick="toggleFeedSummary(' + idx + ', this)">展开摘要</button>' : '') +
-          '<button class="btn btn-sm btn-primary" onclick="submitVideo(\'' + esc(v.bvid) + '\')">' + (hasSum ? '重新生成总结' : '一键总结') + '</button>' +
-        '</div>' +
-        sumBlock +
-      '</div>';
+      '</article>';
     }).join('');
   } catch (e) {
-    listEl.innerHTML = '<div class="reader-card" style="color:var(--err-text)">网络异常：' + esc(e.message) + '</div>';
+    grid.innerHTML = '<div class="reader-card" style="grid-column:1/-1;color:var(--err-text)">网络异常：' + esc(e.message) + '</div>';
   }
 }
 
-function toggleFeedSummary(idx, btn) {
-  const el = document.getElementById('feed-sum-' + idx);
-  if (!el) return;
-  const hidden = el.classList.toggle('hidden');
-  btn.textContent = hidden ? '展开摘要' : '收起摘要';
+function openFeedSummaryModal(idx) {
+  const v = currentFeedVideos[idx];
+  if (!v) return;
+  modalSummaryRaw = v.summary || '';
+  document.getElementById('smTitle').textContent = v.title || v.bvid;
+  document.getElementById('smWatchLink').href = v.url || ('https://www.bilibili.com/video/' + v.bvid);
+  document.getElementById('smBody').innerHTML = renderRichSummary(modalSummaryRaw);
+  openModal('summaryModal');
+}
+
+function copyModalSummary() {
+  navigator.clipboard.writeText(modalSummaryRaw || '').then(() => {
+    const b = document.getElementById('smCopyBtn');
+    b.textContent = '已复制';
+    setTimeout(() => { b.textContent = '复制摘要'; }, 1500);
+  }).catch(() => {});
 }
 
 // ── Monitor Settings Modal Logic ──
@@ -2461,7 +2729,7 @@ async function addUpCreator() {
     if (!r.ok) { showToast('monitorToast', d.error || '解析失败', 'err'); return; }
     if (!monitorConfig.up_list) monitorConfig.up_list = [];
     if (!monitorConfig.up_list.some(x => Number(x.mid) === Number(d.mid))) {
-      monitorConfig.up_list.push({ mid: Number(d.mid), name: d.name || String(d.mid) });
+      monitorConfig.up_list.push({ mid: Number(d.mid), name: d.name || String(d.mid), face: d.face || '' });
     }
     inp.value = '';
     renderUpChips();
@@ -2479,7 +2747,7 @@ function removeUp(idx) {
   renderUpChips();
 }
 
-// ── Email Style Live Preview (All Titles Clickable to Bilibili!) ──
+// ── Email Style Live Preview ──
 const PREVIEW_THEMES = {
   editorial: {
     name:'编辑部日报', pageBg:'#f3f4f6', bodyBg:'#f8fafc', hdBg:'#111827', hdTop:'4px solid #fb7299',
@@ -2578,7 +2846,10 @@ async function saveMonitorConfig() {
     if (!r.ok) { showToast('monitorToast', d.error || '保存失败', 'err'); return; }
     monitorConfig = d.config;
     hydrateMonitorForm();
-    if (currentPage === 'monitor') loadMonitorPage();
+    if (currentPage === 'monitor') {
+      updateMonitorHeaderSummary();
+      renderUpSidebar();
+    }
     if (d.cron_sync && d.cron_sync.ok) {
       showToast('monitorToast', '配置已保存并成功同步至 Shy Cron（' + d.cron_sync.cron_utc + '）', 'ok');
     } else {
