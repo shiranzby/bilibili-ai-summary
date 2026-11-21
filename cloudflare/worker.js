@@ -1273,23 +1273,74 @@ async function handleDeleteJob(request, env, jobId) {
   return jsonResponse({ deleted: true, job_id: jobId });
 }
 
+async function handleBiliCover(request, env, ctx) {
+  const bvid = (new URL(request.url).searchParams.get('bvid') || '').trim();
+  const bvMatch = bvid.match(/BV[a-zA-Z0-9]{8,12}/);
+  if (!bvMatch) return errorResponse('无效的 BV 号', 400);
+  const cleanBvid = bvMatch[0];
+
+  const cache = typeof caches !== 'undefined' ? caches.default : null;
+  const reqUrl = new URL(request.url);
+  const cacheKeyUrl = new URL(reqUrl.origin + '/__cache/bili-cover-v1?bvid=' + encodeURIComponent(cleanBvid));
+  const cacheReq = new Request(cacheKeyUrl.toString(), { method: 'GET' });
+  if (cache) {
+    const hit = await cache.match(cacheReq);
+    if (hit) return new Response(hit.body, hit);
+  }
+
+  const proxyBase = (env.BILI_PROXY_URL || BILI_PROXY_DEF).replace(/\/+$/, '');
+  try {
+    const ir = await fetch(`${proxyBase}/api/bili-info?bvid=${encodeURIComponent(cleanBvid)}`, { signal: AbortSignal.timeout(6000) });
+    if (ir.ok) {
+      const idata = await ir.json();
+      const info = idata?.info;
+      if (info && info.pic) {
+        const pic = String(info.pic).replace(/^http:\/\//, 'https://');
+        const payload = {
+          ok: true,
+          bvid: cleanBvid,
+          pic,
+          title: info.title || '',
+          owner: info.owner?.name || '',
+          duration: formatSecDuration(info.duration),
+        };
+        const resp = new Response(JSON.stringify(payload), {
+          status: 200,
+          headers: {
+            ...CORS_HEADERS,
+            'Content-Type': 'application/json; charset=utf-8',
+            'Cache-Control': 'public, max-age=86400',
+          },
+        });
+        if (cache && ctx) ctx.waitUntil(cache.put(cacheReq, resp.clone()));
+        return resp;
+      }
+    }
+  } catch {}
+  return jsonResponse({ ok: false, bvid: cleanBvid, pic: '' });
+}
+
 async function handleCallback(request, env) {
   if (!env.BILIBILI_BUCKET) return errorResponse('R2 未配置', 503);
   const body = await request.json();
-  const { job_id, bvid, status, summary, transcript, title, timings, owner, pubdate, duration, error, error_stage, error_hint } = body;
+  const { job_id, bvid, status, summary, transcript, title, timings, owner, pubdate, duration, pic, error, error_stage, error_hint } = body;
   if (!job_id || !bvid) return errorResponse('缺少 job_id 或 bvid', 400);
   const pending = await env.BILIBILI_BUCKET.get(`pending/${job_id}.json`);
   if (!pending) return errorResponse('任务不存在或已处理', 404);
+  let pendingData = {};
+  try { pendingData = await pending.json(); } catch {}
 
+  const resolvedPic = String(pic || pendingData.pic || '').trim().replace(/^http:\/\//, 'https://');
   const result = {
     id: job_id, bvid, status: status || 'completed',
     summary: summary || null,
     transcript: transcript || '',
-    title: title || '',
+    title: title || pendingData.title || '',
     timings: timings || {},
-    owner: owner || '',
+    owner: owner || pendingData.owner || '',
     pubdate: pubdate || null,
-    duration: duration || '',
+    duration: duration || pendingData.duration || '',
+    pic: resolvedPic,
     error: error || '',
     error_stage: error_stage || '',
     error_hint: error_hint || '',
@@ -1862,8 +1913,20 @@ select.c-select-native{position:absolute!important;opacity:0!important;pointer-e
 .st-badge.err{background:var(--err-soft);color:var(--err-text)}
 .st-badge.pending{background:var(--warn-soft);color:var(--warn-text)}
 
-.video-head{background:var(--surface);border:1px solid var(--border);border-radius:14px;padding:18px 22px;margin-bottom:14px;display:flex;align-items:flex-start;justify-content:space-between;gap:16px;box-shadow:var(--shadow-sm);flex-wrap:wrap}
-.vh-left{min-width:260px;flex:1}
+.video-head{background:var(--surface);border:1px solid var(--border);border-radius:14px;padding:18px 22px;margin-bottom:14px;display:flex;align-items:flex-start;justify-content:space-between;gap:18px;box-shadow:var(--shadow-sm);flex-wrap:wrap}
+.vh-cover{
+  position:relative;width:216px;aspect-ratio:16/9;border-radius:10px;overflow:hidden;
+  background:var(--surface-3);border:1px solid var(--border);flex-shrink:0;
+  display:block;text-decoration:none;box-shadow:var(--shadow-sm);
+}
+.vh-cover img{width:100%;height:100%;object-fit:cover;display:block;transition:transform .28s ease}
+.vh-cover:hover img{transform:scale(1.04)}
+.vh-cover-fb{
+  width:100%;height:100%;display:flex;align-items:center;justify-content:center;padding:12px;
+  text-align:center;font-size:12px;font-weight:700;color:var(--soft);
+  background:linear-gradient(135deg,var(--surface-3),var(--surface-2));
+}
+.vh-left{min-width:240px;flex:1}
 .vh-title{font-size:18.5px;font-weight:800;line-height:1.4;color:var(--text);margin-bottom:10px;word-break:break-word}
 .vh-title a{color:inherit;text-decoration:none}
 .vh-title a:hover{color:var(--brand-dark)}
@@ -1871,7 +1934,7 @@ select.c-select-native{position:absolute!important;opacity:0!important;pointer-e
 .meta-pill{display:inline-flex;align-items:center;gap:4px;padding:3px 10px;border-radius:999px;background:var(--surface-3);color:var(--soft);font-size:12px;font-weight:500;white-space:nowrap}
 .meta-pill.saved{background:var(--ok-soft);color:var(--ok-text);font-weight:600}
 .vh-actions{display:flex;align-items:center;gap:8px;flex-shrink:0;flex-wrap:wrap}
-.star-btn,.wl-btn{height:34px;padding:0 11px;border:1px solid var(--border);border-radius:9px;background:var(--surface);color:var(--soft);font-size:12.5px;font-weight:600;display:inline-flex;align-items:center;gap:5px;transition:all .15s;white-space:nowrap}
+.star-btn,.wl-btn{height:34px;padding:0 11px;border:1px solid var(--border);border-radius:9px;background:var(--surface);color:var(--soft);font-size:12.5px;font-weight:600;display:inline-flex;align-items:center;gap:5px;transition:all .15s;white-space:nowrap;user-select:none}
 .star-btn:hover,.wl-btn:hover{border-color:var(--border-strong);color:var(--text)}
 .star-btn.starred{border-color:#FCD34D;background:var(--warn-soft);color:var(--warn-text)}
 .wl-btn.active{border-color:var(--blue-border);background:var(--blue-soft);color:var(--blue)}
@@ -1991,16 +2054,51 @@ select.c-select-native{position:absolute!important;opacity:0!important;pointer-e
 .v-thumb-link img{width:100%;height:100%;object-fit:cover;display:block;transition:transform .28s ease}
 .v-card:hover .v-thumb-link img{transform:scale(1.035)}
 .v-thumb-fallback{width:100%;height:100%;display:flex;align-items:center;justify-content:center;padding:16px;text-align:center;font-size:13px;font-weight:700;color:var(--soft);background:linear-gradient(135deg,var(--surface-3),var(--surface-2))}
-.v-dur{position:absolute;right:8px;bottom:8px;background:rgba(15,17,22,.82);color:#fff;font-size:11.5px;font-weight:600;padding:2px 6px;border-radius:5px;line-height:1.3;font-variant-numeric:tabular-nums}
-.v-sum-badge{position:absolute;left:8px;top:8px;background:rgba(16,185,129,.92);color:#fff;font-size:11px;font-weight:600;padding:2px 8px;border-radius:999px}
-.v-chk-wrap{position:absolute;left:8px;bottom:8px;z-index:4;background:rgba(15,17,22,.72);backdrop-filter:blur(4px);border-radius:6px;padding:3px 6px;display:flex;align-items:center;gap:5px;color:#fff;font-size:11px;font-weight:600}
+.v-dur{
+  position:absolute;right:8px;bottom:8px;
+  background:rgba(15,17,22,.46);backdrop-filter:blur(6px);-webkit-backdrop-filter:blur(6px);
+  border:1px solid rgba(255,255,255,.22);color:#fff;
+  font-size:11.5px;font-weight:600;padding:2px 7px;border-radius:6px;line-height:1.3;font-variant-numeric:tabular-nums;
+}
+.v-sum-badge{
+  position:absolute;left:8px;top:8px;
+  background:rgba(15,17,22,.48);backdrop-filter:blur(6px);-webkit-backdrop-filter:blur(6px);
+  border:1px solid rgba(110,231,183,.42);color:#A7F3D0;
+  font-size:11px;font-weight:600;padding:2px 8px;border-radius:999px;line-height:1.35;
+}
+.v-chk-wrap{
+  position:absolute;left:8px;bottom:8px;z-index:4;
+  background:rgba(15,17,22,.46);backdrop-filter:blur(6px);-webkit-backdrop-filter:blur(6px);
+  border:1px solid rgba(255,255,255,.22);border-radius:6px;padding:3px 7px;
+  display:flex;align-items:center;gap:5px;color:#fff;font-size:11px;font-weight:600;
+}
 .v-chk-wrap input{accent-color:var(--brand);width:14px;height:14px;cursor:pointer}
 .v-quick-acts{position:absolute;top:8px;right:8px;display:flex;gap:5px;z-index:3;opacity:0;transition:opacity .16s ease}
 .v-card:hover .v-quick-acts,.v-quick-acts.has-active{opacity:1}
-.v-qbtn{width:28px;height:28px;border-radius:8px;border:1px solid rgba(255,255,255,.22);background:rgba(15,17,22,.72);backdrop-filter:blur(6px);color:#fff;display:inline-flex;align-items:center;justify-content:center;transition:transform .12s,background .15s}
-.v-qbtn:hover{background:rgba(15,17,22,.92);transform:scale(1.06)}
-.v-qbtn.wl-on{background:#2563EB;border-color:#60A5FA;color:#fff}
-.v-qbtn.fav-on{background:#D97706;border-color:#FCD34D;color:#fff}
+.v-qbtn{
+  height:25px;padding:0 8px;border-radius:999px;border:1px solid rgba(255,255,255,.24);
+  background:rgba(15,17,22,.46);backdrop-filter:blur(6px);-webkit-backdrop-filter:blur(6px);
+  color:#fff;font-size:11px;font-weight:600;display:inline-flex;align-items:center;justify-content:center;gap:4px;
+  transition:transform .12s,background .15s,border-color .15s,color .15s;user-select:none;white-space:nowrap;
+}
+.v-qbtn:hover{background:rgba(15,17,22,.64);transform:scale(1.04)}
+.v-qbtn.wl-on{background:rgba(37,99,235,.62);border-color:rgba(147,197,253,.65);color:#fff}
+.v-qbtn.fav-on{background:rgba(217,119,6,.66);border-color:rgba(252,211,77,.7);color:#fff}
+
+/* Dark-Theme Inversion for All 4 Video Cover Overlay Controls (反色处理) */
+[data-theme="dark"] .v-dur,
+[data-theme="dark"] .v-chk-wrap,
+[data-theme="dark"] .v-qbtn{
+  background:rgba(248,250,252,.56);color:#0B0D12;border-color:rgba(15,23,42,.22);
+  box-shadow:0 2px 8px rgba(0,0,0,.22);
+}
+[data-theme="dark"] .v-sum-badge{
+  background:rgba(248,250,252,.60);color:#065F46;border-color:rgba(5,150,105,.42);
+  box-shadow:0 2px 8px rgba(0,0,0,.22);
+}
+[data-theme="dark"] .v-qbtn:hover{background:rgba(255,255,255,.76);color:#000}
+[data-theme="dark"] .v-qbtn.wl-on{background:rgba(219,234,254,.78);border-color:rgba(37,99,235,.65);color:#1E40AF}
+[data-theme="dark"] .v-qbtn.fav-on{background:rgba(254,243,199,.80);border-color:rgba(217,119,6,.68);color:#92400E}
 
 .v-body{display:flex;align-items:flex-start;gap:10px;padding-top:10px}
 .v-ava{width:34px;height:34px;border-radius:50%;object-fit:cover;background:var(--surface-3);border:1px solid var(--border);flex-shrink:0;margin-top:2px}
@@ -2099,9 +2197,20 @@ select.c-select-native{position:absolute!important;opacity:0!important;pointer-e
 .sb-toast.show{display:block}
 .sb-toast.ok{background:var(--ok-soft);color:var(--ok-text);border:1px solid rgba(16,185,129,.25)}
 .sb-toast.err{background:var(--err-soft);color:var(--err-text);border:1px solid var(--err-border)}
-.global-toast{position:fixed;right:24px;bottom:24px;z-index:420;background:var(--cta);color:var(--cta-text);padding:10px 16px;border-radius:10px;font-size:13px;font-weight:600;box-shadow:var(--shadow-lg);opacity:0;transform:translateY(10px);pointer-events:none;transition:opacity .2s,transform .2s}
-.global-toast.show{opacity:1;transform:translateY(0)}
+.global-toast{
+  position:fixed;right:24px;bottom:24px;z-index:420;background:var(--cta);color:var(--cta-text);
+  padding:10px 16px;border-radius:10px;font-size:13px;font-weight:600;box-shadow:var(--shadow-lg);
+  opacity:0;transform:translateY(10px);pointer-events:none;transition:opacity .2s,transform .2s;
+  display:inline-flex;align-items:center;gap:12px;max-width:420px;
+}
+.global-toast.show{opacity:1;transform:translateY(0);pointer-events:auto}
 .global-toast.err{background:var(--err);color:#fff}
+.toast-switch-btn{
+  border:1px solid rgba(251,114,153,.55);background:var(--brand);color:#fff;
+  font-size:12px;font-weight:700;padding:3px 10px;border-radius:7px;white-space:nowrap;
+  transition:opacity .15s,transform .1s;flex-shrink:0;
+}
+.toast-switch-btn:hover{opacity:.92;transform:scale(1.03)}
 
 /* Responsive: Tablet & Mobile (<=768px leaves ONLY clickable Brand Logo top-left!) */
 @media(max-width:1024px){
@@ -2156,6 +2265,7 @@ theme-button{flex-shrink:0}
     display:grid!important;grid-template-columns:minmax(0,1fr) 104px;
     gap:12px;align-items:start;padding:14px 14px;
   }
+  .vh-cover{grid-column:1 / -1;width:100%;max-height:190px}
   .vh-left{min-width:0;width:100%}
   .vh-title{font-size:15.5px;line-height:1.42;margin-bottom:8px;word-break:break-word}
   .vh-pills{gap:5px}
@@ -2297,6 +2407,41 @@ theme-button{flex-shrink:0}
 @keyframes pulseDot{0%,100%{opacity:1;transform:scale(1)}50%{opacity:.45;transform:scale(1.25)}}
 .dot.pending{background:var(--warn);animation:pulseDot 1.4s infinite ease-in-out}
 .st-item.active .st-dot{border-color:var(--brand);background:var(--brand);color:#fff;font-weight:700;box-shadow:0 0 0 3px rgba(251,114,153,.22)}
+.rail-foot-btn.active{border-color:var(--brand-border);background:var(--brand-soft);color:var(--brand-dark)}
+[data-theme="dark"] .fan-nav{background:rgba(248,250,252,.62);color:#0B0D12;border:1px solid rgba(15,23,42,.2)}
+[data-theme="dark"] .fan-nav-btn{color:#0B0D12}
+[data-theme="dark"] .fan-nav-btn:hover{background:rgba(15,23,42,.12)}
+
+/* Multi-Select Favorite Folder Picker & Granular Removal Modal + Settings Subpage */
+.fav-pick-list{display:flex;flex-direction:column;gap:8px;margin-top:10px;max-height:290px;overflow-y:auto}
+.fav-pick-row{
+  display:flex;align-items:center;justify-content:space-between;gap:10px;padding:10px 13px;
+  border:1.5px solid var(--border);border-radius:11px;background:var(--bg);cursor:pointer;
+  transition:border-color .15s,background .15s;user-select:none;
+}
+.fav-pick-row:hover{border-color:var(--border-strong);background:var(--surface-hover)}
+.fav-pick-row.selected{border-color:var(--brand);background:var(--brand-soft)}
+.fav-pick-left{display:flex;align-items:center;gap:10px;min-width:0}
+.fav-pick-chk{
+  width:18px;height:18px;border-radius:5px;border:1.5px solid var(--border-strong);
+  background:var(--surface);display:inline-flex;align-items:center;justify-content:center;
+  color:#fff;flex-shrink:0;transition:all .15s;
+}
+.fav-pick-row.selected .fav-pick-chk{background:var(--brand);border-color:var(--brand)}
+.set-side-card{
+  padding:10px 12px;border:1px solid var(--border);border-radius:10px;background:var(--surface);
+  cursor:pointer;transition:border-color .15s,background .15s;display:flex;align-items:center;gap:10px;
+}
+.set-side-card:hover{background:var(--surface-hover);border-color:var(--border-strong)}
+.set-side-card.active{border-color:var(--brand);background:var(--brand-soft)}
+.set-side-ic{
+  width:32px;height:32px;border-radius:9px;background:var(--surface-3);color:var(--soft);
+  display:flex;align-items:center;justify-content:center;flex-shrink:0;
+}
+.set-side-card.active .set-side-ic{background:var(--brand);color:#fff}
+.set-side-info{flex:1;min-width:0}
+.set-side-title{font-size:13px;font-weight:700;color:var(--text)}
+.set-side-sub{font-size:11px;color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 </style>
 </head>
 <body>
@@ -2401,7 +2546,7 @@ theme-button{flex-shrink:0}
     </div>
 
     <div class="rail-foot">
-      <div class="rail-user-row" onclick="openMonitorModal()" data-tip="监控与日报配置" title="点击打开定时监控与日报样式配置">
+      <div class="rail-user-row" onclick="navigate('settings','monitor')" data-tip="监控与日报配置" title="点击打开定时监控与日报样式配置">
         <div class="rail-user-ava" id="railUserAva">S</div>
         <div class="rail-user-meta">
           <div class="rail-user-name" id="railUserName">shiran</div>
@@ -2409,7 +2554,7 @@ theme-button{flex-shrink:0}
         </div>
       </div>
       <div class="rail-foot-acts">
-        <button class="rail-foot-btn" onclick="openSettingsModal()" data-tip="偏好设置">
+        <button class="rail-foot-btn" id="railSettingsBtn" onclick="navigate('settings')" data-tip="偏好与系统设置">
           <svg class="ic" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
           <span class="rail-label">设置</span>
         </button>
@@ -2432,7 +2577,7 @@ theme-button{flex-shrink:0}
       </div>
       <div class="topbar-actions">
         <theme-button id="topThemeBtn" size="1.05" aria-label="切换日夜主题"></theme-button>
-        <button class="pill-btn tb-hide-sm" onclick="openMonitorModal()">
+        <button class="pill-btn tb-hide-sm" onclick="navigate('settings','monitor')">
           <svg class="ic" viewBox="0 0 24 24"><line x1="4" y1="21" x2="4" y2="14"/><line x1="4" y1="10" x2="4" y2="3"/><line x1="12" y1="21" x2="12" y2="12"/><line x1="12" y1="8" x2="12" y2="3"/><line x1="20" y1="21" x2="20" y2="16"/><line x1="20" y1="12" x2="20" y2="3"/><line x1="1" y1="14" x2="7" y2="14"/><line x1="9" y1="8" x2="15" y2="8"/><line x1="17" y1="16" x2="23" y2="16"/></svg>
           <span>定时与样式</span>
         </button>
@@ -2467,7 +2612,7 @@ theme-button{flex-shrink:0}
           </div>
 
           <div class="mon-main" id="wsScrollArea">
-            <div class="page-inner">
+            <div class="page-inner full">
               <div class="empty-ws-card" id="summaryEmptyState">
                 <h2>开始你的视频 AI 精读</h2>
                 <p>粘贴 B 站视频链接或 BV 号，自动完成免费语音转录与结构化摘要；支持秒速切换风格、可视化思维导图、全文检索与围绕视频多轮 AI 追问。</p>
@@ -2481,6 +2626,11 @@ theme-button{flex-shrink:0}
             <div class="stepper hidden" id="stepperBar"></div>
 
             <section class="video-head">
+              <a class="vh-cover" id="dCoverLink" href="#" target="_blank" rel="noopener" title="前往 B 站观看原视频">
+                <img id="dCoverImg" src="" referrerpolicy="no-referrer" alt="" class="hidden">
+                <div class="vh-cover-fb" id="dCoverFb">B站视频</div>
+                <span class="v-dur hidden" id="dCoverDur"></span>
+              </a>
               <div class="vh-left">
                 <h1 class="vh-title"><a id="dTitleLink" href="#" target="_blank" rel="noopener">—</a></h1>
                 <div class="vh-pills" id="dPills"></div>
@@ -2491,13 +2641,12 @@ theme-button{flex-shrink:0}
                   <svg class="ic" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><polyline points="12 7 12 12 15 15"/></svg>
                   <span id="wlBtnText">稍后再看</span>
                 </button>
-                <button class="star-btn" id="starBtn" onclick="toggleStarCurrent()">
+                <button class="star-btn" id="starBtn" data-fav-bvid="" title="收藏（长按可多选收藏夹）" onclick="toggleStarCurrent()">
                   <svg class="ic" viewBox="0 0 24 24"><polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2"/></svg>
                   <span id="starBtnText">收藏</span>
                 </button>
                 <a class="watch-btn" id="dWatchLink" href="#" target="_blank" rel="noopener">
                   <span>在B站观看</span>
-                  <svg class="ic" viewBox="0 0 24 24"><path d="M7 17L17 7M7 7h10v10"/></svg>
                 </a>
                 <button class="vh-tag-mobile-btn" id="vhTagMobileBtn" type="button" onclick="openCurrentJobTagPopover(this)">
                   <svg class="ic" viewBox="0 0 24 24"><path d="M20.59 13.41l-7.17 7.17a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82z"/><line x1="7" y1="7" x2="7.01" y2="7"/></svg>
@@ -2754,6 +2903,372 @@ theme-button{flex-shrink:0}
           </div>
         </div>
       </section>
+
+      <!-- ROUTE 7: DEDICATED SETTINGS SECONDARY PAGE (2-Pane Functional Divisions) -->
+      <section class="route-view no-pad hidden" id="view-settings">
+        <div class="monitor-split">
+          <div class="mon-aside">
+            <div style="padding:4px 4px 8px">
+              <div style="font-size:14.5px;font-weight:800;color:var(--text)">偏好与系统设置</div>
+              <div style="font-size:11.5px;color:var(--muted);margin-top:2px">按功能模块划分 · 自动同步云端 R2</div>
+            </div>
+            <div class="mon-aside-scroll" id="settingsSideNav" style="margin-top:4px">
+              <div class="set-side-card active" data-stab="general" onclick="switchSettingsTab('general')">
+                <div class="set-side-ic"><svg class="ic" viewBox="0 0 24 24"><rect x="3" y="3" width="18" height="18" rx="2"/><line x1="9" y1="3" x2="9" y2="21"/></svg></div>
+                <div class="set-side-info">
+                  <div class="set-side-title">阅读与界面偏好</div>
+                  <div class="set-side-sub">默认视图、字号、主题与侧边栏</div>
+                </div>
+              </div>
+              <div class="set-side-card" data-stab="single" onclick="switchSettingsTab('single')">
+                <div class="set-side-ic"><svg class="ic" viewBox="0 0 24 24"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></svg></div>
+                <div class="set-side-info">
+                  <div class="set-side-title">单条摘要与邮件策略</div>
+                  <div class="set-side-sub">单条通知开关、默认邮箱与模板</div>
+                </div>
+              </div>
+              <div class="set-side-card" data-stab="monitor" onclick="switchSettingsTab('monitor')">
+                <div class="set-side-ic"><svg class="ic" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><polyline points="12 7 12 12 15 15"/></svg></div>
+                <div class="set-side-info">
+                  <div class="set-side-title">定时监控与巡检计划</div>
+                  <div class="set-side-sub">Shy Cron 调度、UP主与扫描窗口</div>
+                </div>
+              </div>
+              <div class="set-side-card" data-stab="briefing" onclick="switchSettingsTab('briefing')">
+                <div class="set-side-ic"><svg class="ic" viewBox="0 0 24 24"><path d="M4 4h16c1.1 0 2 .9 2 2v12c0 1.1-.9 2-2 2H4c-1.1 0-2-.9-2-2V6c0-1.1.9-2 2-2z"/><polyline points="22,6 12,13 2,6"/></svg></div>
+                <div class="set-side-info">
+                  <div class="set-side-title">日报邮件样式与预览</div>
+                  <div class="set-side-sub">4 套开源宽屏邮件主题与合并策略</div>
+                </div>
+              </div>
+              <div class="set-side-card" data-stab="data" onclick="switchSettingsTab('data')">
+                <div class="set-side-ic"><svg class="ic" viewBox="0 0 24 24"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M21 12c0 1.66-4 3-9 3s-9-1.34-9-3"/><path d="M3 5v14c0 1.66 4 3 9 3s9-1.34 9-3V5"/></svg></div>
+                <div class="set-side-info">
+                  <div class="set-side-title">分类库与系统数据维护</div>
+                  <div class="set-side-sub">三大分类夹、R2 状态与缓存清理</div>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <div class="mon-main" id="settingsScrollArea">
+            <div class="page-inner full">
+              <!-- SUB-PANE 1: GENERAL & READING PREFERENCES -->
+              <div class="settings-pane" id="setPane-general">
+                <div class="page-toolbar">
+                  <div class="pt-left">
+                    <h2>阅读与界面偏好</h2>
+                    <p>自定义摘要工作台默认打开视图、阅读字号、日夜主题与侧边栏展开状态</p>
+                  </div>
+                  <div class="pt-actions">
+                    <button class="btn btn-brand" type="button" onclick="saveUserPrefs()">保存偏好设置</button>
+                  </div>
+                </div>
+
+                <div class="m-section" style="background:var(--surface)">
+                  <div class="m-sec-head">
+                    <div>
+                      <div class="m-sec-title">摘要工作台阅读设置</div>
+                      <div class="m-sec-sub">进入任意视频摘要详情页时的默认展示模式与正文字号</div>
+                    </div>
+                  </div>
+                  <div class="form-grid">
+                    <div class="field">
+                      <label>打开摘要默认显示视图</label>
+                      <select class="ctrl" id="prefDefaultView">
+                        <option value="summary">AI 总结</option>
+                        <option value="mindmap">思维导图</option>
+                        <option value="transcript">完整转录</option>
+                        <option value="split">分栏对照</option>
+                        <option value="chat">AI 追问</option>
+                      </select>
+                    </div>
+                    <div class="field">
+                      <label>阅读器默认字号</label>
+                      <select class="ctrl" id="prefReaderFontSize" onchange="adjustFontSizeTo(this.value)">
+                        <option value="13">紧凑 (13px)</option>
+                        <option value="14" selected>标准 (14px · 默认)</option>
+                        <option value="15">舒适 (15px)</option>
+                        <option value="16">大字号 (16px)</option>
+                        <option value="18">超大字号 (18px)</option>
+                      </select>
+                    </div>
+                  </div>
+                </div>
+
+                <div class="m-section" style="background:var(--surface);margin-bottom:0">
+                  <div class="m-sec-head" style="margin-bottom:0">
+                    <div>
+                      <div class="m-sec-title">桌面端侧边栏展开 / 收起状态</div>
+                      <div class="m-sec-sub">点击左上角品牌图标也可随时在「展开完整导航 (228px)」与「紧凑图标栏 (64px)」之间切换</div>
+                    </div>
+                    <button class="btn" type="button" onclick="toggleRailCollapsed()">切换侧边栏展开/收起</button>
+                  </div>
+                </div>
+              </div>
+
+              <!-- SUB-PANE 2: SINGLE SUMMARY & EMAIL STRATEGY -->
+              <div class="settings-pane hidden" id="setPane-single">
+                <div class="page-toolbar">
+                  <div class="pt-left">
+                    <h2>单条摘要与邮件策略</h2>
+                    <p>配置手动提交单条视频总结时的邮件推送开关、默认接收邮箱、视觉样式与总结提示词模板</p>
+                  </div>
+                  <div class="pt-actions">
+                    <button class="btn btn-brand" type="button" onclick="saveUserPrefs()">保存单条摘要配置</button>
+                  </div>
+                </div>
+
+                <div class="m-section" style="background:var(--surface)">
+                  <div class="m-sec-head" style="margin-bottom:0">
+                    <div>
+                      <div class="m-sec-title">单条摘要完成后发送邮件</div>
+                      <div class="m-sec-sub">关闭后仅保存在网页端工作台与 Cloudflare R2，不发送单条邮件（不影响定时监控日报）</div>
+                    </div>
+                    <label class="tog-switch"><input type="checkbox" id="prefSendEmail" checked><span class="tog-track"></span></label>
+                  </div>
+                </div>
+
+                <div class="m-section" style="background:var(--surface);margin-bottom:0">
+                  <div class="m-sec-title" style="margin-bottom:12px">单条摘要默认参数</div>
+                  <div class="form-grid">
+                    <div class="field">
+                      <label>默认接收邮箱（留空发至系统默认邮箱）</label>
+                      <input class="ctrl" id="prefDefaultEmail" type="email" placeholder="example@qq.com">
+                    </div>
+                    <div class="field">
+                      <label>默认单条邮件样式</label>
+                      <select class="ctrl" id="prefEmailStyle">
+                        <option value="editorial">编辑部日报（深色报头 · 默认）</option>
+                        <option value="minimal">极简纸刊（纯白 Notion 风）</option>
+                        <option value="bilibili">B站元气粉（樱花粉渐变）</option>
+                        <option value="compact">极速速览（高密度紧凑）</option>
+                      </select>
+                    </div>
+                  </div>
+                  <div class="field" style="margin-top:12px">
+                    <label>默认总结提示词模板</label>
+                    <select class="ctrl" id="prefDefaultTpl">
+                      <option value="">默认精炼日报模板</option>
+                      <option value="notes">深度结构化笔记</option>
+                      <option value="quotes">金句与核心观点提取</option>
+                    </select>
+                  </div>
+                </div>
+              </div>
+
+              <!-- SUB-PANE 3: SCHEDULED MONITOR & PATROL CONFIG -->
+              <div class="settings-pane hidden" id="setPane-monitor">
+                <div class="page-toolbar">
+                  <div class="pt-left">
+                    <h2>定时监控与巡检计划</h2>
+                    <p>配置保存在 Cloudflare R2，定时策略自动同步至 Shy Cron (cron.shyapi.de5.net)</p>
+                  </div>
+                  <div class="pt-actions">
+                    <button class="btn" type="button" onclick="triggerMonitorNow()">立即巡检</button>
+                    <button class="btn btn-brand" type="button" id="saveMonitorBtn" onclick="saveMonitorConfig()">保存并同步定时任务</button>
+                  </div>
+                </div>
+
+                <div class="sb-toast" id="monitorToast" style="margin-bottom:14px"></div>
+
+                <div class="m-section" style="background:var(--surface)">
+                  <div class="m-sec-head" style="margin-bottom:0">
+                    <div>
+                      <div class="m-sec-title">启用自动定时监控</div>
+                      <div class="m-sec-sub">开启后将通过 Shy Cron 按设定时间自动触发 GitHub Actions 抓取新视频</div>
+                    </div>
+                    <label class="tog-switch"><input type="checkbox" id="cfgEnabled" checked><span class="tog-track"></span></label>
+                  </div>
+                </div>
+
+                <div class="m-section" style="background:var(--surface)">
+                  <div class="m-sec-head">
+                    <div class="m-sec-title">定时运行计划（北京时间 UTC+8）</div>
+                    <span class="cron-badge" id="cronPreviewBadge">UTC Cron: 0 0,12 * * *</span>
+                  </div>
+                  <div class="form-grid">
+                    <div class="field">
+                      <label>调度模式</label>
+                      <select class="ctrl" id="cfgScheduleMode" onchange="onScheduleModeChange()">
+                        <option value="times">指定每天运行时间（北京时间）</option>
+                        <option value="every_12h">每 12 小时（08:00 / 20:00）</option>
+                        <option value="every_6h">每 6 小时运行一次</option>
+                        <option value="custom">自定义 5 位 UTC Cron 表达式</option>
+                      </select>
+                    </div>
+                    <div class="field" id="timesInputWrap">
+                      <label>添加每日运行时间点</label>
+                      <div class="inline-add-row">
+                        <input class="ctrl" id="newTimeInput" type="time" value="08:00">
+                        <button class="btn" type="button" onclick="addTimeSlot()">+ 添加</button>
+                      </div>
+                    </div>
+                    <div class="field hidden" id="customCronWrap">
+                      <label>UTC Cron（分 时 日 月 周）</label>
+                      <input class="ctrl" id="cfgCustomCron" type="text" placeholder="0 0,12 * * *" oninput="updateCronBadge()">
+                    </div>
+                  </div>
+                  <div class="chip-list" id="timeChipList"></div>
+                  <div id="cronSyncNote" style="font-size:12px;color:var(--muted);margin-top:10px"></div>
+                </div>
+
+                <div class="m-section" style="background:var(--surface)">
+                  <div class="m-sec-head">
+                    <div class="m-sec-title">监控 UP 主列表（<span id="upCountSpan">0</span> 位）</div>
+                  </div>
+                  <div class="inline-add-row">
+                    <input class="ctrl" id="upAddInput" type="text" placeholder="输入 UP 主 UID 或主页链接（如 346563107 或 https://space.bilibili.com/346563107）" onkeydown="if(event.key==='Enter')addUpCreator()">
+                    <button class="btn btn-primary" type="button" id="upAddBtn" onclick="addUpCreator()">解析并添加</button>
+                  </div>
+                  <div class="chip-list" id="upChipList"></div>
+                </div>
+
+                <div class="m-section" style="background:var(--surface);margin-bottom:0">
+                  <div class="m-sec-head">
+                    <div class="m-sec-title">扫描策略</div>
+                  </div>
+                  <div class="form-grid">
+                    <div class="field">
+                      <label>扫描时间窗口</label>
+                      <select class="ctrl" id="cfgWindowHours">
+                        <option value="24">最近 24 小时（1天）</option>
+                        <option value="48">最近 48 小时（2天）</option>
+                        <option value="72">最近 72 小时（3天）</option>
+                        <option value="168">最近 7 天</option>
+                      </select>
+                    </div>
+                    <div class="field">
+                      <label>单次每位 UP 主最多处理条数</label>
+                      <select class="ctrl" id="cfgMaxVideos">
+                        <option value="2">最多 2 支</option>
+                        <option value="3">最多 3 支</option>
+                        <option value="5">最多 5 支</option>
+                        <option value="10">最多 10 支</option>
+                      </select>
+                    </div>
+                  </div>
+                </div>
+              </div>
+
+              <!-- SUB-PANE 4: DAILY BRIEFING EMAIL STYLES & LIVE PREVIEW -->
+              <div class="settings-pane hidden" id="setPane-briefing">
+                <div class="page-toolbar">
+                  <div class="pt-left">
+                    <h2>日报邮件样式与实时预览</h2>
+                    <p>桌面端自适应宽屏布局、附带 16:9 视频封面与直达原视频超链接</p>
+                  </div>
+                  <div class="pt-actions">
+                    <button class="btn btn-brand" type="button" onclick="saveMonitorConfig()">保存日报样式配置</button>
+                  </div>
+                </div>
+
+                <div class="m-section" style="background:var(--surface)">
+                  <div class="form-grid">
+                    <div class="field">
+                      <label>合并发送策略</label>
+                      <div style="display:flex;align-items:center;justify-content:space-between;height:38px;padding:0 12px;border:1px solid var(--border);border-radius:9px;background:var(--bg)">
+                        <span style="font-size:13px">多位 UP 主合并为一封日报</span>
+                        <label class="tog-switch"><input type="checkbox" id="cfgMergeEmails" checked><span class="tog-track"></span></label>
+                      </div>
+                    </div>
+                    <div class="field">
+                      <label>自定义日报接收邮箱（可选）</label>
+                      <input class="ctrl" id="cfgSmtpTo" type="email" placeholder="留空则发往系统默认邮箱">
+                    </div>
+                  </div>
+                </div>
+
+                <div class="m-section" style="background:var(--surface);margin-bottom:0">
+                  <div class="m-sec-head" style="margin-bottom:10px">
+                    <div>
+                      <div class="m-sec-title">选择日报邮件视觉样式（开源 4 套主题）</div>
+                      <div class="m-sec-sub">所有目录条目、视频封面与卡片标题均直接超链接跳转至 B 站原视频页</div>
+                    </div>
+                  </div>
+                  <div class="style-grid" id="emailStyleGrid">
+                    <div class="style-card" data-style="editorial" onclick="selectEmailStyle('editorial')">
+                      <div class="sc-thumb"><div style="height:20px;background:linear-gradient(135deg,#0f172a,#1e293b)"></div><div style="flex:1;background:#f8fafc;padding:4px 6px"><div style="height:4px;width:65%;background:#fb7299;border-radius:2px;margin-bottom:3px"></div><div style="height:3px;width:90%;background:#cbd5e1;border-radius:2px"></div></div></div>
+                      <div class="sc-name">编辑部日报</div>
+                      <div class="sc-desc">深色报头 · 卡片式目录与重点高亮</div>
+                    </div>
+                    <div class="style-card" data-style="minimal" onclick="selectEmailStyle('minimal')">
+                      <div class="sc-thumb"><div style="height:16px;background:#fff;border-bottom:2px solid #18181b"></div><div style="flex:1;background:#fff;padding:4px 6px"><div style="height:4px;width:55%;background:#18181b;border-radius:2px;margin-bottom:3px"></div><div style="height:3px;width:85%;background:#d4d4d8;border-radius:2px"></div></div></div>
+                      <div class="sc-name">极简纸刊</div>
+                      <div class="sc-desc">Notion 纯白排版 · 克制黑白高级感</div>
+                    </div>
+                    <div class="style-card" data-style="bilibili" onclick="selectEmailStyle('bilibili')">
+                      <div class="sc-thumb"><div style="height:20px;background:linear-gradient(135deg,#fb7299,#ff85a7)"></div><div style="flex:1;background:#fff5f7;padding:4px 6px"><div style="height:4px;width:70%;background:#fb7299;border-radius:2px;margin-bottom:3px"></div><div style="height:3px;width:85%;background:#fecdd3;border-radius:2px"></div></div></div>
+                      <div class="sc-name">B站元气粉</div>
+                      <div class="sc-desc">樱花粉渐变报头 · 轻快明朗</div>
+                    </div>
+                    <div class="style-card" data-style="compact" onclick="selectEmailStyle('compact')">
+                      <div class="sc-thumb"><div style="height:16px;background:#2563eb"></div><div style="flex:1;background:#f8fafc;padding:4px 6px"><div style="height:3px;width:95%;background:#94a3b8;margin-bottom:3px"></div><div style="height:3px;width:85%;background:#94a3b8;margin-bottom:3px"></div><div style="height:3px;width:70%;background:#94a3b8"></div></div></div>
+                      <div class="sc-name">极速速览</div>
+                      <div class="sc-desc">高密度列表 · 30 秒扫完所有更新</div>
+                    </div>
+                  </div>
+
+                  <div class="preview-box">
+                    <div class="preview-bar">
+                      <span>实时邮件效果预览（点击封面、目录或标题可测试原视频超链接）</span>
+                      <span id="previewStyleName" style="font-weight:700;color:var(--brand-dark)">编辑部日报</span>
+                    </div>
+                    <div class="preview-stage" id="emailPreviewStage"></div>
+                  </div>
+                </div>
+              </div>
+
+              <!-- SUB-PANE 5: FOLDER LIBRARY & SYSTEM DATA MAINTENANCE -->
+              <div class="settings-pane hidden" id="setPane-data">
+                <div class="page-toolbar">
+                  <div class="pt-left">
+                    <h2>分类库与系统数据维护</h2>
+                    <p>集中管理摘要分类、UP 主分组、收藏文件夹，以及查看 Cloudflare R2 存储状态</p>
+                  </div>
+                  <div class="pt-actions">
+                    <button class="btn" type="button" onclick="refreshSettingsDataStats()">刷新状态</button>
+                    <button class="btn btn-brand" type="button" onclick="openTagManagerModal('summary')">打开分类管理器</button>
+                  </div>
+                </div>
+
+                <div class="m-section" style="background:var(--surface)">
+                  <div class="m-sec-head">
+                    <div>
+                      <div class="m-sec-title">三大分类与收藏文件夹快捷管理</div>
+                      <div class="m-sec-sub">独立维护摘要工作台分类、监控 UP 主分类与多选收藏文件夹</div>
+                    </div>
+                  </div>
+                  <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:12px" id="settingsFolderCards"></div>
+                </div>
+
+                <div class="m-section" style="background:var(--surface)">
+                  <div class="m-sec-head" style="margin-bottom:0">
+                    <div>
+                      <div class="m-sec-title">Cloudflare R2 云端存储与本地缓存</div>
+                      <div class="m-sec-sub" id="sysStatsBadge">读取系统状态中...</div>
+                    </div>
+                    <div style="display:flex;gap:8px;flex-wrap:wrap">
+                      <button class="btn btn-sm" type="button" onclick="clearLocalCaches()">清空动态封面缓存</button>
+                      <button class="btn btn-sm" type="button" onclick="exportLibraryBackupJson()">导出分类与收藏备份 JSON</button>
+                    </div>
+                  </div>
+                </div>
+
+                <div class="m-section" style="background:var(--surface);margin-bottom:0">
+                  <div class="m-sec-head" style="margin-bottom:0">
+                    <div>
+                      <div class="m-sec-title">当前设备持久登录会话</div>
+                      <div class="m-sec-sub">已启用 90 天 HttpOnly 安全 Cookie + 本地令牌双持久化保护</div>
+                    </div>
+                    <button class="btn btn-sm" style="color:var(--err);border-color:var(--err-border)" type="button" onclick="doLogout()">退出当前设备登录</button>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </section>
     </div>
   </main>
 </div>
@@ -2761,6 +3276,52 @@ theme-button{flex-shrink:0}
 <!-- GLOBAL FLOATING TOAST & TAG POPOVER -->
 <div class="global-toast" id="globalToast"></div>
 <div class="tag-popover hidden" id="tagPopover"></div>
+
+<!-- MULTI-SELECT FAVORITE FOLDER PICKER MODAL (Click "切换收藏夹" or Long-Press 收藏) -->
+<div class="modal-backdrop hidden" id="favPickModal" onclick="if(event.target===this)closeModal('favPickModal')">
+  <div class="modal">
+    <div class="modal-head">
+      <div>
+        <h2>选择收藏文件夹（支持多选）</h2>
+        <div style="font-size:12px;color:var(--muted);margin-top:2px" id="favPickVideoTitle">可同时归入多个收藏文件夹</div>
+      </div>
+      <button class="icon-btn" onclick="closeModal('favPickModal')" aria-label="关闭">
+        <svg class="ic" viewBox="0 0 24 24"><path d="M18 6L6 18M6 6l12 12"/></svg>
+      </button>
+    </div>
+    <div class="modal-body">
+      <div style="display:flex;gap:8px;margin-bottom:10px">
+        <input class="ctrl" id="favPickNewName" type="text" maxlength="16" placeholder="快速新建收藏文件夹并勾选..." onkeydown="if(event.key==='Enter')quickCreateFavFolderInPicker()">
+        <button class="btn" type="button" onclick="quickCreateFavFolderInPicker()">+ 新建</button>
+      </div>
+      <div class="fav-pick-list" id="favPickList"></div>
+    </div>
+    <div class="modal-foot">
+      <button class="btn" style="color:var(--err);border-color:var(--err-border)" type="button" onclick="removeCurrentPickFromAllFavs()">从所有收藏夹移除</button>
+      <div style="display:flex;gap:8px">
+        <button class="btn" type="button" onclick="closeModal('favPickModal')">取消</button>
+        <button class="btn btn-primary" type="button" onclick="saveFavMultiModal()">确认保存</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- GRANULAR FAVORITE REMOVAL CONFIRMATION MODAL (Single Folder vs All Folders) -->
+<div class="modal-backdrop hidden" id="favRemoveModal" onclick="if(event.target===this)closeModal('favRemoveModal')">
+  <div class="modal">
+    <div class="modal-head">
+      <div>
+        <h2>移除收藏确认</h2>
+        <div style="font-size:12px;color:var(--muted);margin-top:2px" id="favRemoveSub">请选择仅从当前收藏夹移除，还是从所有收藏夹彻底移除</div>
+      </div>
+      <button class="icon-btn" onclick="closeModal('favRemoveModal')" aria-label="关闭">
+        <svg class="ic" viewBox="0 0 24 24"><path d="M18 6L6 18M6 6l12 12"/></svg>
+      </button>
+    </div>
+    <div class="modal-body" id="favRemoveBody"></div>
+    <div class="modal-foot" id="favRemoveFoot"></div>
+  </div>
+</div>
 
 <!-- NEW SUMMARY / BATCH SUBMIT MODAL (Ctrl+K) -->
 <div class="modal-backdrop hidden" id="submitModal" onclick="if(event.target===this)closeModal('submitModal')">
@@ -2909,253 +3470,10 @@ theme-button{flex-shrink:0}
     </div>
     <div class="modal-body" id="smBody"></div>
     <div class="modal-foot">
-      <a class="btn" id="smWatchLink" href="#" target="_blank" rel="noopener">在B站观看 ↗</a>
+      <a class="btn" id="smWatchLink" href="#" target="_blank" rel="noopener">在B站观看</a>
       <div style="display:flex;gap:8px">
         <button class="btn" onclick="copyModalSummary()">复制摘要</button>
         <button class="btn btn-primary" onclick="closeModal('summaryModal')">关闭</button>
-      </div>
-    </div>
-  </div>
-</div>
-
-<!-- USER PREFERENCES & SETTINGS MODAL -->
-<div class="modal-backdrop hidden" id="settingsModal" onclick="if(event.target===this)closeModal('settingsModal')">
-  <div class="modal">
-    <div class="modal-head">
-      <div>
-        <h2>偏好与系统设置</h2>
-        <div style="font-size:12px;color:var(--muted);margin-top:2px">单条摘要默认邮件策略与工作台偏好</div>
-      </div>
-      <button class="icon-btn" onclick="closeModal('settingsModal')" aria-label="关闭">
-        <svg class="ic" viewBox="0 0 24 24"><path d="M18 6L6 18M6 6l12 12"/></svg>
-      </button>
-    </div>
-    <div class="modal-body">
-      <div class="m-section">
-        <div class="m-sec-head" style="margin-bottom:0">
-          <div>
-            <div class="m-sec-title">单条摘要完成后发送邮件</div>
-            <div class="m-sec-sub">关闭后仅保存网页端与 R2，不发送单条邮件（不影响定时日报）</div>
-          </div>
-          <label class="tog-switch"><input type="checkbox" id="prefSendEmail" checked><span class="tog-track"></span></label>
-        </div>
-      </div>
-
-      <div class="m-section">
-        <div class="m-sec-title" style="margin-bottom:12px">单条摘要默认配置</div>
-        <div class="field">
-          <label>默认接收邮箱（留空发至系统默认邮箱）</label>
-          <input class="ctrl" id="prefDefaultEmail" type="email" placeholder="example@qq.com">
-        </div>
-        <div class="field">
-          <label>默认单条邮件样式</label>
-          <select class="ctrl" id="prefEmailStyle">
-            <option value="editorial">编辑部日报（深色报头 · 默认）</option>
-            <option value="minimal">极简纸刊（纯白 Notion 风）</option>
-            <option value="bilibili">B站元气粉（樱花粉渐变）</option>
-            <option value="compact">极速速览（高密度紧凑）</option>
-          </select>
-        </div>
-        <div class="field">
-          <label>默认总结模板</label>
-          <select class="ctrl" id="prefDefaultTpl">
-            <option value="">默认精炼日报模板</option>
-            <option value="notes">深度结构化笔记</option>
-            <option value="quotes">金句与核心观点提取</option>
-          </select>
-        </div>
-      </div>
-
-      <div class="m-section" style="margin-bottom:0">
-        <div class="m-sec-title" style="margin-bottom:12px">阅读工作台偏好</div>
-        <div class="field">
-          <label>打开摘要默认显示视图</label>
-          <select class="ctrl" id="prefDefaultView">
-            <option value="summary">AI 总结</option>
-            <option value="mindmap">思维导图</option>
-            <option value="transcript">完整转录</option>
-            <option value="split">分栏对照</option>
-            <option value="chat">AI 追问</option>
-          </select>
-        </div>
-        <div style="display:flex;align-items:center;justify-content:space-between;margin-top:12px;padding-top:12px;border-top:1px solid var(--border);gap:10px;flex-wrap:wrap">
-          <div style="font-size:12px;color:var(--soft)" id="sysStatsBadge">读取系统状态中...</div>
-          <button class="btn btn-sm" type="button" onclick="clearLocalCaches()">清空动态封面缓存</button>
-        </div>
-      </div>
-    </div>
-    <div class="modal-foot">
-      <button class="btn" onclick="closeModal('settingsModal')">取消</button>
-      <button class="btn btn-brand" onclick="saveUserPrefs()">保存设置</button>
-    </div>
-  </div>
-</div>
-
-<!-- MONITOR & DAILY BRIEFING SETTINGS MODAL -->
-<div class="modal-backdrop hidden" id="monitorModal" onclick="if(event.target===this)closeModal('monitorModal')">
-  <div class="modal wide">
-    <div class="modal-head">
-      <div>
-        <h2>监控与日报样式配置</h2>
-        <div style="font-size:12px;color:var(--muted);margin-top:2px">配置保存在 Cloudflare R2，定时策略自动同步至 Shy Cron</div>
-      </div>
-      <button class="icon-btn" onclick="closeModal('monitorModal')" aria-label="关闭">
-        <svg class="ic" viewBox="0 0 24 24"><path d="M18 6L6 18M6 6l12 12"/></svg>
-      </button>
-    </div>
-    <div class="modal-body">
-      <div class="seg-tabs" id="monitorTabs" style="margin-bottom:18px">
-        <span class="seg-slider"></span>
-        <button class="seg-tab active" data-mtab="schedule" onclick="switchMonitorTab('schedule')">定时与 UP 主监控</button>
-        <button class="seg-tab" data-mtab="email" onclick="switchMonitorTab('email')">邮件样式与实时预览</button>
-      </div>
-
-      <div id="mTabSchedule">
-        <div class="m-section">
-          <div class="m-sec-head" style="margin-bottom:0">
-            <div>
-              <div class="m-sec-title">启用自动定时监控</div>
-              <div class="m-sec-sub">开启后将通过 Shy Cron 按设定时间自动触发 GitHub Actions 抓取新视频</div>
-            </div>
-            <label class="tog-switch"><input type="checkbox" id="cfgEnabled" checked><span class="tog-track"></span></label>
-          </div>
-        </div>
-
-        <div class="m-section">
-          <div class="m-sec-head">
-            <div class="m-sec-title">定时运行计划（北京时间 UTC+8）</div>
-            <span class="cron-badge" id="cronPreviewBadge">UTC Cron: 0 0,12 * * *</span>
-          </div>
-          <div class="form-grid">
-            <div class="field">
-              <label>调度模式</label>
-              <select class="ctrl" id="cfgScheduleMode" onchange="onScheduleModeChange()">
-                <option value="times">指定每天运行时间（北京时间）</option>
-                <option value="every_12h">每 12 小时（08:00 / 20:00）</option>
-                <option value="every_6h">每 6 小时运行一次</option>
-                <option value="custom">自定义 5 位 UTC Cron 表达式</option>
-              </select>
-            </div>
-            <div class="field" id="timesInputWrap">
-              <label>添加每日运行时间点</label>
-              <div class="inline-add-row">
-                <input class="ctrl" id="newTimeInput" type="time" value="08:00">
-                <button class="btn" type="button" onclick="addTimeSlot()">+ 添加</button>
-              </div>
-            </div>
-            <div class="field hidden" id="customCronWrap">
-              <label>UTC Cron（分 时 日 月 周）</label>
-              <input class="ctrl" id="cfgCustomCron" type="text" placeholder="0 0,12 * * *" oninput="updateCronBadge()">
-            </div>
-          </div>
-          <div class="chip-list" id="timeChipList"></div>
-          <div id="cronSyncNote" style="font-size:12px;color:var(--muted);margin-top:10px"></div>
-        </div>
-
-        <div class="m-section">
-          <div class="m-sec-head">
-            <div class="m-sec-title">监控 UP 主列表（<span id="upCountSpan">0</span> 位）</div>
-          </div>
-          <div class="inline-add-row">
-            <input class="ctrl" id="upAddInput" type="text" placeholder="输入 UP 主 UID 或主页链接（如 346563107 或 https://space.bilibili.com/346563107）" onkeydown="if(event.key==='Enter')addUpCreator()">
-            <button class="btn btn-primary" type="button" id="upAddBtn" onclick="addUpCreator()">解析并添加</button>
-          </div>
-          <div class="chip-list" id="upChipList"></div>
-        </div>
-
-        <div class="m-section" style="margin-bottom:0">
-          <div class="m-sec-head">
-            <div class="m-sec-title">扫描策略</div>
-          </div>
-          <div class="form-grid">
-            <div class="field">
-              <label>扫描时间窗口</label>
-              <select class="ctrl" id="cfgWindowHours">
-                <option value="24">最近 24 小时（1天）</option>
-                <option value="48">最近 48 小时（2天）</option>
-                <option value="72">最近 72 小时（3天）</option>
-                <option value="168">最近 7 天</option>
-              </select>
-            </div>
-            <div class="field">
-              <label>单次每位 UP 主最多处理条数</label>
-              <select class="ctrl" id="cfgMaxVideos">
-                <option value="2">最多 2 支</option>
-                <option value="3">最多 3 支</option>
-                <option value="5">最多 5 支</option>
-                <option value="10">最多 10 支</option>
-              </select>
-            </div>
-          </div>
-        </div>
-      </div>
-
-      <div id="mTabEmail" class="hidden">
-        <div class="m-section">
-          <div class="m-sec-head" style="margin-bottom:10px">
-            <div>
-              <div class="m-sec-title">选择日报邮件视觉样式（开源 4 套主题）</div>
-              <div class="m-sec-sub">所有目录条目与卡片标题均直接超链接跳转至 B 站原视频页</div>
-            </div>
-          </div>
-          <div class="style-grid" id="emailStyleGrid">
-            <div class="style-card" data-style="editorial" onclick="selectEmailStyle('editorial')">
-              <div class="sc-thumb"><div style="height:20px;background:linear-gradient(135deg,#0f172a,#1e293b)"></div><div style="flex:1;background:#f8fafc;padding:4px 6px"><div style="height:4px;width:65%;background:#fb7299;border-radius:2px;margin-bottom:3px"></div><div style="height:3px;width:90%;background:#cbd5e1;border-radius:2px"></div></div></div>
-              <div class="sc-name">编辑部日报</div>
-              <div class="sc-desc">深色报头 · 卡片式目录与重点高亮</div>
-            </div>
-            <div class="style-card" data-style="minimal" onclick="selectEmailStyle('minimal')">
-              <div class="sc-thumb"><div style="height:16px;background:#fff;border-bottom:2px solid #18181b"></div><div style="flex:1;background:#fff;padding:4px 6px"><div style="height:4px;width:55%;background:#18181b;border-radius:2px;margin-bottom:3px"></div><div style="height:3px;width:85%;background:#d4d4d8;border-radius:2px"></div></div></div>
-              <div class="sc-name">极简纸刊</div>
-              <div class="sc-desc">Notion 纯白排版 · 克制黑白高级感</div>
-            </div>
-            <div class="style-card" data-style="bilibili" onclick="selectEmailStyle('bilibili')">
-              <div class="sc-thumb"><div style="height:20px;background:linear-gradient(135deg,#fb7299,#ff85a7)"></div><div style="flex:1;background:#fff5f7;padding:4px 6px"><div style="height:4px;width:70%;background:#fb7299;border-radius:2px;margin-bottom:3px"></div><div style="height:3px;width:85%;background:#fecdd3;border-radius:2px"></div></div></div>
-              <div class="sc-name">B站元气粉</div>
-              <div class="sc-desc">樱花粉渐变报头 · 轻快明朗</div>
-            </div>
-            <div class="style-card" data-style="compact" onclick="selectEmailStyle('compact')">
-              <div class="sc-thumb"><div style="height:16px;background:#2563eb"></div><div style="flex:1;background:#f8fafc;padding:4px 6px"><div style="height:3px;width:95%;background:#94a3b8;margin-bottom:3px"></div><div style="height:3px;width:85%;background:#94a3b8;margin-bottom:3px"></div><div style="height:3px;width:70%;background:#94a3b8"></div></div></div>
-              <div class="sc-name">极速速览</div>
-              <div class="sc-desc">高密度列表 · 30 秒扫完所有更新</div>
-            </div>
-          </div>
-
-          <div class="preview-box">
-            <div class="preview-bar">
-              <span>实时邮件效果预览（点击目录或标题可测试原视频超链接）</span>
-              <span id="previewStyleName" style="font-weight:700;color:var(--brand-dark)">编辑部日报</span>
-            </div>
-            <div class="preview-stage" id="emailPreviewStage"></div>
-          </div>
-        </div>
-
-        <div class="m-section" style="margin-bottom:0">
-          <div class="form-grid">
-            <div class="field">
-              <label>合并发送策略</label>
-              <div style="display:flex;align-items:center;justify-content:space-between;height:38px;padding:0 12px;border:1px solid var(--border);border-radius:9px;background:var(--surface)">
-                <span style="font-size:13px">多位 UP 主合并为一封日报</span>
-                <label class="tog-switch"><input type="checkbox" id="cfgMergeEmails" checked><span class="tog-track"></span></label>
-              </div>
-            </div>
-            <div class="field">
-              <label>自定义日报接收邮箱（可选）</label>
-              <input class="ctrl" id="cfgSmtpTo" type="email" placeholder="留空则发往系统默认邮箱">
-            </div>
-          </div>
-        </div>
-      </div>
-
-      <div class="sb-toast" id="monitorToast"></div>
-    </div>
-    <div class="modal-foot">
-      <div style="display:flex;gap:8px;flex-wrap:wrap">
-        <button class="btn" type="button" onclick="triggerMonitorNow()">立即巡检</button>
-      </div>
-      <div style="display:flex;gap:8px;flex-wrap:wrap">
-        <button class="btn" type="button" onclick="closeModal('monitorModal')">关闭</button>
-        <button class="btn btn-brand" type="button" id="saveMonitorBtn" onclick="saveMonitorConfig()">保存并同步定时任务</button>
       </div>
     </div>
   </div>
@@ -3637,7 +3955,7 @@ function toggleMobileNav(forceState) {
 }
 
 // ── Spring Sliding Pill Engine (Horizontal + Vertical Rail) ──
-const SLIDER_IDS = ['segTabs', 'wlFilterTabs', 'histStatusTabs', 'folderViewTabs', 'submitModeTabs', 'monitorTabs', 'folderMgrTabs'];
+const SLIDER_IDS = ['segTabs', 'wlFilterTabs', 'histStatusTabs', 'folderViewTabs', 'submitModeTabs', 'folderMgrTabs'];
 
 function moveSlider(containerId, instant) {
   const box = document.getElementById(containerId);
@@ -3772,7 +4090,7 @@ document.addEventListener('keydown', (e) => {
     e.preventDefault(); openSubmitModal('single');
   } else if (e.key === 'Escape') {
     closeTagPopover();
-    ['submitModal', 'addMonitorModal', 'tagManagerModal', 'summaryModal', 'settingsModal', 'monitorModal'].forEach(closeModal);
+    ['submitModal', 'addMonitorModal', 'tagManagerModal', 'summaryModal', 'favPickModal', 'favRemoveModal'].forEach(closeModal);
     toggleMobileNav(false);
   }
 });
@@ -3952,7 +4270,7 @@ async function syncFromR2() {
       if (!j || !j.id) continue;
       const ex = map.get(j.id);
       if (!ex) map.set(j.id, j);
-      else map.set(j.id, { ...ex, ...j, summary: ex.summary || j.summary, transcript: ex.transcript || j.transcript, starred: Boolean(j.starred || ex.starred) });
+      else map.set(j.id, { ...ex, ...j, pic: j.pic || ex.pic || '', summary: ex.summary || j.summary, transcript: ex.transcript || j.transcript, starred: Boolean(j.starred || ex.starred) });
     }
     const merged = Array.from(map.values()).sort((a, b) => new Date(b.created_at || 0) - new Date(a.created_at || 0));
     saveJobs(merged, true);
@@ -3962,7 +4280,15 @@ async function syncFromR2() {
       if (cur) renderDetail(cur);
     }
     merged.forEach(j => { if (normStatus(j.status) === 'pending') startPolling(j.id); });
+    prewarmMissingJobCovers();
   } catch {}
+}
+
+function prewarmMissingJobCovers() {
+  const missing = getJobs().filter(j => j && j.bvid && /^BV/i.test(j.bvid) && !j.pic).slice(0, 10);
+  missing.forEach((j, idx) => {
+    setTimeout(() => { if (authUser) ensureJobCover(j); }, 250 + idx * 320);
+  });
 }
 
 // ── Navigation & Keep-Alive Hash Router (Zero Flicker) ──
@@ -3973,7 +4299,9 @@ const ROUTE_TITLES = {
   'favorites': '我的收藏',
   'history': '历史记录',
   'folder': '标签文件夹',
+  'settings': '偏好与系统设置',
 };
+let activeSettingsTab = 'general';
 
 function navigate(route, param) {
   closeTagPopover();
@@ -3998,7 +4326,7 @@ function handleHashRoute(isInit) {
     return;
   }
   const param = parts[1] ? decodeURIComponent(parts[1]) : '';
-  if (['summary', 'monitor', 'watch-later', 'favorites', 'history'].includes(r)) {
+  if (['summary', 'monitor', 'watch-later', 'favorites', 'history', 'settings'].includes(r)) {
     activateRoute(r, param, isInit);
   } else {
     activateRoute('summary', '', isInit);
@@ -4018,6 +4346,7 @@ window.addEventListener('popstate', () => { if (authUser) handleHashRoute(false)
 function getRouteScrollEl(route) {
   if (route === 'summary') return document.getElementById('wsScrollArea');
   if (route === 'monitor') return document.getElementById('monScrollArea');
+  if (route === 'settings') return document.getElementById('settingsScrollArea');
   return document.getElementById('view-' + route);
 }
 
@@ -4029,7 +4358,7 @@ async function activateRoute(route, param, isInit) {
   if (route === 'folder') activeFolderId = param || ((libraryState.folders[0] && libraryState.folders[0].id) || '');
 
   // Keep-Alive DOM visibility toggle (ZERO DOM rebuild, ZERO opacity flash!)
-  ['summary', 'monitor', 'watch-later', 'favorites', 'history', 'folder'].forEach(r => {
+  ['summary', 'monitor', 'watch-later', 'favorites', 'history', 'folder', 'settings'].forEach(r => {
     const el = document.getElementById('view-' + r);
     if (el) el.classList.toggle('hidden', r !== route);
   });
@@ -4038,6 +4367,8 @@ async function activateRoute(route, param, isInit) {
   document.querySelectorAll('#railNav .rail-item').forEach(b => b.classList.toggle('active', b.dataset.route === route));
   document.querySelectorAll('#railSummaryFolderList .folder-nav-item').forEach(b => b.classList.toggle('active', route === 'folder' && activeFolderScope === 'summary' && b.dataset.fid === activeFolderId));
   document.querySelectorAll('#railUpFolderList .folder-nav-item').forEach(b => b.classList.toggle('active', route === 'folder' && activeFolderScope === 'up' && b.dataset.fid === activeFolderId));
+  const setBtn = document.getElementById('railSettingsBtn');
+  if (setBtn) setBtn.classList.toggle('active', route === 'settings');
   moveRailNavSlider(Boolean(isInit));
 
   document.getElementById('topbarTitle').textContent = ROUTE_TITLES[route] || '摘要工作台';
@@ -4079,6 +4410,8 @@ async function activateRoute(route, param, isInit) {
   } else if (route === 'folder') {
     renderFolderPage(activeFolderId, true);
     requestAnimationFrame(() => moveSlider('folderViewTabs', true));
+  } else if (route === 'settings') {
+    await loadSettingsPage(param || activeSettingsTab || 'general');
   }
 }
 
@@ -4125,10 +4458,15 @@ function renderRailFolders() {
   }
 }
 
-// ── User Preferences ──
+// ── User Preferences & Settings Secondary Page (#/settings) ──
 function getUserPrefs() {
   try { return { ...DEFAULT_PREFS, ...JSON.parse(localStorage.getItem(LS_PREFS) || '{}') }; }
   catch { return { ...DEFAULT_PREFS }; }
+}
+function adjustFontSizeTo(px) {
+  const n = parseInt(px, 10) || 14;
+  readerFontPx = Math.max(12, Math.min(19, n));
+  document.documentElement.style.setProperty('--reader-fs', readerFontPx + 'px');
 }
 function applyUserPrefsToUi() {
   const p = getUserPrefs();
@@ -4138,39 +4476,112 @@ function applyUserPrefsToUi() {
   if (stEl) { stEl.value = p.default_email_style || 'editorial'; syncCustomSelect(stEl); }
   if (emEl && !emEl.value) emEl.value = p.default_email || '';
   if (tplEl) { tplEl.value = p.default_tpl || ''; syncCustomSelect(tplEl); onTplPreset(); }
+  if (p.reader_fs) {
+    adjustFontSizeTo(p.reader_fs);
+    const fsSel = document.getElementById('prefReaderFontSize');
+    if (fsSel) { fsSel.value = String(p.reader_fs); syncCustomSelect(fsSel); }
+  }
   if (p.default_view && ['summary', 'mindmap', 'transcript', 'split', 'chat'].includes(p.default_view)) {
     viewMode = p.default_view;
     document.querySelectorAll('#segTabs .seg-tab').forEach(b => b.classList.toggle('active', b.dataset.mode === viewMode));
   }
 }
-async function openSettingsModal() {
+function openSettingsModal(tab) {
+  navigate('settings', tab || 'general');
+}
+function switchSettingsTab(tab) {
+  const aliasMap = { schedule: 'monitor', email: 'briefing' };
+  const cleanTab = aliasMap[tab] || (['general', 'single', 'monitor', 'briefing', 'data'].includes(tab) ? tab : 'general');
+  activeSettingsTab = cleanTab;
+  document.querySelectorAll('#settingsSideNav .set-side-card').forEach(el => {
+    el.classList.toggle('active', el.dataset.stab === cleanTab);
+  });
+  ['general', 'single', 'monitor', 'briefing', 'data'].forEach(k => {
+    const pane = document.getElementById('setPane-' + k);
+    if (pane) pane.classList.toggle('hidden', k !== cleanTab);
+  });
+  const tabTitles = {
+    general: '阅读与界面偏好',
+    single: '单条摘要与邮件策略',
+    monitor: '定时监控与巡检计划',
+    briefing: '日报邮件样式与预览',
+    data: '分类库与系统数据维护',
+  };
+  document.getElementById('topbarSub').textContent = tabTitles[cleanTab] || '';
+  if (cleanTab === 'briefing') renderEmailPreview();
+  if (cleanTab === 'data') { renderSettingsFolderCards(); refreshSettingsDataStats(); }
+}
+async function loadSettingsPage(tab) {
   const p = getUserPrefs();
-  document.getElementById('prefSendEmail').checked = p.send_email_on_single !== false;
-  document.getElementById('prefEmailStyle').value = p.default_email_style || 'editorial';
-  document.getElementById('prefDefaultEmail').value = p.default_email || '';
-  document.getElementById('prefDefaultTpl').value = p.default_tpl || '';
-  document.getElementById('prefDefaultView').value = p.default_view || 'summary';
+  const sendEl = document.getElementById('prefSendEmail');
+  const styleEl = document.getElementById('prefEmailStyle');
+  const emailEl = document.getElementById('prefDefaultEmail');
+  const tplEl = document.getElementById('prefDefaultTpl');
+  const viewEl = document.getElementById('prefDefaultView');
+  const fsEl = document.getElementById('prefReaderFontSize');
+  if (sendEl) sendEl.checked = p.send_email_on_single !== false;
+  if (styleEl) styleEl.value = p.default_email_style || 'editorial';
+  if (emailEl) emailEl.value = p.default_email || '';
+  if (tplEl) tplEl.value = p.default_tpl || '';
+  if (viewEl) viewEl.value = p.default_view || 'summary';
+  if (fsEl) fsEl.value = String(p.reader_fs || readerFontPx || 14);
   syncAllCustomSelects();
-  openModal('settingsModal');
+  switchSettingsTab(tab || activeSettingsTab || 'general');
+  await loadMonitorConfig();
+  renderSettingsFolderCards();
+  refreshSettingsDataStats();
+}
+function renderSettingsFolderCards() {
+  const box = document.getElementById('settingsFolderCards');
+  if (!box) return;
+  const scopes = [
+    { key: 'summary', title: '摘要工作台分类', sub: '用于归档与筛选单条视频 AI 摘要', list: libraryState.summary_folders || [] },
+    { key: 'up', title: '监控 UP 主分类', sub: '用于按领域分组查看监控 UP 主动态', list: libraryState.up_folders || [] },
+    { key: 'fav', title: '收藏文件夹（支持多选）', sub: '用于我的收藏叠层卡片与多选归类', list: libraryState.fav_folders || [] },
+  ];
+  box.innerHTML = scopes.map(sc => {
+    const chips = sc.list.map(f => '<span class="mini-tag" style="padding:2px 8px"><span class="folder-dot" style="width:6px;height:6px;background:' + esc(f.color) + '"></span>' + esc(f.name) + '</span>').join('');
+    return '<div style="border:1px solid var(--border);border-radius:11px;padding:14px;background:var(--bg);display:flex;flex-direction:column;gap:8px">' +
+      '<div style="display:flex;align-items:center;justify-content:space-between;gap:8px">' +
+        '<div style="font-size:13.5px;font-weight:700;color:var(--text)">' + esc(sc.title) + ' (' + sc.list.length + ')</div>' +
+        '<button class="btn btn-sm" type="button" onclick="openTagManagerModal(\'' + sc.key + '\')">管理 / 新建</button>' +
+      '</div>' +
+      '<div style="font-size:11.5px;color:var(--muted)">' + esc(sc.sub) + '</div>' +
+      '<div style="display:flex;flex-wrap:wrap;gap:5px;margin-top:2px">' + (chips || '<span style="font-size:11.5px;color:var(--muted)">暂无分类</span>') + '</div>' +
+    '</div>';
+  }).join('');
+}
+async function refreshSettingsDataStats() {
   const badge = document.getElementById('sysStatsBadge');
-  badge.textContent = '读取中...';
+  if (!badge) return;
+  badge.textContent = '正在读取系统状态...';
   try {
     const s = await fetch('/api/stats').then(r => r.json());
-    badge.textContent = '存储: ' + String(s.mode || 'r2').toUpperCase() + ' · 待处理 ' + (s.pending_jobs || 0) + ' · 已归档 ' + (s.completed_jobs || 0);
+    badge.textContent = '存储引擎: ' + String(s.mode || 'r2').toUpperCase() + ' · 云端待处理任务 ' + (s.pending_jobs || 0) + ' 条 · 云端已归档结果 ' + (s.completed_jobs || 0) + ' 条 · 本地历史记录 ' + getJobs().length + ' 条';
   } catch { badge.textContent = '状态读取失败'; }
 }
+function exportLibraryBackupJson() {
+  const blob = new Blob([JSON.stringify({ library: libraryState, exported_at: new Date().toISOString() }, null, 2)], { type: 'application/json;charset=utf-8' });
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = 'bilisum-library-backup.json';
+  a.click();
+  setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+  toast('已导出分类与收藏夹备份 JSON');
+}
 function saveUserPrefs() {
+  const fsVal = parseInt((document.getElementById('prefReaderFontSize') && document.getElementById('prefReaderFontSize').value) || String(readerFontPx), 10) || 14;
   const prefs = {
     send_email_on_single: document.getElementById('prefSendEmail').checked,
     default_email_style: document.getElementById('prefEmailStyle').value || 'editorial',
     default_email: document.getElementById('prefDefaultEmail').value.trim(),
     default_tpl: document.getElementById('prefDefaultTpl').value || '',
     default_view: document.getElementById('prefDefaultView').value || 'summary',
+    reader_fs: fsVal,
   };
   localStorage.setItem(LS_PREFS, JSON.stringify(prefs));
   applyUserPrefsToUi();
   applyViewMode();
-  closeModal('settingsModal');
   toast('偏好设置已保存');
 }
 function clearLocalCaches() { clearFeedCache(); toast('已清空 UP 主动态封面缓存'); }
@@ -4457,52 +4868,339 @@ function toggleWatchLaterVideo(videoObj) {
   return added;
 }
 
-function toggleFavoriteVideo(videoObj) {
-  if (!videoObj || !videoObj.bvid) return false;
+const videoMetaRegistry = new Map();
+let favPickCurrentBvid = '';
+let favPickSelectedSet = new Set();
+let favLongPressTimer = null;
+let favLongPressConsumedAt = 0;
+
+function rememberVideoMeta(v) {
+  if (!v || !v.bvid) return;
+  const ex = videoMetaRegistry.get(v.bvid) || {};
+  videoMetaRegistry.set(v.bvid, {
+    bvid: v.bvid,
+    job_id: v.job_id || ex.job_id || '',
+    mid: Number(v.mid || ex.mid) || 0,
+    title: v.title || ex.title || v.bvid,
+    author: v.author || v.owner || ex.author || '',
+    face: v.face || ex.face || '',
+    pic: (v.pic || ex.pic || '').replace(/^http:\/\//, 'https://'),
+    duration: v.duration || ex.duration || '',
+    play: Number(v.play || ex.play) || 0,
+    danmaku: Number(v.danmaku || ex.danmaku) || 0,
+    created: Number(v.created || ex.created) || 0,
+    url: v.url || v.video_url || ex.url || ('https://www.bilibili.com/video/' + v.bvid),
+  });
+}
+
+function getVideoMetaByBvid(bvid) {
+  if (!bvid) return null;
+  if (videoMetaRegistry.has(bvid)) return videoMetaRegistry.get(bvid);
+  const fromFav = (libraryState.favorites || []).find(v => v.bvid === bvid);
+  if (fromFav) { rememberVideoMeta(fromFav); return videoMetaRegistry.get(bvid); }
+  const fromWl = (libraryState.watch_later || []).find(v => v.bvid === bvid);
+  if (fromWl) { rememberVideoMeta(fromWl); return videoMetaRegistry.get(bvid); }
+  const fromFeed = currentFeedVideos.find(v => v.bvid === bvid) || folderFeedVideos.find(v => v.bvid === bvid);
+  if (fromFeed) { rememberVideoMeta(fromFeed); return videoMetaRegistry.get(bvid); }
+  const fromJob = getJobs().find(j => j.bvid === bvid);
+  if (fromJob) {
+    rememberVideoMeta({ bvid: fromJob.bvid, job_id: fromJob.id, title: fromJob.title, author: fromJob.owner, duration: fromJob.duration, pic: fromJob.pic || '', url: fromJob.video_url });
+    return videoMetaRegistry.get(bvid);
+  }
+  return { bvid, title: bvid, author: '', pic: '', duration: '', url: 'https://www.bilibili.com/video/' + bvid };
+}
+
+function showFavAddedToast(bvid, folderName) {
+  const el = document.getElementById('globalToast');
+  if (!el) return;
+  el.innerHTML = '<span>已加入「' + esc(folderName || '默认收藏夹') + '」</span>' +
+    '<button type="button" class="toast-switch-btn" onclick="openFavMultiModal(\'' + esc(bvid) + '\')">切换收藏夹</button>';
+  el.className = 'global-toast show';
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => { el.classList.remove('show'); }, 5200);
+}
+
+function ensureVideoInFavoritesList(videoObj) {
+  if (!videoObj || !videoObj.bvid) return;
+  rememberVideoMeta(videoObj);
+  const meta = getVideoMetaByBvid(videoObj.bvid);
   const list = libraryState.favorites || [];
   const idx = list.findIndex(v => v.bvid === videoObj.bvid);
   const jobs = getJobs();
-  const jobIdx = jobs.findIndex(j => j.bvid === videoObj.bvid || (videoObj.job_id && j.id === videoObj.job_id));
-  const wasOn = idx >= 0 || (jobIdx >= 0 && jobs[jobIdx].starred);
-  let added = false;
-
-  if (wasOn) {
-    if (idx >= 0) list.splice(idx, 1);
-    if (jobIdx >= 0) { jobs[jobIdx].starred = false; saveJobs(jobs); }
-  } else {
+  const jobIdx = jobs.findIndex(j => j.bvid === videoObj.bvid || (meta.job_id && j.id === meta.job_id));
+  if (idx < 0) {
     list.unshift({
-      bvid: videoObj.bvid, job_id: (jobIdx >= 0 ? jobs[jobIdx].id : '') || videoObj.job_id || '',
-      mid: Number(videoObj.mid) || 0, title: videoObj.title || videoObj.bvid,
-      author: videoObj.author || videoObj.owner || '', face: videoObj.face || '',
-      pic: videoObj.pic || '', duration: videoObj.duration || '',
-      play: Number(videoObj.play) || 0, danmaku: Number(videoObj.danmaku) || 0,
-      created: Number(videoObj.created) || 0,
-      url: videoObj.url || ('https://www.bilibili.com/video/' + videoObj.bvid),
+      bvid: meta.bvid,
+      job_id: (jobIdx >= 0 ? jobs[jobIdx].id : '') || meta.job_id || '',
+      mid: Number(meta.mid) || 0,
+      title: meta.title || meta.bvid,
+      author: meta.author || '',
+      face: meta.face || '',
+      pic: meta.pic || '',
+      duration: meta.duration || '',
+      play: Number(meta.play) || 0,
+      danmaku: Number(meta.danmaku) || 0,
+      created: Number(meta.created) || 0,
+      url: meta.url || ('https://www.bilibili.com/video/' + meta.bvid),
       added_at: new Date().toISOString(),
     });
-    if (jobIdx >= 0) { jobs[jobIdx].starred = true; saveJobs(jobs); }
-    added = true;
   }
   libraryState.favorites = list;
-  saveLibraryLocalAndCloud();
-  syncFeedCardQuickStates(videoObj.bvid);
-  refreshAllLibraryViews();
-  toast(added ? '已加入「我的收藏」' : '已取消收藏');
-  return added;
+  if (jobIdx >= 0 && !jobs[jobIdx].starred) {
+    jobs[jobIdx].starred = true;
+    saveJobs(jobs);
+  }
 }
+
+function toggleFavoriteVideo(videoObj) {
+  if (Date.now() - favLongPressConsumedAt < 650) return false;
+  if (!videoObj || !videoObj.bvid) return false;
+  rememberVideoMeta(videoObj);
+  const bvid = videoObj.bvid;
+  const list = libraryState.favorites || [];
+  const idx = list.findIndex(v => v.bvid === bvid);
+  const jobs = getJobs();
+  const jobIdx = jobs.findIndex(j => j.bvid === bvid || (videoObj.job_id && j.id === videoObj.job_id));
+  const wasOn = idx >= 0 || (jobIdx >= 0 && jobs[jobIdx].starred);
+
+  if (wasOn) {
+    promptRemoveFavVideo(bvid, '');
+    return false;
+  }
+
+  // Default add to 默认收藏夹 (fav_default or first fav_folder) + show interactive prompt toast to switch folders
+  const folders = libraryState.fav_folders || [];
+  const defFolder = folders.find(f => f.id === 'fav_default') || folders[0] || { id: 'fav_default', name: '默认收藏夹', color: '#FB7299' };
+  ensureVideoInFavoritesList(videoObj);
+  libraryState.fav_folder_map[bvid] = [defFolder.id];
+  saveLibraryLocalAndCloud();
+  syncFeedCardQuickStates(bvid);
+  refreshAllLibraryViews();
+  showFavAddedToast(bvid, defFolder.name);
+  return true;
+}
+
+function openFavMultiModal(bvid) {
+  if (!bvid) return;
+  const toastEl = document.getElementById('globalToast');
+  if (toastEl) toastEl.classList.remove('show');
+  closeModal('favRemoveModal');
+  favPickCurrentBvid = bvid;
+  const meta = getVideoMetaByBvid(bvid);
+  const titleEl = document.getElementById('favPickVideoTitle');
+  if (titleEl) titleEl.textContent = (meta && meta.title && meta.title !== bvid) ? ('视频：' + meta.title) : ('视频 ID：' + bvid + '（可多选归入多个收藏夹）');
+  const folders = libraryState.fav_folders || [];
+  const defId = (folders.find(f => f.id === 'fav_default') || folders[0] || {}).id || 'fav_default';
+  const isFav = isFavBvid(bvid) || Boolean(getJobs().find(j => j.bvid === bvid && j.starred));
+  const currentIds = isFav ? getFavFolderIds(bvid) : [defId];
+  favPickSelectedSet = new Set(currentIds);
+  const inp = document.getElementById('favPickNewName');
+  if (inp) inp.value = '';
+  renderFavMultiList();
+  openModal('favPickModal');
+}
+
+function renderFavMultiList() {
+  const box = document.getElementById('favPickList');
+  if (!box) return;
+  const folders = libraryState.fav_folders || [];
+  const allFavs = getAllFavoritesMerged();
+  box.innerHTML = folders.map(f => {
+    const sel = favPickSelectedSet.has(f.id);
+    const cnt = allFavs.filter(v => getFavFolderIds(v.bvid).includes(f.id)).length;
+    return '<div class="fav-pick-row' + (sel ? ' selected' : '') + '" onclick="toggleFavPickRow(\'' + esc(f.id) + '\')">' +
+      '<div class="fav-pick-left">' +
+        '<span class="fav-pick-chk">' + (sel ? '&#10003;' : '') + '</span>' +
+        '<span class="folder-dot" style="width:10px;height:10px;background:' + esc(f.color) + '"></span>' +
+        '<span style="font-size:13.5px;font-weight:700;color:var(--text)">' + esc(f.name) + '</span>' +
+      '</div>' +
+      '<span style="font-size:12px;color:var(--muted)">' + cnt + ' 条收藏</span>' +
+    '</div>';
+  }).join('');
+}
+
+function toggleFavPickRow(fid) {
+  if (favPickSelectedSet.has(fid)) favPickSelectedSet.delete(fid);
+  else favPickSelectedSet.add(fid);
+  renderFavMultiList();
+}
+
+function quickCreateFavFolderInPicker() {
+  const inp = document.getElementById('favPickNewName');
+  const name = ((inp && inp.value) || '').trim().slice(0, 16);
+  if (!name) { toast('请输入新收藏文件夹名称', true); return; }
+  const arr = getScopeFolders('fav');
+  const existing = arr.find(f => f.name === name);
+  if (existing) {
+    favPickSelectedSet.add(existing.id);
+    inp.value = '';
+    renderFavMultiList();
+    return;
+  }
+  const id = 'fa_' + Date.now().toString(36) + '_' + Math.random().toString(36).slice(2, 5);
+  const color = FOLDER_COLORS[arr.length % FOLDER_COLORS.length];
+  arr.push({ id, name, color });
+  setScopeFolders('fav', arr);
+  favPickSelectedSet.add(id);
+  inp.value = '';
+  saveLibraryLocalAndCloud();
+  renderFavMultiList();
+  toast('已新建并勾选收藏夹：' + name);
+}
+
+function saveFavMultiModal() {
+  const bvid = favPickCurrentBvid;
+  if (!bvid) { closeModal('favPickModal'); return; }
+  const chosen = Array.from(favPickSelectedSet);
+  if (!chosen.length) {
+    removeVideoFromAllFavFolders(bvid);
+    closeModal('favPickModal');
+    return;
+  }
+  const meta = getVideoMetaByBvid(bvid);
+  ensureVideoInFavoritesList(meta);
+  libraryState.fav_folder_map[bvid] = chosen;
+  saveLibraryLocalAndCloud();
+  syncFeedCardQuickStates(bvid);
+  refreshAllLibraryViews();
+  closeModal('favPickModal');
+  const names = chosen.map(id => { const f = getFolderById(id, 'fav'); return f ? f.name : ''; }).filter(Boolean);
+  toast('已收藏至：' + names.join('、'));
+}
+
+function removeCurrentPickFromAllFavs() {
+  const bvid = favPickCurrentBvid;
+  closeModal('favPickModal');
+  if (bvid) removeVideoFromAllFavFolders(bvid);
+}
+
+function promptRemoveFavVideo(bvid, folderId) {
+  if (!bvid) return;
+  const meta = getVideoMetaByBvid(bvid);
+  const folderIds = getFavFolderIds(bvid);
+  const folders = folderIds.map(id => getFolderById(id, 'fav')).filter(Boolean);
+  const targetFolder = folderId ? getFolderById(folderId, 'fav') : (folders.length === 1 ? folders[0] : null);
+  const folderNames = folders.map(f => '「' + f.name + '」').join('、') || '「默认收藏夹」';
+
+  const bodyEl = document.getElementById('favRemoveBody');
+  const footEl = document.getElementById('favRemoveFoot');
+  if (!bodyEl || !footEl) return;
+
+  let bodyHtml = '<div style="font-size:14px;font-weight:700;color:var(--text);margin-bottom:8px;line-height:1.45">' + esc((meta && meta.title) || bvid) + '</div>';
+  bodyHtml += '<div style="font-size:12.5px;color:var(--soft);line-height:1.6;margin-bottom:14px">该视频当前保存在 ' + folders.length + ' 个收藏夹中：<strong>' + esc(folderNames) + '</strong></div>';
+
+  if (folders.length > 1) {
+    bodyHtml += '<div style="font-size:12px;color:var(--muted);margin-bottom:8px">移除单个收藏夹内的视频不会影响其他收藏夹中的同一视频，你也可以选择从所有收藏夹彻底移除：</div>';
+    bodyHtml += '<div style="display:flex;flex-direction:column;gap:8px">';
+    folders.forEach(f => {
+      const isCurrent = targetFolder && targetFolder.id === f.id;
+      bodyHtml += '<button type="button" class="btn' + (isCurrent ? ' btn-primary' : '') + '" style="justify-content:space-between;width:100%" onclick="removeVideoFromSingleFavFolder(\'' + esc(bvid) + '\',\'' + esc(f.id) + '\')">' +
+        '<span style="display:inline-flex;align-items:center;gap:7px"><span class="folder-dot" style="background:' + esc(f.color) + '"></span><span>仅从「' + esc(f.name) + '」移除</span></span>' +
+        '<span style="font-size:11.5px;opacity:.8">保留其余 ' + (folders.length - 1) + ' 个收藏夹</span>' +
+      '</button>';
+    });
+    bodyHtml += '</div>';
+  } else if (targetFolder) {
+    bodyHtml += '<div style="font-size:12.5px;color:var(--muted)">该视频目前仅在「' + esc(targetFolder.name) + '」中，移除后将取消收藏，或你可以先切换到其他收藏夹。</div>';
+  }
+
+  bodyEl.innerHTML = bodyHtml;
+  footEl.innerHTML =
+    '<button type="button" class="btn" onclick="closeModal(\'favRemoveModal\');openFavMultiModal(\'' + esc(bvid) + '\')">多选切换收藏夹</button>' +
+    '<div style="display:flex;gap:8px;flex-wrap:wrap">' +
+      '<button type="button" class="btn" onclick="closeModal(\'favRemoveModal\')">取消</button>' +
+      (targetFolder && folders.length > 1
+        ? '<button type="button" class="btn btn-primary" onclick="removeVideoFromSingleFavFolder(\'' + esc(bvid) + '\',\'' + esc(targetFolder.id) + '\')">仅从「' + esc(targetFolder.name) + '」移除</button>'
+        : '') +
+      '<button type="button" class="btn" style="background:var(--err);color:#fff;border-color:transparent" onclick="removeVideoFromAllFavFolders(\'' + esc(bvid) + '\')">' + (folders.length > 1 ? '从所有收藏夹彻底移除' : '确认移除收藏') + '</button>' +
+    '</div>';
+  openModal('favRemoveModal');
+}
+
+function removeVideoFromSingleFavFolder(bvid, folderId) {
+  closeModal('favRemoveModal');
+  if (!bvid || !folderId) return;
+  const f = getFolderById(folderId, 'fav');
+  const cur = getFavFolderIds(bvid).filter(id => id !== folderId);
+  if (cur.length === 0) {
+    removeVideoFromAllFavFolders(bvid, f ? ('已从「' + f.name + '」移除') : '已移除收藏');
+    return;
+  }
+  libraryState.fav_folder_map[bvid] = cur;
+  saveLibraryLocalAndCloud();
+  syncFeedCardQuickStates(bvid);
+  refreshAllLibraryViews();
+  const remainNames = cur.map(id => { const x = getFolderById(id, 'fav'); return x ? x.name : ''; }).filter(Boolean);
+  toast('已从「' + ((f && f.name) || '当前收藏夹') + '」移除（仍保留在：' + remainNames.join('、') + '）');
+}
+
+function removeVideoFromAllFavFolders(bvid, customMsg) {
+  closeModal('favRemoveModal');
+  if (!bvid) return;
+  libraryState.favorites = (libraryState.favorites || []).filter(v => v.bvid !== bvid);
+  delete libraryState.fav_folder_map[bvid];
+  const jobs = getJobs();
+  let jobChanged = false;
+  jobs.forEach(j => { if (j.bvid === bvid && j.starred) { j.starred = false; jobChanged = true; } });
+  if (jobChanged) saveJobs(jobs);
+  saveLibraryLocalAndCloud();
+  syncFeedCardQuickStates(bvid);
+  refreshAllLibraryViews();
+  toast(customMsg || '已从所有收藏夹中移除该视频');
+}
+
+// Global Long-Press (~420ms) & Right-Click on any [data-fav-bvid] button -> open Multi-Select Favorite Folder Modal
+(function initFavLongPress() {
+  let startX = 0, startY = 0;
+  const clearTimer = () => { if (favLongPressTimer) { clearTimeout(favLongPressTimer); favLongPressTimer = null; } };
+  document.addEventListener('pointerdown', (e) => {
+    if (e.button && e.button !== 0) return;
+    const btn = e.target.closest && e.target.closest('[data-fav-bvid]');
+    if (!btn) return;
+    const bvid = (btn.dataset.favBvid || '').trim();
+    if (!bvid) return;
+    startX = e.clientX || 0; startY = e.clientY || 0;
+    clearTimer();
+    favLongPressTimer = setTimeout(() => {
+      favLongPressTimer = null;
+      favLongPressConsumedAt = Date.now();
+      openFavMultiModal(bvid);
+    }, 420);
+  }, true);
+  document.addEventListener('pointermove', (e) => {
+    if (!favLongPressTimer) return;
+    if (Math.hypot((e.clientX || 0) - startX, (e.clientY || 0) - startY) > 10) clearTimer();
+  }, true);
+  document.addEventListener('pointerup', clearTimer, true);
+  document.addEventListener('pointercancel', clearTimer, true);
+  document.addEventListener('contextmenu', (e) => {
+    const btn = e.target.closest && e.target.closest('[data-fav-bvid]');
+    if (!btn) return;
+    const bvid = (btn.dataset.favBvid || '').trim();
+    if (!bvid) return;
+    e.preventDefault();
+    clearTimer();
+    favLongPressConsumedAt = Date.now();
+    openFavMultiModal(bvid);
+  }, true);
+})();
 
 function toggleWatchLaterCurrent() {
   const job = getJobs().find(j => j.id === selectedJobId);
   if (job) toggleWatchLaterVideo({ bvid: job.bvid, job_id: job.id, title: job.title, author: job.owner, duration: job.duration, pic: job.pic || '', url: job.video_url });
 }
 function toggleStarCurrent() {
+  if (Date.now() - favLongPressConsumedAt < 650) return;
   const job = getJobs().find(j => j.id === selectedJobId);
   if (job) toggleFavoriteVideo({ bvid: job.bvid, job_id: job.id, title: job.title, author: job.owner, duration: job.duration, pic: job.pic || '', url: job.video_url });
 }
 function updateStarBtn(job) {
   const btn = document.getElementById('starBtn'), txt = document.getElementById('starBtnText');
   const on = isJobFavorited(job);
-  if (btn) btn.classList.toggle('starred', on);
+  if (btn) {
+    btn.classList.toggle('starred', on);
+    btn.dataset.favBvid = (job && job.bvid) || '';
+  }
   if (txt) txt.textContent = on ? '已收藏' : '收藏';
 }
 function updateWatchLaterBtn(job) {
@@ -5096,7 +5794,81 @@ function renderStepper(job) {
   bar.innerHTML = steps.map((s, i) => '<span class="' + (s.done ? 'st-item done' : (s.active ? 'st-item active' : 'st-item')) + '"><span class="st-dot">' + (s.done ? '&#10003;' : (i + 1)) + '</span><span>' + esc(s.name) + '</span></span><span class="st-line' + (s.done ? ' done' : '') + '"></span>').join('') + badgeHtml;
 }
 
+const coverFetchInFlight = new Set();
+function findKnownCoverByBvid(bvid) {
+  if (!bvid) return '';
+  const reg = videoMetaRegistry.get(bvid);
+  if (reg && reg.pic) return reg.pic;
+  const f1 = (libraryState.favorites || []).find(v => v.bvid === bvid && v.pic);
+  if (f1) return f1.pic;
+  const f2 = (libraryState.watch_later || []).find(v => v.bvid === bvid && v.pic);
+  if (f2) return f2.pic;
+  const f3 = currentFeedVideos.find(v => v.bvid === bvid && v.pic) || folderFeedVideos.find(v => v.bvid === bvid && v.pic);
+  if (f3) return f3.pic;
+  return '';
+}
+function applyDetailCoverDom(picUrl, fallbackText, durationText) {
+  const imgEl = document.getElementById('dCoverImg');
+  const fbEl = document.getElementById('dCoverFb');
+  const durEl = document.getElementById('dCoverDur');
+  if (durEl) {
+    if (durationText) { durEl.textContent = durationText; durEl.classList.remove('hidden'); }
+    else durEl.classList.add('hidden');
+  }
+  if (!imgEl || !fbEl) return;
+  if (picUrl) {
+    const clean = picUrl.replace(/^http:\/\//, 'https://');
+    const src = clean.includes('@') ? clean : (clean + '@672w_378h_1c.webp');
+    imgEl.src = src;
+    imgEl.classList.remove('hidden');
+    fbEl.classList.add('hidden');
+  } else {
+    imgEl.classList.add('hidden');
+    fbEl.textContent = (fallbackText || 'B站视频').slice(0, 18);
+    fbEl.classList.remove('hidden');
+  }
+}
+async function ensureJobCover(job) {
+  if (!job || !job.bvid || !/^BV/i.test(job.bvid)) return;
+  if (job.pic) return;
+  const known = findKnownCoverByBvid(job.bvid);
+  if (known) {
+    const jobs = getJobs();
+    let changed = false;
+    jobs.forEach(j => { if (j.bvid === job.bvid && !j.pic) { j.pic = known; changed = true; } });
+    if (changed) saveJobs(jobs);
+    if (selectedJobId === job.id) applyDetailCoverDom(known, job.title || job.bvid, job.duration || '');
+    return;
+  }
+  if (coverFetchInFlight.has(job.bvid)) return;
+  coverFetchInFlight.add(job.bvid);
+  try {
+    const r = await apiFetch('/api/bili-cover?bvid=' + encodeURIComponent(job.bvid));
+    if (!r.ok) return;
+    const d = await r.json();
+    if (d && d.ok && d.pic) {
+      const jobs = getJobs();
+      let changed = false;
+      jobs.forEach(j => {
+        if (j.bvid === job.bvid) {
+          if (!j.pic) { j.pic = d.pic; changed = true; }
+          if ((!j.title || j.title === j.bvid) && d.title) { j.title = d.title; changed = true; }
+          if (!j.owner && d.owner) { j.owner = d.owner; changed = true; }
+          if (!j.duration && d.duration) { j.duration = d.duration; changed = true; }
+        }
+      });
+      if (changed) saveJobs(jobs);
+      const cur = getJobs().find(j => j.id === selectedJobId);
+      if (cur && cur.bvid === job.bvid) {
+        applyDetailCoverDom(d.pic, cur.title || cur.bvid, cur.duration || d.duration || '');
+      }
+    }
+  } catch {}
+  finally { coverFetchInFlight.delete(job.bvid); }
+}
+
 function renderDetail(job) {
+  rememberVideoMeta({ bvid: job.bvid, job_id: job.id, title: job.title, author: job.owner, duration: job.duration, pic: job.pic || '', url: job.video_url });
   renderStepper(job);
   updateStarBtn(job);
   updateWatchLaterBtn(job);
@@ -5106,6 +5878,11 @@ function renderDetail(job) {
   titleLink.textContent = job.title || job.bvid || '处理中...';
   titleLink.href = videoUrl;
   document.getElementById('dWatchLink').href = videoUrl;
+  const coverLink = document.getElementById('dCoverLink');
+  if (coverLink) coverLink.href = videoUrl;
+  const knownPic = job.pic || findKnownCoverByBvid(job.bvid);
+  applyDetailCoverDom(knownPic, job.title || job.bvid, job.duration || '');
+  if (!job.pic) ensureJobCover(job);
 
   const pills = [];
   if (job.owner) pills.push('<span class="meta-pill">UP主：' + esc(job.owner) + '</span>');
@@ -5384,6 +6161,7 @@ async function quickRemoveMonitorUp(mid) {
 }
 
 function buildVideoCardHtml(v, idx, opts) {
+  rememberVideoMeta(v);
   const o = opts || {};
   const poolName = o.pool || 'feed';
   const jobs = getJobs();
@@ -5412,8 +6190,8 @@ function buildVideoCardHtml(v, idx, opts) {
       '</a>' +
       chkHtml +
       '<div class="v-quick-acts' + ((wlOn || favOn) ? ' has-active' : '') + '">' +
-        '<button type="button" class="v-qbtn v-qbtn-wl' + (wlOn ? ' wl-on' : '') + '" title="' + (wlOn ? '移出稍后再看' : '加入稍后再看') + '" onclick="event.preventDefault();event.stopPropagation();togglePoolVideoWl(\'' + poolName + '\',' + idx + ')">' + SVG_CLOCK_SM + '</button>' +
-        '<button type="button" class="v-qbtn v-qbtn-fav' + (favOn ? ' fav-on' : '') + '" title="' + (favOn ? '取消收藏' : '加入收藏') + '" onclick="event.preventDefault();event.stopPropagation();togglePoolVideoFav(\'' + poolName + '\',' + idx + ')">' + SVG_STAR_LINE + '</button>' +
+        '<button type="button" class="v-qbtn v-qbtn-wl' + (wlOn ? ' wl-on' : '') + '" title="稍后再看" onclick="event.preventDefault();event.stopPropagation();togglePoolVideoWl(\'' + poolName + '\',' + idx + ')">' + SVG_CLOCK_SM + '<span>稍后再看</span></button>' +
+        '<button type="button" class="v-qbtn v-qbtn-fav' + (favOn ? ' fav-on' : '') + '" data-fav-bvid="' + esc(v.bvid) + '" title="收藏（长按可多选收藏夹）" onclick="event.preventDefault();event.stopPropagation();togglePoolVideoFav(\'' + poolName + '\',' + idx + ')">' + SVG_STAR_LINE + '<span>收藏</span></button>' +
       '</div>' +
     '</div>' +
     '<div class="v-body">' + avaHtml +
@@ -5464,8 +6242,8 @@ function syncFeedCardQuickStates(bvid) {
   document.querySelectorAll('.v-card[data-bvid="' + bvid.replace(/"/g, '') + '"]').forEach(card => {
     const acts = card.querySelector('.v-quick-acts'), wlB = card.querySelector('.v-qbtn-wl'), favB = card.querySelector('.v-qbtn-fav');
     if (acts) acts.classList.toggle('has-active', wlOn || favOn);
-    if (wlB) { wlB.classList.toggle('wl-on', wlOn); wlB.title = wlOn ? '移出稍后再看' : '加入稍后再看'; }
-    if (favB) { favB.classList.toggle('fav-on', favOn); favB.title = favOn ? '取消收藏' : '加入收藏'; }
+    if (wlB) { wlB.classList.toggle('wl-on', wlOn); wlB.title = '稍后再看'; }
+    if (favB) { favB.classList.toggle('fav-on', favOn); favB.title = '收藏（长按可多选收藏夹）'; }
   });
 }
 
@@ -5733,9 +6511,9 @@ function renderFavoritesPage() {
             '</div>' +
             '<div class="fav-item-acts">' +
               (hasSum ? '<button class="btn btn-sm btn-primary" onclick="selectJob(\'' + esc(matchedJob.id) + '\',true)">打开摘要</button>' : '<button class="btn btn-sm btn-primary" onclick="submitPoolVideo(\'fav\',' + gIdx + ')">一键总结</button>') +
-              '<button class="btn btn-sm" onclick="openTagPopover(this,\'fav\',\'' + esc(v.bvid) + '\')">移动收藏夹</button>' +
-              '<a class="btn btn-sm" href="' + esc(vUrl) + '" target="_blank" rel="noopener">原视频 ↗</a>' +
-              '<button class="arch-ic-btn del" title="取消收藏" onclick="togglePoolVideoFav(\'fav\',' + gIdx + ')">' + SVG_TRASH_SM + '</button>' +
+              '<button class="btn btn-sm" onclick="openFavMultiModal(\'' + esc(v.bvid) + '\')">切换收藏夹</button>' +
+              '<a class="btn btn-sm" href="' + esc(vUrl) + '" target="_blank" rel="noopener">在B站观看</a>' +
+              '<button class="arch-ic-btn del" title="移除收藏" onclick="promptRemoveFavVideo(\'' + esc(v.bvid) + '\',\'' + esc(f.id) + '\')">' + SVG_TRASH_SM + '</button>' +
             '</div>' +
           '</div>';
         }).join('')
@@ -5849,8 +6627,8 @@ function buildArchiveCardHtml(j, showBatchChk) {
       '<span style="font-size:11.5px;color:var(--muted)">' + esc(fmtShortDate(j.created_at)) + '</span>' +
       '<div class="arch-acts">' +
         '<button type="button" class="arch-ic-btn" title="添加标签" onclick="openTagPopover(this,\'job\',\'' + esc(jobTagKey(j)) + '\')">' + SVG_TAG_SM + '</button>' +
-        '<button type="button" class="arch-ic-btn' + (wlOn ? ' wl-on' : '') + '" title="稍后再看" onclick="toggleWatchLaterVideo({bvid:\'' + esc(j.bvid) + '\',job_id:\'' + esc(j.id) + '\',title:' + JSON.stringify(j.title || '') + ',author:' + JSON.stringify(j.owner || '') + ',duration:' + JSON.stringify(j.duration || '') + '})">' + SVG_CLOCK_SM + '</button>' +
-        '<button type="button" class="arch-ic-btn' + (favOn ? ' fav-on' : '') + '" title="收藏" onclick="toggleFavoriteVideo({bvid:\'' + esc(j.bvid) + '\',job_id:\'' + esc(j.id) + '\',title:' + JSON.stringify(j.title || '') + ',author:' + JSON.stringify(j.owner || '') + ',duration:' + JSON.stringify(j.duration || '') + '})">' + SVG_STAR_LINE + '</button>' +
+        '<button type="button" class="arch-ic-btn' + (wlOn ? ' wl-on' : '') + '" title="稍后再看" onclick="toggleWatchLaterVideo({bvid:\'' + esc(j.bvid) + '\',job_id:\'' + esc(j.id) + '\',title:' + JSON.stringify(j.title || '') + ',author:' + JSON.stringify(j.owner || '') + ',duration:' + JSON.stringify(j.duration || '') + ',pic:' + JSON.stringify(j.pic || '') + '})">' + SVG_CLOCK_SM + '</button>' +
+        '<button type="button" class="arch-ic-btn' + (favOn ? ' fav-on' : '') + '" data-fav-bvid="' + esc(j.bvid) + '" title="收藏（长按可多选收藏夹）" onclick="toggleFavoriteVideo({bvid:\'' + esc(j.bvid) + '\',job_id:\'' + esc(j.id) + '\',title:' + JSON.stringify(j.title || '') + ',author:' + JSON.stringify(j.owner || '') + ',duration:' + JSON.stringify(j.duration || '') + ',pic:' + JSON.stringify(j.pic || '') + '})">' + SVG_STAR_LINE + '</button>' +
         '<button type="button" class="arch-ic-btn del" title="删除" onclick="deleteOneJob(\'' + esc(j.id) + '\')">' + SVG_TRASH_SM + '</button>' +
       '</div>' +
     '</div>' +
@@ -6012,18 +6790,9 @@ async function loadMoreFolderUpsFeed() {
   } catch { folderPagination.loading = false; renderFolderFeedFooter(); }
 }
 
-// ── Monitor Settings Modal (Schedule + Email Styles + Shy Cron) ──
-async function openMonitorModal() {
-  openModal('monitorModal');
-  requestAnimationFrame(() => moveSlider('monitorTabs', true));
-  await loadMonitorConfig();
-}
-function switchMonitorTab(tab) {
-  document.querySelectorAll('#monitorTabs .seg-tab').forEach(b => b.classList.toggle('active', b.dataset.mtab === tab));
-  moveSlider('monitorTabs');
-  document.getElementById('mTabSchedule').classList.toggle('hidden', tab !== 'schedule');
-  document.getElementById('mTabEmail').classList.toggle('hidden', tab !== 'email');
-  if (tab === 'email') renderEmailPreview();
+// ── Monitor Settings (Integrated in #/settings Secondary Page) ──
+function openMonitorModal(tab) {
+  navigate('settings', tab || 'monitor');
 }
 async function loadMonitorConfig() {
   try {
@@ -6195,6 +6964,7 @@ export default {
       if (path === '/api/monitor-config' && request.method === 'GET') return await handleGetMonitorConfig(request, env);
       if (path === '/api/monitor-config' && request.method === 'POST') return await handleSaveMonitorConfig(request, env);
       if (path === '/api/up-lookup' && request.method === 'GET') return await handleUpLookup(request, env);
+      if (path === '/api/bili-cover' && request.method === 'GET') return await handleBiliCover(request, env, ctx);
       if (path === '/api/up-videos' && request.method === 'GET') return await handleGetUpVideos(request, env, ctx);
       if (path === '/api/monitor-archive' && request.method === 'GET') return await handleGetMonitorArchive(request, env);
       if (path === '/api/monitor-archive' && request.method === 'POST') return await handlePostMonitorArchive(request, env);
