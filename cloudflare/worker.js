@@ -715,33 +715,58 @@ async function handleGetMonitorArchive(request, env) {
 
 const LIBRARY_KEY = 'config/library.json';
 const DEFAULT_LIBRARY = {
-  folders: [
+  summary_folders: [
     { id: 'tech', name: '科技', color: '#2563EB' },
     { id: 'history', name: '历史', color: '#D97706' },
     { id: 'game', name: '游戏', color: '#7C3AED' },
     { id: 'software', name: '软件', color: '#059669' },
   ],
+  up_folders: [
+    { id: 'up_news', name: '国际时政', color: '#E11D48' },
+    { id: 'up_tech', name: '数码科技', color: '#2563EB' },
+    { id: 'up_know', name: '知识科普', color: '#059669' },
+    { id: 'up_fun', name: '趣味娱乐', color: '#D97706' },
+  ],
+  fav_folders: [
+    { id: 'fav_default', name: '默认收藏夹', color: '#FB7299' },
+    { id: 'fav_deep', name: '深度干货', color: '#2563EB' },
+  ],
   job_tags: {},
   up_tags: {},
+  fav_folder_map: {},
   watch_later: [],
   favorites: [],
 };
 
+function sanitizeFolderList(arr, fallback) {
+  if (!Array.isArray(arr) || !arr.length) return fallback.map(f => ({ ...f }));
+  const seen = new Set();
+  const out = [];
+  for (const f of arr.slice(0, 40)) {
+    const id = String(f?.id || '').trim().slice(0, 32) || ('f_' + Date.now() + '_' + out.length);
+    if (seen.has(id)) continue;
+    seen.add(id);
+    out.push({
+      id,
+      name: String(f?.name || '').trim().slice(0, 20) || '未命名',
+      color: /^#[0-9a-fA-F]{3,8}$/.test(String(f?.color || '')) ? String(f.color) : '#2563EB',
+    });
+  }
+  return out.length ? out : fallback.map(f => ({ ...f }));
+}
+
 function sanitizeLibrary(raw) {
   const src = raw && typeof raw === 'object' ? raw : {};
-  const folders = Array.isArray(src.folders) && src.folders.length
-    ? src.folders.slice(0, 40).map(f => ({
-        id: String(f.id || '').trim().slice(0, 32) || ('f_' + Date.now()),
-        name: String(f.name || '').trim().slice(0, 20) || '未命名',
-        color: /^#[0-9a-fA-F]{3,8}$/.test(String(f.color || '')) ? String(f.color) : '#2563EB',
-      }))
-    : DEFAULT_LIBRARY.folders.map(f => ({ ...f }));
-  const validIds = new Set(folders.map(f => f.id));
-  const cleanTagMap = (m) => {
+  const legacyFolders = Array.isArray(src.folders) && src.folders.length ? src.folders : null;
+  const summary_folders = sanitizeFolderList(src.summary_folders || legacyFolders, DEFAULT_LIBRARY.summary_folders);
+  const up_folders = sanitizeFolderList(src.up_folders, DEFAULT_LIBRARY.up_folders);
+  const fav_folders = sanitizeFolderList(src.fav_folders, DEFAULT_LIBRARY.fav_folders);
+
+  const cleanTagMap = (m, validSet) => {
     const out = {};
     if (m && typeof m === 'object') {
       Object.keys(m).slice(0, 500).forEach(k => {
-        const arr = Array.isArray(m[k]) ? [...new Set(m[k].map(String).filter(id => validIds.has(id)))] : [];
+        const arr = Array.isArray(m[k]) ? [...new Set(m[k].map(String).filter(id => validSet.has(id)))] : [];
         if (arr.length) out[String(k)] = arr;
       });
     }
@@ -775,10 +800,19 @@ function sanitizeLibrary(raw) {
     }
     return out;
   };
+
+  const sumSet = new Set(summary_folders.map(f => f.id));
+  const upSet = new Set(up_folders.map(f => f.id));
+  const favSet = new Set(fav_folders.map(f => f.id));
+
   return {
-    folders,
-    job_tags: cleanTagMap(src.job_tags),
-    up_tags: cleanTagMap(src.up_tags),
+    folders: summary_folders,
+    summary_folders,
+    up_folders,
+    fav_folders,
+    job_tags: cleanTagMap(src.job_tags, sumSet),
+    up_tags: cleanTagMap(src.up_tags, upSet),
+    fav_folder_map: cleanTagMap(src.fav_folder_map, favSet),
     watch_later: cleanVidList(src.watch_later),
     favorites: cleanVidList(src.favorites),
     updated_at: src.updated_at || nowISO(),
@@ -1073,7 +1107,8 @@ async function handleSubmit(request, env, ctx) {
   let title = String(body.title || '').trim();
   let owner = String(body.owner || '').trim();
   let duration = String(body.duration || '').trim();
-  if (!title && /^BV/i.test(bvid)) {
+  let pic = String(body.pic || '').trim().replace(/^http:\/\//, 'https://');
+  if ((!title || !pic) && /^BV/i.test(bvid)) {
     try {
       const ctrl = new AbortController();
       const timer = setTimeout(() => ctrl.abort(), 3200);
@@ -1084,9 +1119,10 @@ async function handleSubmit(request, env, ctx) {
         const idata = await ir.json();
         const info = idata?.info;
         if (info) {
-          title = info.title || '';
-          owner = info.owner?.name || '';
-          duration = formatSecDuration(info.duration);
+          if (!title) title = info.title || '';
+          if (!owner) owner = info.owner?.name || '';
+          if (!duration) duration = formatSecDuration(info.duration);
+          if (!pic && info.pic) pic = String(info.pic).replace(/^http:\/\//, 'https://');
         }
       }
     } catch {}
@@ -1096,7 +1132,7 @@ async function handleSubmit(request, env, ctx) {
   const job = {
     id: jobId, bvid, url: bvid, status: 'pending',
     created_at: nowISO(), updated_at: nowISO(),
-    summary: null, title: title || bvid, owner, duration,
+    summary: null, title: title || bvid, owner, duration, pic,
     error: '', email_style, send_email,
   };
 
@@ -1116,7 +1152,7 @@ async function handleSubmit(request, env, ctx) {
     if (ghResp.status !== 204 && ghResp.status !== 201 && ghResp.status !== 200) {
       if (env.BILIBILI_BUCKET) cleanupExcessResults(env.BILIBILI_BUCKET).catch(() => {});
       return jsonResponse({
-        job_id: jobId, bvid, title: job.title, owner, duration, status: 'pending',
+        job_id: jobId, bvid, title: job.title, owner, duration, pic, status: 'pending',
         warning: 'GitHub Actions 触发可能失败: HTTP ' + ghResp.status,
       }, 201);
     }
@@ -1126,7 +1162,7 @@ async function handleSubmit(request, env, ctx) {
   }
 
   if (env.BILIBILI_BUCKET) cleanupExcessResults(env.BILIBILI_BUCKET).catch(() => {});
-  return jsonResponse({ job_id: jobId, bvid, title: job.title, owner, duration, status: 'pending' }, 201);
+  return jsonResponse({ job_id: jobId, bvid, title: job.title, owner, duration, pic, status: 'pending' }, 201);
 }
 
 async function handleListJobs(request, env) {
@@ -1774,7 +1810,7 @@ select.c-select-native{position:absolute!important;opacity:0!important;pointer-e
 .st-badge.pending{background:var(--warn-soft);color:var(--warn-text)}
 
 .video-head{background:var(--surface);border:1px solid var(--border);border-radius:14px;padding:18px 22px;margin-bottom:14px;display:flex;align-items:flex-start;justify-content:space-between;gap:16px;box-shadow:var(--shadow-sm);flex-wrap:wrap}
-.vh-left{min-width:0;flex:1}
+.vh-left{min-width:260px;flex:1}
 .vh-title{font-size:18.5px;font-weight:800;line-height:1.4;color:var(--text);margin-bottom:10px;word-break:break-word}
 .vh-title a{color:inherit;text-decoration:none}
 .vh-title a:hover{color:var(--brand-dark)}
@@ -2051,13 +2087,153 @@ select.c-select-native{position:absolute!important;opacity:0!important;pointer-e
   .form-grid,.style-grid{grid-template-columns:1fr 1fr}
   .archive-grid{grid-template-columns:1fr}
 }
+
+/* Day-Night Toggle View-Transition Reveal (from shiranzby/Day-night-toggle-button) */
+:root[data-shiran-vt]::view-transition-old(root),
+:root[data-shiran-vt]::view-transition-new(root){animation:none;mix-blend-mode:normal}
+:root[data-shiran-vt]::view-transition-group(root){animation-duration:0s}
+:root[data-shiran-vt]::view-transition-old(root){z-index:1}
+:root[data-shiran-vt]::view-transition-new(root){z-index:2}
+theme-button{flex-shrink:0}
+
+/* Narrow-Screen Video Header Layout (Left: Title + Meta + Tags | Right: Stacked Controls) */
+.vh-tag-mobile-btn{display:none}
+@media(max-width:680px){
+  .video-head{
+    display:grid!important;grid-template-columns:minmax(0,1fr) 104px;
+    gap:12px;align-items:start;padding:14px 14px;
+  }
+  .vh-left{min-width:0;width:100%}
+  .vh-title{font-size:15.5px;line-height:1.42;margin-bottom:8px;word-break:break-word}
+  .vh-pills{gap:5px}
+  .meta-pill{font-size:11px;padding:2px 8px}
+  .vh-actions{
+    flex-direction:column;width:104px;gap:6px;align-items:stretch;
+  }
+  .vh-actions .wl-btn,.vh-actions .star-btn,.vh-actions .watch-btn,.vh-actions .vh-tag-mobile-btn{
+    width:100%;height:30px;padding:0 8px;font-size:11.5px;justify-content:center;border-radius:8px;
+  }
+  .vh-tag-mobile-btn{
+    display:inline-flex!important;align-items:center;gap:4px;
+    border:1px dashed var(--border-strong);background:var(--bg);color:var(--soft);font-weight:600;
+  }
+  .vh-tag-mobile-btn:hover{border-color:var(--brand);color:var(--brand-dark);background:var(--brand-soft)}
+  .vh-tag-row .tag-add-btn{display:none}
+  .view-bar{gap:8px}
+  .seg-tabs{max-width:100%;overflow-x:auto}
+  .seg-tab{padding:5px 10px;font-size:12px}
+  .act-btn{height:30px;padding:0 9px;font-size:11.5px}
+  .topbar{padding:0 12px;gap:8px}
+  .topbar-actions{gap:5px}
+  .topbar-actions .pill-btn{height:30px;padding:0 8px;font-size:11.5px;gap:4px}
+  .topbar-actions .tb-hide-sm{display:none}
+  .topbar-title{font-size:14px}
+}
+
+/* Stacked Fan-Deck Favorite Folder Rows & Accordion Expand */
+.fav-deck-list{display:flex;flex-direction:column;gap:14px}
+.fav-deck-card{
+  background:var(--surface);border:1px solid var(--border);border-radius:16px;
+  box-shadow:var(--shadow-sm);overflow:hidden;
+  transition:border-color .2s,box-shadow .2s;
+}
+.fav-deck-card:hover{border-color:var(--border-strong);box-shadow:var(--shadow-md)}
+.fav-deck-card.expanded{border-color:var(--brand-border);box-shadow:var(--shadow-md)}
+.fav-deck-head{
+  display:flex;align-items:center;gap:22px;padding:18px 22px;cursor:pointer;
+  transition:background .15s;
+}
+.fav-deck-head:hover{background:var(--surface-hover)}
+
+.fan-deck-wrap{position:relative;width:206px;height:118px;flex-shrink:0;user-select:none}
+.fan-deck{position:relative;width:180px;height:101px;perspective:700px}
+.fan-card{
+  position:absolute;inset:0;border-radius:11px;overflow:hidden;
+  border:1.5px solid var(--surface);background:var(--surface-3);
+  transform-origin:15% 88%;
+  transition:transform .42s cubic-bezier(.34,1.32,.64,1),opacity .32s ease,box-shadow .32s ease;
+  will-change:transform,opacity;
+}
+.fan-card img{width:100%;height:100%;object-fit:cover;display:block}
+.fan-card-fb{
+  width:100%;height:100%;display:flex;align-items:center;justify-content:center;padding:10px;
+  text-align:center;font-size:11.5px;font-weight:700;color:var(--soft);
+  background:linear-gradient(135deg,var(--surface-3),var(--surface-2));
+}
+.fan-card.pos-0{z-index:3;transform:translate(0,0) rotate(0deg) scale(1);box-shadow:0 8px 20px rgba(15,23,42,.20);opacity:1}
+.fan-card.pos-1{z-index:2;transform:translate(13px,7px) rotate(3.6deg) scale(.94);box-shadow:0 5px 14px rgba(15,23,42,.13);opacity:.92}
+.fan-card.pos-2{z-index:1;transform:translate(24px,14px) rotate(7.2deg) scale(.88);box-shadow:0 3px 10px rgba(15,23,42,.08);opacity:.76}
+.fav-deck-head:hover .fan-card.pos-0{transform:translate(-3px,-2px) rotate(-1.2deg) scale(1.02)}
+.fav-deck-head:hover .fan-card.pos-1{transform:translate(17px,9px) rotate(5.2deg) scale(.94)}
+.fav-deck-head:hover .fan-card.pos-2{transform:translate(30px,17px) rotate(9.8deg) scale(.88)}
+
+.fan-nav{
+  position:absolute;left:6px;bottom:10px;z-index:5;display:inline-flex;align-items:center;gap:4px;
+  background:rgba(15,17,22,.72);backdrop-filter:blur(6px);border-radius:999px;padding:2px 5px;color:#fff;
+}
+.fan-nav-btn{
+  width:20px;height:20px;border:none;border-radius:50%;background:transparent;color:#fff;
+  display:inline-flex;align-items:center;justify-content:center;font-size:13px;line-height:1;
+}
+.fan-nav-btn:hover{background:rgba(255,255,255,.22)}
+.fan-nav-idx{font-size:10.5px;font-weight:700;font-variant-numeric:tabular-nums;padding:0 3px}
+
+.fav-deck-info{flex:1;min-width:0}
+.fav-deck-title-row{display:flex;align-items:center;gap:9px;margin-bottom:7px;flex-wrap:wrap}
+.fav-deck-name{font-size:16px;font-weight:800;color:var(--text)}
+.fav-deck-cnt{font-size:11.5px;font-weight:700;padding:2px 9px;border-radius:999px;background:var(--surface-3);color:var(--soft)}
+.fav-deck-previews{display:flex;flex-direction:column;gap:4px}
+.fav-deck-pv{font-size:12.5px;color:var(--soft);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;display:flex;align-items:center;gap:7px}
+.fav-deck-pv-num{font-size:11px;font-weight:700;color:var(--brand);font-family:Consolas,monospace;flex-shrink:0}
+
+.fav-deck-right{display:flex;align-items:center;gap:8px;flex-shrink:0}
+.fav-deck-chev{width:30px;height:30px;border-radius:8px;border:1px solid var(--border);background:var(--surface);color:var(--soft);display:inline-flex;align-items:center;justify-content:center;transition:transform .28s cubic-bezier(.22,1,.36,1),background .15s}
+.fav-deck-card.expanded .fav-deck-chev{transform:rotate(180deg);background:var(--brand-soft);border-color:var(--brand-border);color:var(--brand-dark)}
+
+/* Smooth Top-to-Bottom Accordion Expand */
+.fav-deck-collapse{display:grid;grid-template-rows:0fr;transition:grid-template-rows .34s cubic-bezier(.22,1,.36,1)}
+.fav-deck-card.expanded .fav-deck-collapse{grid-template-rows:1fr}
+.fav-deck-collapse-inner{overflow:hidden}
+.fav-deck-items{border-top:1px solid var(--border);background:var(--bg);padding:12px 18px;display:flex;flex-direction:column;gap:10px}
+
+.fav-item-row{
+  display:flex;align-items:center;gap:15px;padding:11px 14px;border-radius:12px;
+  background:var(--surface);border:1px solid var(--border);transition:border-color .15s,box-shadow .15s;
+}
+.fav-item-row:hover{border-color:var(--brand-border);box-shadow:var(--shadow-sm)}
+.fav-item-thumb{
+  position:relative;width:154px;aspect-ratio:16/9;border-radius:9px;overflow:hidden;
+  background:var(--surface-3);border:1px solid var(--border);flex-shrink:0;text-decoration:none;display:block;
+}
+.fav-item-thumb img{width:100%;height:100%;object-fit:cover;display:block;transition:transform .24s ease}
+.fav-item-row:hover .fav-item-thumb img{transform:scale(1.04)}
+.fav-item-mid{flex:1;min-width:0}
+.fav-item-title{font-size:14px;font-weight:700;color:var(--text);text-decoration:none;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;line-height:1.42;margin-bottom:5px}
+.fav-item-title:hover{color:var(--brand-dark)}
+.fav-item-meta{font-size:12px;color:var(--muted);display:flex;flex-wrap:wrap;gap:6px;align-items:center}
+.fav-item-excerpt{font-size:12px;color:var(--soft);margin-top:5px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.fav-item-acts{display:flex;align-items:center;gap:6px;flex-shrink:0;flex-wrap:wrap}
+
+@media(max-width:768px){
+  .fav-deck-head{flex-direction:column;align-items:flex-start;gap:14px;padding:14px}
+  .fav-deck-right{width:100%;justify-content:flex-end}
+  .fav-item-row{flex-direction:column;align-items:stretch;gap:10px}
+  .fav-item-thumb{width:100%}
+  .fav-item-acts{justify-content:flex-end}
+}
+
+.pick-chip-row{display:flex;flex-wrap:wrap;gap:6px;margin-top:4px}
+.pick-chip{display:inline-flex;align-items:center;gap:5px;height:28px;padding:0 10px;border-radius:999px;border:1px solid var(--border);background:var(--surface);color:var(--soft);font-size:12px;font-weight:600;transition:all .15s}
+.pick-chip:hover{border-color:var(--border-strong);color:var(--text)}
+.pick-chip.selected{border-color:var(--brand);background:var(--brand-soft);color:var(--brand-dark)}
+
 </style>
 </head>
 <body>
 
 <!-- FULL-SCREEN AUTH GATE (Enforces Login + 90-Day Single-Device Persistence) -->
 <div class="auth-gate hidden" id="authGate">
-  <button class="icon-btn auth-gate-theme" id="gateThemeBtn" onclick="toggleTheme()" title="切换浅色 / 暗色主题"></button>
+  <div class="auth-gate-theme"><theme-button id="gateThemeBtn" size="1.15" aria-label="切换日夜主题"></theme-button></div>
   <div class="auth-card">
     <div class="auth-brand">
       <div class="brand-icon">
@@ -2095,7 +2271,7 @@ select.c-select-native{position:absolute!important;opacity:0!important;pointer-e
 
   <aside class="nav-rail" id="navRail">
     <div class="rail-head">
-      <button class="brand-link" onclick="onBrandClick()" data-tip="展开侧边栏">
+      <button class="brand-link" onclick="onBrandClick()" data-tip="展开 / 收起侧边栏" title="点击品牌图标展开或收起侧边栏">
         <div class="brand-icon">
           <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="6" width="18" height="13" rx="3"/><path d="M8 3l3 3M16 3l-3 3"/><path d="M9 12v2M15 12v2"/></svg>
         </div>
@@ -2104,16 +2280,7 @@ select.c-select-native{position:absolute!important;opacity:0!important;pointer-e
           <div class="brand-sub">视频知识工作台</div>
         </div>
       </button>
-      <button class="rail-collapse-btn" onclick="toggleRailCollapsed()" title="收起侧边栏">
-        <svg class="ic" viewBox="0 0 24 24"><rect x="3" y="3" width="18" height="18" rx="2"/><line x1="9" y1="3" x2="9" y2="21"/><polyline points="15 9 12 12 15 15"/></svg>
-      </button>
     </div>
-
-    <button class="rail-cta" onclick="openSubmitModal('single')" data-tip="新建摘要 (Ctrl+K)">
-      <svg class="ic" viewBox="0 0 24 24"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
-      <span class="rail-label">新建摘要</span>
-      <span class="rail-cta-kbd">Ctrl K</span>
-    </button>
 
     <div class="rail-scroll">
       <nav class="rail-nav" id="railNav">
@@ -2146,12 +2313,21 @@ select.c-select-native{position:absolute!important;opacity:0!important;pointer-e
 
       <div class="rail-sep"></div>
       <div class="rail-sec-head">
-        <span class="rail-sec-title">标签文件夹</span>
-        <button class="rail-sec-add" onclick="openTagManagerModal()" data-tip="管理标签文件夹" title="管理标签文件夹">
+        <span class="rail-sec-title">摘要分类</span>
+        <button class="rail-sec-add" onclick="openTagManagerModal('summary')" data-tip="管理摘要分类" title="管理摘要分类">
           <svg class="ic" viewBox="0 0 24 24"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
         </button>
       </div>
-      <div class="rail-folders" id="railFolderList"></div>
+      <div class="rail-folders" id="railSummaryFolderList"></div>
+
+      <div class="rail-sep"></div>
+      <div class="rail-sec-head">
+        <span class="rail-sec-title">UP 主分类</span>
+        <button class="rail-sec-add" onclick="openTagManagerModal('up')" data-tip="管理 UP 主分类" title="管理 UP 主分类">
+          <svg class="ic" viewBox="0 0 24 24"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
+        </button>
+      </div>
+      <div class="rail-folders" id="railUpFolderList"></div>
     </div>
 
     <div class="rail-foot">
@@ -2167,9 +2343,9 @@ select.c-select-native{position:absolute!important;opacity:0!important;pointer-e
           <svg class="ic" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
           <span class="rail-label">设置</span>
         </button>
-        <button class="rail-foot-btn" id="railThemeBtn" onclick="toggleTheme()" data-tip="切换主题"></button>
         <button class="rail-foot-btn" onclick="doLogout()" data-tip="退出登录" title="退出当前设备登录">
           <svg class="ic" viewBox="0 0 24 24"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><polyline points="16 17 21 12 16 7"/><line x1="21" y1="12" x2="9" y2="12"/></svg>
+          <span class="rail-label">退出</span>
         </button>
       </div>
     </div>
@@ -2178,23 +2354,23 @@ select.c-select-native{position:absolute!important;opacity:0!important;pointer-e
   <main class="main-col">
     <header class="topbar">
       <div class="tb-left">
-        <!-- Mobile ONLY: top-left clickable Brand Logo toggles navigation drawer -->
         <button class="mobile-logo-btn" onclick="toggleMobileNav()" aria-label="展开或收起菜单">
           <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="6" width="18" height="13" rx="3"/><path d="M8 3l3 3M16 3l-3 3"/><path d="M9 12v2M15 12v2"/></svg>
-        </button>
-        <!-- Desktop Plan B Collapsed: expand button -->
-        <button class="tb-expand-btn" onclick="toggleRailCollapsed()" title="展开侧边栏">
-          <svg class="ic" viewBox="0 0 24 24"><rect x="3" y="3" width="18" height="18" rx="2"/><line x1="9" y1="3" x2="9" y2="21"/><polyline points="13 9 16 12 13 15"/></svg>
         </button>
         <span class="topbar-title" id="topbarTitle">摘要工作台</span>
         <span class="topbar-sub" id="topbarSub"></span>
       </div>
       <div class="topbar-actions">
-        <button class="pill-btn brand" onclick="openMonitorModal()">
+        <theme-button id="topThemeBtn" size="1.05" aria-label="切换日夜主题"></theme-button>
+        <button class="pill-btn tb-hide-sm" onclick="openMonitorModal()">
           <svg class="ic" viewBox="0 0 24 24"><line x1="4" y1="21" x2="4" y2="14"/><line x1="4" y1="10" x2="4" y2="3"/><line x1="12" y1="21" x2="12" y2="12"/><line x1="12" y1="8" x2="12" y2="3"/><line x1="20" y1="21" x2="20" y2="16"/><line x1="20" y1="12" x2="20" y2="3"/><line x1="1" y1="14" x2="7" y2="14"/><line x1="9" y1="8" x2="15" y2="8"/><line x1="17" y1="16" x2="23" y2="16"/></svg>
           <span>定时与样式</span>
         </button>
-        <button class="pill-btn" onclick="openSubmitModal('single')">
+        <button class="pill-btn brand" onclick="openAddMonitorModal()">
+          <svg class="ic" viewBox="0 0 24 24"><path d="M16 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="8.5" cy="7" r="4"/><line x1="20" y1="8" x2="20" y2="14"/><line x1="23" y1="11" x2="17" y2="11"/></svg>
+          <span>新增监控</span>
+        </button>
+        <button class="pill-btn" onclick="openSubmitModal('single')" title="快捷键 Ctrl+K">
           <svg class="ic" viewBox="0 0 24 24"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
           <span>新建摘要</span>
         </button>
@@ -2238,6 +2414,10 @@ select.c-select-native{position:absolute!important;opacity:0!important;pointer-e
                   <span>在B站观看</span>
                   <svg class="ic" viewBox="0 0 24 24"><path d="M7 17L17 7M7 7h10v10"/></svg>
                 </a>
+                <button class="vh-tag-mobile-btn" id="vhTagMobileBtn" type="button" onclick="openCurrentJobTagPopover(this)">
+                  <svg class="ic" viewBox="0 0 24 24"><path d="M20.59 13.41l-7.17 7.17a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82z"/><line x1="7" y1="7" x2="7.01" y2="7"/></svg>
+                  <span>添加标签</span>
+                </button>
               </div>
             </section>
 
@@ -2399,29 +2579,23 @@ select.c-select-native{position:absolute!important;opacity:0!important;pointer-e
         </div>
       </section>
 
-      <!-- ROUTE 4: FAVORITES COLLECTION -->
+      <!-- ROUTE 4: FAVORITES STACKED FAN-DECK FOLDERS -->
       <section class="route-view hidden" id="view-favorites">
         <div class="page-inner full">
           <div class="page-toolbar">
             <div class="pt-left">
               <h2>我的收藏</h2>
-              <p id="favPageSub">跨页面统一管理已收藏的精华摘要与 B 站原视频</p>
+              <p id="favPageSub">按收藏文件夹归类，支持封面叠层切换与下滑展开查看</p>
             </div>
             <div class="pt-actions">
-              <div class="search-box" style="width:230px">
+              <div class="search-box" style="width:220px">
                 <span class="s-ic"><svg class="ic" viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4.3-4.3"/></svg></span>
-                <input class="ctrl" id="favSearchInput" type="text" placeholder="搜索收藏内容..." oninput="renderFavoritesPage()">
+                <input class="ctrl" id="favSearchInput" type="text" placeholder="搜索收藏视频或摘要..." oninput="renderFavoritesPage()">
               </div>
-              <div class="seg-tabs" id="favTypeTabs">
-                <span class="seg-slider"></span>
-                <button class="seg-tab active" data-ft="all" onclick="setFavType('all')">全部</button>
-                <button class="seg-tab" data-ft="summary" onclick="setFavType('summary')">已归档摘要</button>
-                <button class="seg-tab" data-ft="video" onclick="setFavType('video')">收藏视频</button>
-              </div>
+              <button class="btn btn-brand" onclick="openTagManagerModal('fav')">+ 新建收藏夹</button>
             </div>
           </div>
-          <div class="folder-bar" id="favFolderBar" style="margin-bottom:16px"></div>
-          <div class="video-grid" id="favGrid"></div>
+          <div class="fav-deck-list" id="favDeckList"></div>
         </div>
       </section>
 
@@ -2535,6 +2709,10 @@ select.c-select-native{position:absolute!important;opacity:0!important;pointer-e
           <label>自定义模板（含 {content} 占位符）</label>
           <textarea class="ctrl" id="customTpl" placeholder="请根据以下视频内容提取核心干货：\n{content}"></textarea>
         </div>
+        <div class="field" style="margin-top:12px">
+          <label>摘要分类标签（可选，可多选）</label>
+          <div class="pick-chip-row" id="submitFolderPicker"></div>
+        </div>
         <div class="form-grid" style="margin-top:12px">
           <div class="field">
             <label>单条结果接收邮箱（可选）</label>
@@ -2566,28 +2744,64 @@ select.c-select-native{position:absolute!important;opacity:0!important;pointer-e
   </div>
 </div>
 
-<!-- TAG FOLDER MANAGER MODAL -->
+<!-- ADD MONITOR UP MODAL (Topbar "+ 新增监控") -->
+<div class="modal-backdrop hidden" id="addMonitorModal" onclick="if(event.target===this)closeModal('addMonitorModal')">
+  <div class="modal">
+    <div class="modal-head">
+      <div>
+        <h2>新增监控 UP 主</h2>
+        <div style="font-size:12px;color:var(--muted);margin-top:2px">输入 B 站 UP 主 UID 或主页链接，可选直接归入 UP 主分类</div>
+      </div>
+      <button class="icon-btn" onclick="closeModal('addMonitorModal')" aria-label="关闭">
+        <svg class="ic" viewBox="0 0 24 24"><path d="M18 6L6 18M6 6l12 12"/></svg>
+      </button>
+    </div>
+    <div class="modal-body">
+      <div class="field">
+        <label>UP 主 UID 或空间链接</label>
+        <input class="ctrl" id="modalAddUpInput" type="text" placeholder="例如：346563107 或 https://space.bilibili.com/346563107" onkeydown="if(event.key==='Enter')submitModalAddUp()">
+      </div>
+      <div class="field">
+        <label>归入 UP 主分类（可选，可多选）</label>
+        <div class="pick-chip-row" id="addUpFolderPicker"></div>
+      </div>
+      <div class="sb-toast" id="modalAddUpToast"></div>
+    </div>
+    <div class="modal-foot">
+      <button class="btn" onclick="closeModal('addMonitorModal')">取消</button>
+      <button class="btn btn-primary" id="modalAddUpBtn" onclick="submitModalAddUp()">解析并添加监控</button>
+    </div>
+  </div>
+</div>
+
+<!-- 3-SCOPE FOLDER MANAGER MODAL (摘要分类 / UP主分类 / 收藏文件夹) -->
 <div class="modal-backdrop hidden" id="tagManagerModal" onclick="if(event.target===this)closeModal('tagManagerModal')">
   <div class="modal">
     <div class="modal-head">
       <div>
-        <h2>标签文件夹管理</h2>
-        <div style="font-size:12px;color:var(--muted);margin-top:2px">全局同步至 Cloudflare R2，同时用于摘要归档与 UP 主分组</div>
+        <h2>分类与收藏文件夹管理</h2>
+        <div style="font-size:12px;color:var(--muted);margin-top:2px">独立管理摘要分类、UP 主分组与收藏夹，自动同步至 Cloudflare R2</div>
       </div>
       <button class="icon-btn" onclick="closeModal('tagManagerModal')" aria-label="关闭">
         <svg class="ic" viewBox="0 0 24 24"><path d="M18 6L6 18M6 6l12 12"/></svg>
       </button>
     </div>
     <div class="modal-body">
+      <div class="seg-tabs" id="folderMgrTabs" style="margin-bottom:16px">
+        <span class="seg-slider"></span>
+        <button class="seg-tab active" data-fscope="summary" onclick="switchFolderMgrScope('summary')">摘要分类</button>
+        <button class="seg-tab" data-fscope="up" onclick="switchFolderMgrScope('up')">UP 主分类</button>
+        <button class="seg-tab" data-fscope="fav" onclick="switchFolderMgrScope('fav')">收藏文件夹</button>
+      </div>
       <div class="field">
-        <label>新建标签文件夹</label>
+        <label id="newFolderLabel">新建摘要分类</label>
         <div style="display:flex;gap:8px">
-          <input class="ctrl" id="newFolderNameInput" type="text" maxlength="16" placeholder="例如：科技、历史、游戏、AI工具..." onkeydown="if(event.key==='Enter')createNewFolder()">
+          <input class="ctrl" id="newFolderNameInput" type="text" maxlength="16" placeholder="输入文件夹名称..." onkeydown="if(event.key==='Enter')createNewFolder()">
           <button class="btn btn-primary" type="button" onclick="createNewFolder()">创建</button>
         </div>
         <div class="color-swatches" id="folderColorSwatches"></div>
       </div>
-      <div style="font-size:12px;font-weight:700;color:var(--soft);margin-top:16px">已有标签文件夹</div>
+      <div style="font-size:12px;font-weight:700;color:var(--soft);margin-top:16px" id="existingFolderTitle">已有分类</div>
       <div class="folder-mgr-list" id="folderMgrList"></div>
     </div>
     <div class="modal-foot">
@@ -2861,6 +3075,138 @@ select.c-select-native{position:absolute!important;opacity:0!important;pointer-e
 </div>
 
 <script>
+
+// ── Authentic Day-Night Toggle Button Web Component (shiranzby/Day-night-toggle-button v5.0) ──
+(function registerShiranThemeButton() {
+  if (customElements.get('theme-button')) return;
+  const cloudPositions = [[-20,10,50],[-10,-25,60],[20,-40,60],[50,-35,60],[75,-60,75],[110,-50,60]];
+  const starPositions = [[11,39,15],[39,91,15],[26,19,10],[37,66,10],[21,75,6],[51,38,6]];
+  const cloudsHtml = cloudPositions.map(p => '<div class="cs" style="--right:' + p[0] + 'em;--bottom:' + p[1] + 'em;width:' + p[2] + 'em;height:' + p[2] + 'em"></div>').join('');
+  const starsHtml = starPositions.map(p => '<div class="sr" style="top:' + p[0] + 'em;left:' + p[1] + 'em;width:' + p[2] + 'em;height:' + p[2] + 'em;--half:' + (p[2]/2) + 'em"><div class="ss"></div><div class="ss"></div><div class="ss"></div><div class="ss"></div></div>').join('');
+
+  const tpl = document.createElement('template');
+  tpl.innerHTML =
+    '<style>' +
+      ':host{display:inline-grid;place-items:center;min-width:44px;min-height:34px;vertical-align:middle;line-height:0;border-radius:100px;cursor:pointer;-webkit-tap-highlight-color:transparent}' +
+      ':host(:focus-visible){outline:2px solid currentColor;outline-offset:4px}' +
+      '*,*::before,*::after{box-sizing:border-box}' +
+      '.wrap{position:relative;display:inline-block}' +
+      '.ct{width:180em;height:70em;position:relative;overflow:hidden;border-radius:100em;background:rgba(70,133,192,1);box-shadow:inset 0 0 5em 3em rgba(0,0,0,.45);transition:background .7s cubic-bezier(0,.5,1,1)}' +
+      '.mb{margin:7.5em 0 0 7.5em;width:55em;height:55em;position:relative;z-index:3;border-radius:50%;background:rgba(255,195,35,1);box-shadow:3em 3em 5em rgba(0,0,0,.5),inset -3em -5em 3em -3em rgba(0,0,0,.5),inset 4em 5em 2em -2em rgba(255,230,80,1);transition:transform 1s cubic-bezier(.56,1.35,.52,1),background 1s,box-shadow 1s}' +
+      '.mo{position:absolute;background:rgba(150,160,180,1);box-shadow:inset 0 0 1em 1em rgba(0,0,0,.3);border-radius:50%;transition:opacity .5s;opacity:0}' +
+      '.mo:nth-child(1){top:7.5em;left:25em;width:12.5em;height:12.5em}' +
+      '.mo:nth-child(2){top:20em;left:7.5em;width:20em;height:20em}' +
+      '.mo:nth-child(3){top:32.5em;left:32.5em;width:12.5em;height:12.5em}' +
+      '.db{position:absolute;border-radius:50%;transition:transform 1s cubic-bezier(.56,1.35,.52,1)}' +
+      '.db:nth-of-type(2){top:-20em;left:-20em;width:110em;height:110em;background:rgba(255,255,255,.2);z-index:-2}' +
+      '.db:nth-of-type(3){top:-32.5em;left:-17.5em;width:135em;height:135em;background:rgba(255,255,255,.1);z-index:-3}' +
+      '.db:nth-of-type(4){top:-45em;left:-15em;width:160em;height:160em;background:rgba(255,255,255,.05);z-index:-4}' +
+      '.cl{transform:translateY(10em);z-index:-2}' +
+      '.cll{position:absolute;right:0;bottom:25em;opacity:.5;z-index:-3}' +
+      '.settled .cll{transform:translateY(10em)}' +
+      '.cl,.cll{transition:transform 1s cubic-bezier(.56,1.35,.52,1)}' +
+      '.cs{position:absolute;right:var(--right);bottom:var(--bottom);background:#fff;border-radius:50%;z-index:-1;transition:right 1s,bottom 1s}' +
+      '.st{transform:translateY(-125em);opacity:0;z-index:-2;transition:transform 1s cubic-bezier(.56,1.35,.52,1),opacity 1s}' +
+      '.sr{position:absolute;transition:top 1s,left 1s}' +
+      '.ss{float:left;width:var(--half);height:var(--half);background-image:radial-gradient(circle var(--half) at left top,transparent var(--half),#fff)}' +
+      '.ss:nth-child(2){background-image:radial-gradient(circle var(--half) at right top,transparent var(--half),#fff)}' +
+      '.ss:nth-child(3){background-image:radial-gradient(circle var(--half) at left bottom,transparent var(--half),#fff)}' +
+      '.ss:nth-child(4){background-image:radial-gradient(circle var(--half) at right bottom,transparent var(--half),#fff)}' +
+      '.dark{background:rgba(25,30,50,1)}' +
+      '.dark .mb{transform:translateX(110em);background:rgba(195,200,210,1);box-shadow:3em 3em 5em rgba(0,0,0,.5),inset -3em -5em 3em -3em rgba(0,0,0,.5),inset 4em 5em 2em -2em rgba(255,255,210,1)}' +
+      '.dark .db:nth-of-type(2){transform:translateX(110em)}' +
+      '.dark .db:nth-of-type(3){transform:translateX(80em)}' +
+      '.dark .db:nth-of-type(4){transform:translateX(50em)}' +
+      '.dark .cl,.dark .cll{transform:translateY(80em)}' +
+      '.dark .mo{opacity:1}' +
+      '.dark .st{transform:translateY(-62.5em);opacity:1}' +
+      '@media(hover:hover) and (pointer:fine){' +
+        '.hover:not(.dark) .mb,.hover:not(.dark) .db:nth-of-type(2){transform:translateX(10em)}' +
+        '.hover:not(.dark) .db:nth-of-type(3){transform:translateX(7em)}' +
+        '.hover:not(.dark) .db:nth-of-type(4){transform:translateX(4em)}' +
+        '.hover:not(.dark) .cl .cs:nth-child(1){right:-24em;bottom:10em}' +
+        '.hover:not(.dark) .cl .cs:nth-child(2){right:-12em;bottom:-27em}' +
+        '.hover:not(.dark) .cl .cs:nth-child(3){right:17em;bottom:-43em}' +
+        '.hover:not(.dark) .cl .cs:nth-child(4){right:46em;bottom:-39em}' +
+        '.hover:not(.dark) .cl .cs:nth-child(5){right:70em;bottom:-65em}' +
+        '.hover:not(.dark) .cl .cs:nth-child(6){right:109em;bottom:-54em}' +
+        '.hover:not(.dark) .cll .cs:nth-child(1){right:-23em;bottom:10em}' +
+        '.hover:not(.dark) .cll .cs:nth-child(2){right:-11em;bottom:-26em}' +
+        '.hover:not(.dark) .cll .cs:nth-child(3){right:18em;bottom:-42em}' +
+        '.hover:not(.dark) .cll .cs:nth-child(4){right:47em;bottom:-38em}' +
+        '.hover:not(.dark) .cll .cs:nth-child(5){right:74em;bottom:-64em}' +
+        '.hover:not(.dark) .cll .cs:nth-child(6){right:110em;bottom:-55em}' +
+        '.hover.dark .mb,.hover.dark .db:nth-of-type(2){transform:translateX(100em)}' +
+        '.hover.dark .db:nth-of-type(3){transform:translateX(73em)}' +
+        '.hover.dark .db:nth-of-type(4){transform:translateX(46em)}' +
+        '.hover.dark .sr:nth-child(1){top:10em!important;left:36em!important}' +
+        '.hover.dark .sr:nth-child(2){top:40em!important;left:87em!important}' +
+        '.hover.dark .sr:nth-child(3){top:26em!important;left:16em!important}' +
+        '.hover.dark .sr:nth-child(4){top:38em!important;left:63em!important}' +
+        '.hover.dark .sr:nth-child(5){top:20.5em!important;left:72em!important}' +
+        '.hover.dark .sr:nth-child(6){top:51.5em!important;left:35em!important}' +
+      '}' +
+      '@media(prefers-reduced-motion:reduce){*,*::before,*::after{transition:none!important;animation:none!important}}' +
+    '</style>' +
+    '<div class="wrap" aria-hidden="true"><div class="ct"><div class="mb"><div class="mo"></div><div class="mo"></div><div class="mo"></div></div><div class="db"></div><div class="db"></div><div class="db"></div><div class="cl">' + cloudsHtml + '</div><div class="cll">' + cloudsHtml + '</div><div class="st">' + starsHtml + '</div></div></div>';
+
+  class ThemeButton extends HTMLElement {
+    static get observedAttributes() { return ['value', 'size', 'disabled']; }
+    constructor() {
+      super();
+      const shadow = this.attachShadow({ mode: 'closed' });
+      shadow.append(tpl.content.cloneNode(true));
+      this._wrapper = shadow.querySelector('.wrap');
+      this._scene = shadow.querySelector('.ct');
+      this._hoverMedia = matchMedia('(hover:hover) and (pointer:fine)');
+      this._lastToggle = -Infinity;
+      this.addEventListener('click', ev => { if (!this.disabled) this._activate(ev); }, true);
+      this.addEventListener('keydown', ev => {
+        if (!['Enter', ' ', 'Spacebar'].includes(ev.key)) return;
+        ev.preventDefault();
+        if (!this.disabled && !ev.repeat) this._activate(ev);
+      });
+      shadow.querySelector('.mb').addEventListener('mousemove', () => {
+        if (!this.disabled && this._hoverMedia.matches && performance.now() - this._lastToggle >= 500) this._scene.classList.add('hover');
+      });
+      shadow.querySelector('.mb').addEventListener('mouseleave', () => this._scene.classList.remove('hover'));
+    }
+    connectedCallback() {
+      if (!this.hasAttribute('value')) this.value = document.documentElement.dataset.theme === 'dark' ? 'dark' : 'light';
+      this.setAttribute('role', 'switch');
+      if (!this.hasAttribute('tabindex')) this.setAttribute('tabindex', '0');
+      this._render();
+    }
+    attributeChangedCallback() { this._render(); }
+    get value() { return this.getAttribute('value') === 'dark' ? 'dark' : 'light'; }
+    set value(v) { this.setAttribute('value', v === 'dark' ? 'dark' : 'light'); }
+    get size() { const n = Number(this.getAttribute('size')); return Number.isFinite(n) && n > 0 ? n : 1.1; }
+    set size(v) { this.setAttribute('size', v); }
+    get disabled() { return this.hasAttribute('disabled'); }
+    set disabled(v) { this.toggleAttribute('disabled', Boolean(v)); }
+    _render() {
+      this._wrapper.style.fontSize = (this.size / 3) + 'px';
+      if (this._renderedTheme !== undefined && this._renderedTheme !== this.value) this._scene.classList.add('settled');
+      this._renderedTheme = this.value;
+      this._scene.classList.toggle('dark', this.value === 'dark');
+      this._scene.classList.remove('hover');
+      this.setAttribute('aria-checked', String(this.value === 'dark'));
+    }
+    _activate(source) {
+      this._lastToggle = performance.now();
+      this.value = this.value === 'dark' ? 'light' : 'dark';
+      const rect = this.getBoundingClientRect();
+      const pt = (source && source.type === 'click' && source.detail > 0 && Number.isFinite(source.clientX))
+        ? { x: source.clientX, y: source.clientY }
+        : { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 };
+      const ev = new CustomEvent('change', { detail: this.value, bubbles: true, composed: true });
+      Object.defineProperty(ev, 'point', { value: pt, enumerable: true });
+      this.dispatchEvent(ev);
+    }
+  }
+  customElements.define('theme-button', ThemeButton);
+})();
+
 // ── Storage Keys & Constants ──
 const LS_JOBS = 'bilisum_jobs_v3';
 const LS_THEME = 'bilisum_theme_v3';
@@ -2874,12 +3220,28 @@ const SS_FEED_CACHE = 'bilisum_up_feed_cache_v2';
 const FEED_CACHE_TTL_MS = 10 * 60 * 1000;
 
 const FOLDER_COLORS = ['#2563EB', '#D97706', '#7C3AED', '#059669', '#E11D48', '#0891B2', '#4F46E5', '#64748B'];
-const DEFAULT_FOLDERS = [
+const DEFAULT_SUMMARY_FOLDERS = [
   { id: 'tech', name: '科技', color: '#2563EB' },
   { id: 'history', name: '历史', color: '#D97706' },
   { id: 'game', name: '游戏', color: '#7C3AED' },
   { id: 'software', name: '软件', color: '#059669' },
 ];
+const DEFAULT_UP_FOLDERS = [
+  { id: 'up_news', name: '国际时政', color: '#E11D48' },
+  { id: 'up_tech', name: '数码科技', color: '#2563EB' },
+  { id: 'up_know', name: '知识科普', color: '#059669' },
+  { id: 'up_fun', name: '趣味娱乐', color: '#D97706' },
+];
+const DEFAULT_FAV_FOLDERS = [
+  { id: 'fav_default', name: '默认收藏夹', color: '#FB7299' },
+  { id: 'fav_deep', name: '深度干货', color: '#2563EB' },
+];
+let activeFolderScope = 'summary';
+let folderMgrScope = 'summary';
+let expandedFavFolders = new Set();
+let favDeckOffsets = {};
+let submitSelectedFolders = new Set();
+let addUpSelectedFolders = new Set();
 const DEFAULT_PREFS = {
   send_email_on_single: true,
   default_email_style: 'editorial',
@@ -3119,26 +3481,49 @@ async function bootstrapAuth() {
   }
 }
 
-// ── Theme & Plan A/B Rail Collapse + Mobile Drawer ──
+// ── Day-Night Theme Controller (View-Transition Radial Wave) + Brand Toggle ──
+let activeThemeVt = null;
+function applyThemeDom(val) {
+  document.documentElement.setAttribute('data-theme', val);
+  document.documentElement.style.colorScheme = val;
+  document.querySelectorAll('theme-button').forEach(b => b.setAttribute('value', val));
+}
+function setSiteTheme(next, point) {
+  const val = next === 'dark' ? 'dark' : 'light';
+  localStorage.setItem(LS_THEME, val);
+  document.querySelectorAll('theme-button').forEach(b => b.setAttribute('value', val));
+  const reduce = matchMedia('(prefers-reduced-motion: reduce)').matches;
+  if (reduce || !document.startViewTransition) { applyThemeDom(val); return; }
+  if (activeThemeVt) { try { activeThemeVt.skipTransition(); } catch {} activeThemeVt = null; }
+  const root = document.documentElement;
+  const W = root.clientWidth || window.innerWidth, H = root.clientHeight || window.innerHeight;
+  const ox = point && Number.isFinite(point.x) ? point.x : W - 90;
+  const oy = point && Number.isFinite(point.y) ? point.y : 28;
+  const rad = Math.hypot(Math.max(ox, W - ox), Math.max(oy, H - oy)) || 1;
+  root.setAttribute('data-shiran-vt', '');
+  try {
+    const vt = document.startViewTransition(() => { applyThemeDom(val); });
+    activeThemeVt = vt;
+    vt.ready.then(() => {
+      if (activeThemeVt !== vt) return;
+      root.animate(
+        { clipPath: ['circle(0px at ' + ox + 'px ' + oy + 'px)', 'circle(' + rad + 'px at ' + ox + 'px ' + oy + 'px)'] },
+        { duration: 1100, easing: 'cubic-bezier(0.4,0,0.5,1)', fill: 'forwards', pseudoElement: '::view-transition-new(root)' }
+      );
+    }).catch(() => { applyThemeDom(val); root.removeAttribute('data-shiran-vt'); });
+    vt.finished.finally(() => { if (activeThemeVt === vt) { activeThemeVt = null; root.removeAttribute('data-shiran-vt'); } });
+  } catch {
+    applyThemeDom(val); root.removeAttribute('data-shiran-vt');
+  }
+}
 function initTheme() {
   const saved = localStorage.getItem(LS_THEME) || 'light';
-  document.documentElement.setAttribute('data-theme', saved);
-  updateThemeButtons();
-}
-function toggleTheme() {
-  const cur = document.documentElement.getAttribute('data-theme') || 'light';
-  const next = cur === 'dark' ? 'light' : 'dark';
-  document.documentElement.setAttribute('data-theme', next);
-  localStorage.setItem(LS_THEME, next);
-  updateThemeButtons();
-}
-function updateThemeButtons() {
-  const isDark = document.documentElement.getAttribute('data-theme') === 'dark';
-  const icon = isDark ? SVG_SUN : SVG_MOON;
-  const gBtn = document.getElementById('gateThemeBtn');
-  if (gBtn) gBtn.innerHTML = icon;
-  const rBtn = document.getElementById('railThemeBtn');
-  if (rBtn) rBtn.innerHTML = icon + '<span class="rail-label">' + (isDark ? '浅色' : '暗色') + '</span>';
+  applyThemeDom(saved);
+  document.querySelectorAll('theme-button').forEach(btn => {
+    btn.addEventListener('change', ev => {
+      if (ev.detail === 'dark' || ev.detail === 'light') setSiteTheme(ev.detail, ev.point || null);
+    });
+  });
 }
 
 function applyRailCollapsedState() {
@@ -3153,10 +3538,8 @@ function toggleRailCollapsed() {
   setTimeout(() => { updateAllSliders(true); moveRailNavSlider(true); }, 260);
 }
 function onBrandClick() {
-  const shell = document.getElementById('appShell');
   if (window.innerWidth <= 768) { toggleMobileNav(false); return; }
-  if (shell.classList.contains('rail-collapsed')) toggleRailCollapsed();
-  else navigate('summary');
+  toggleRailCollapsed();
 }
 function toggleMobileNav(forceState) {
   const shell = document.getElementById('appShell');
@@ -3167,7 +3550,7 @@ function toggleMobileNav(forceState) {
 }
 
 // ── Spring Sliding Pill Engine (Horizontal + Vertical Rail) ──
-const SLIDER_IDS = ['segTabs', 'wlFilterTabs', 'favTypeTabs', 'histStatusTabs', 'folderViewTabs', 'submitModeTabs', 'monitorTabs'];
+const SLIDER_IDS = ['segTabs', 'wlFilterTabs', 'histStatusTabs', 'folderViewTabs', 'submitModeTabs', 'monitorTabs', 'folderMgrTabs'];
 
 function moveSlider(containerId, instant) {
   const box = document.getElementById(containerId);
@@ -3302,29 +3685,52 @@ document.addEventListener('keydown', (e) => {
     e.preventDefault(); openSubmitModal('single');
   } else if (e.key === 'Escape') {
     closeTagPopover();
-    ['submitModal', 'tagManagerModal', 'summaryModal', 'settingsModal', 'monitorModal'].forEach(closeModal);
+    ['submitModal', 'addMonitorModal', 'tagManagerModal', 'summaryModal', 'settingsModal', 'monitorModal'].forEach(closeModal);
     toggleMobileNav(false);
   }
 });
 
-// ── Library State (Tag Folders + Watch Later + Favorites) ──
+// ── 3-Scope Library State (摘要分类 / UP主分类 / 收藏文件夹 + Watch Later + Favorites) ──
+function normLocalLib(raw) {
+  const src = raw && typeof raw === 'object' ? raw : {};
+  const sf = Array.isArray(src.summary_folders) && src.summary_folders.length ? src.summary_folders : (Array.isArray(src.folders) && src.folders.length ? src.folders : DEFAULT_SUMMARY_FOLDERS.map(f => ({ ...f })));
+  const uf = Array.isArray(src.up_folders) && src.up_folders.length ? src.up_folders : DEFAULT_UP_FOLDERS.map(f => ({ ...f }));
+  const ff = Array.isArray(src.fav_folders) && src.fav_folders.length ? src.fav_folders : DEFAULT_FAV_FOLDERS.map(f => ({ ...f }));
+  return {
+    folders: sf,
+    summary_folders: sf,
+    up_folders: uf,
+    fav_folders: ff,
+    job_tags: src.job_tags && typeof src.job_tags === 'object' ? src.job_tags : {},
+    up_tags: src.up_tags && typeof src.up_tags === 'object' ? src.up_tags : {},
+    fav_folder_map: src.fav_folder_map && typeof src.fav_folder_map === 'object' ? src.fav_folder_map : {},
+    watch_later: Array.isArray(src.watch_later) ? src.watch_later : [],
+    favorites: Array.isArray(src.favorites) ? src.favorites : [],
+  };
+}
 function loadLocalLibrary() {
-  try {
-    const raw = JSON.parse(localStorage.getItem(LS_LIBRARY) || 'null');
-    if (raw && typeof raw === 'object') {
-      return {
-        folders: Array.isArray(raw.folders) && raw.folders.length ? raw.folders : DEFAULT_FOLDERS.map(f => ({ ...f })),
-        job_tags: raw.job_tags && typeof raw.job_tags === 'object' ? raw.job_tags : {},
-        up_tags: raw.up_tags && typeof raw.up_tags === 'object' ? raw.up_tags : {},
-        watch_later: Array.isArray(raw.watch_later) ? raw.watch_later : [],
-        favorites: Array.isArray(raw.favorites) ? raw.favorites : [],
-      };
-    }
-  } catch {}
-  return { folders: DEFAULT_FOLDERS.map(f => ({ ...f })), job_tags: {}, up_tags: {}, watch_later: [], favorites: [] };
+  try { return normLocalLib(JSON.parse(localStorage.getItem(LS_LIBRARY) || 'null')); }
+  catch { return normLocalLib(null); }
+}
+function getScopeFolders(scope) {
+  if (scope === 'up') return libraryState.up_folders || [];
+  if (scope === 'fav') return libraryState.fav_folders || [];
+  return libraryState.summary_folders || [];
+}
+function setScopeFolders(scope, arr) {
+  if (scope === 'up') libraryState.up_folders = arr;
+  else if (scope === 'fav') libraryState.fav_folders = arr;
+  else { libraryState.summary_folders = arr; libraryState.folders = arr; }
+}
+function getFolderById(id, scope) {
+  if (scope) return getScopeFolders(scope).find(f => f.id === id) || null;
+  return (libraryState.summary_folders || []).find(f => f.id === id)
+    || (libraryState.up_folders || []).find(f => f.id === id)
+    || (libraryState.fav_folders || []).find(f => f.id === id) || null;
 }
 
 function saveLibraryLocalAndCloud() {
+  libraryState.folders = libraryState.summary_folders;
   try { localStorage.setItem(LS_LIBRARY, JSON.stringify(libraryState)); } catch {}
   updateNavBadges();
   renderRailFolders();
@@ -3349,23 +3755,19 @@ async function syncLibraryFromR2() {
     if (!r.ok) return;
     const d = await r.json();
     if (!d || !d.library) return;
-    const remote = d.library;
+    const remote = normLocalLib(d.library);
     const localHas = Boolean(localStorage.getItem(LS_LIBRARY));
     if (!localHas) {
-      libraryState = {
-        folders: remote.folders && remote.folders.length ? remote.folders : DEFAULT_FOLDERS.map(f => ({ ...f })),
-        job_tags: remote.job_tags || {},
-        up_tags: remote.up_tags || {},
-        watch_later: remote.watch_later || [],
-        favorites: remote.favorites || [],
-      };
+      libraryState = remote;
     } else {
-      const fMap = new Map();
-      (remote.folders || []).forEach(f => fMap.set(f.id, f));
-      (libraryState.folders || []).forEach(f => fMap.set(f.id, f));
-      libraryState.folders = Array.from(fMap.values());
-      libraryState.job_tags = { ...(remote.job_tags || {}), ...(libraryState.job_tags || {}) };
-      libraryState.up_tags = { ...(remote.up_tags || {}), ...(libraryState.up_tags || {}) };
+      const mergeF = (a, b) => { const m = new Map(); (a || []).forEach(f => m.set(f.id, f)); (b || []).forEach(f => m.set(f.id, f)); return Array.from(m.values()); };
+      libraryState.summary_folders = mergeF(remote.summary_folders, libraryState.summary_folders);
+      libraryState.folders = libraryState.summary_folders;
+      libraryState.up_folders = mergeF(remote.up_folders, libraryState.up_folders);
+      libraryState.fav_folders = mergeF(remote.fav_folders, libraryState.fav_folders);
+      libraryState.job_tags = { ...remote.job_tags, ...libraryState.job_tags };
+      libraryState.up_tags = { ...remote.up_tags, ...libraryState.up_tags };
+      libraryState.fav_folder_map = { ...remote.fav_folder_map, ...libraryState.fav_folder_map };
       const mergeVids = (a, b) => {
         const m = new Map();
         (a || []).forEach(v => { if (v && v.bvid) m.set(v.bvid, v); });
@@ -3380,19 +3782,25 @@ async function syncLibraryFromR2() {
   } catch {}
 }
 
-function getFolderById(id) { return (libraryState.folders || []).find(f => f.id === id) || null; }
 function jobTagKey(job) { return String((job && (job.bvid || job.id)) || ''); }
 function getJobTagIds(job) {
   const k = jobTagKey(job);
   if (!k) return [];
-  const valid = new Set((libraryState.folders || []).map(f => f.id));
+  const valid = new Set((libraryState.summary_folders || []).map(f => f.id));
   return (libraryState.job_tags[k] || []).filter(id => valid.has(id));
 }
 function getUpTagIds(mid) {
   const k = String(mid || '');
   if (!k) return [];
-  const valid = new Set((libraryState.folders || []).map(f => f.id));
+  const valid = new Set((libraryState.up_folders || []).map(f => f.id));
   return (libraryState.up_tags[k] || []).filter(id => valid.has(id));
+}
+function getFavFolderIds(bvid) {
+  const folders = libraryState.fav_folders || [];
+  if (!folders.length) return [];
+  const valid = new Set(folders.map(f => f.id));
+  const assigned = (libraryState.fav_folder_map[bvid] || []).filter(id => valid.has(id));
+  return assigned.length ? assigned : [folders[0].id];
 }
 function isWatchLater(bvid) { return Boolean(bvid && (libraryState.watch_later || []).some(v => v.bvid === bvid)); }
 function isFavBvid(bvid) { return Boolean(bvid && (libraryState.favorites || []).some(v => v.bvid === bvid)); }
@@ -3483,12 +3891,27 @@ function handleHashRoute(isInit) {
   if (!raw) { activateRoute('summary', selectedJobId || '', isInit); return; }
   const parts = raw.split('/');
   const r = parts[0];
+  if (r === 'folder') {
+    const scope = (parts[1] === 'up' || parts[1] === 'summary') ? parts[1] : 'summary';
+    const fid = parts[2] ? decodeURIComponent(parts[2]) : (parts[1] && parts[1] !== 'up' && parts[1] !== 'summary' ? decodeURIComponent(parts[1]) : '');
+    activeFolderScope = scope;
+    activateRoute('folder', fid, isInit);
+    return;
+  }
   const param = parts[1] ? decodeURIComponent(parts[1]) : '';
-  if (['summary', 'monitor', 'watch-later', 'favorites', 'history', 'folder'].includes(r)) {
+  if (['summary', 'monitor', 'watch-later', 'favorites', 'history'].includes(r)) {
     activateRoute(r, param, isInit);
   } else {
     activateRoute('summary', '', isInit);
   }
+}
+function navigateFolder(scope, fid) {
+  closeTagPopover();
+  toggleMobileNav(false);
+  activeFolderScope = scope === 'up' ? 'up' : 'summary';
+  const h = '#/folder/' + activeFolderScope + '/' + encodeURIComponent(fid);
+  if (window.location.hash !== h) window.location.hash = h;
+  else activateRoute('folder', fid, false);
 }
 window.addEventListener('hashchange', () => { if (authUser) handleHashRoute(false); });
 
@@ -3512,7 +3935,8 @@ async function activateRoute(route, param, isInit) {
 
   // Update Rail active states + vertical spring slider
   document.querySelectorAll('#railNav .rail-item').forEach(b => b.classList.toggle('active', b.dataset.route === route));
-  document.querySelectorAll('#railFolderList .folder-nav-item').forEach(b => b.classList.toggle('active', route === 'folder' && b.dataset.fid === activeFolderId));
+  document.querySelectorAll('#railSummaryFolderList .folder-nav-item').forEach(b => b.classList.toggle('active', route === 'folder' && activeFolderScope === 'summary' && b.dataset.fid === activeFolderId));
+  document.querySelectorAll('#railUpFolderList .folder-nav-item').forEach(b => b.classList.toggle('active', route === 'folder' && activeFolderScope === 'up' && b.dataset.fid === activeFolderId));
   moveRailNavSlider(Boolean(isInit));
 
   document.getElementById('topbarTitle').textContent = ROUTE_TITLES[route] || '摘要工作台';
@@ -3547,7 +3971,6 @@ async function activateRoute(route, param, isInit) {
     requestAnimationFrame(() => moveSlider('wlFilterTabs', true));
   } else if (route === 'favorites') {
     renderFavoritesPage();
-    requestAnimationFrame(() => moveSlider('favTypeTabs', true));
   } else if (route === 'history') {
     renderHistoryPage();
     requestAnimationFrame(() => moveSlider('histStatusTabs', true));
@@ -3572,22 +3995,32 @@ function updateNavBadges() {
 }
 
 function renderRailFolders() {
-  const box = document.getElementById('railFolderList');
-  if (!box) return;
+  const sumBox = document.getElementById('railSummaryFolderList');
+  const upBox = document.getElementById('railUpFolderList');
   const jobs = getJobs();
   const ups = monitorConfig.up_list || [];
-  const folders = libraryState.folders || [];
-  box.innerHTML = folders.map(f => {
-    const jCnt = jobs.filter(j => getJobTagIds(j).includes(f.id)).length;
-    const uCnt = ups.filter(u => getUpTagIds(u.mid).includes(f.id)).length;
-    const total = jCnt + uCnt;
-    const active = currentRoute === 'folder' && activeFolderId === f.id ? ' active' : '';
-    return '<button class="folder-nav-item' + active + '" data-fid="' + esc(f.id) + '" data-tip="' + esc(f.name) + (total ? (' (' + total + ')') : '') + '" onclick="navigate(\'folder\',\'' + esc(f.id) + '\')">' +
-      '<span class="folder-dot" style="background:' + esc(f.color) + '"></span>' +
-      '<span class="rail-label">' + esc(f.name) + '</span>' +
-      (total ? '<span class="rail-badge">' + total + '</span>' : '') +
-    '</button>';
-  }).join('');
+  if (sumBox) {
+    sumBox.innerHTML = (libraryState.summary_folders || []).map(f => {
+      const cnt = jobs.filter(j => getJobTagIds(j).includes(f.id)).length;
+      const active = currentRoute === 'folder' && activeFolderScope === 'summary' && activeFolderId === f.id ? ' active' : '';
+      return '<button class="folder-nav-item' + active + '" data-fid="' + esc(f.id) + '" data-tip="摘要 · ' + esc(f.name) + (cnt ? (' (' + cnt + ')') : '') + '" onclick="navigateFolder(\'summary\',\'' + esc(f.id) + '\')">' +
+        '<span class="folder-dot" style="background:' + esc(f.color) + '"></span>' +
+        '<span class="rail-label">' + esc(f.name) + '</span>' +
+        (cnt ? '<span class="rail-badge">' + cnt + '</span>' : '') +
+      '</button>';
+    }).join('');
+  }
+  if (upBox) {
+    upBox.innerHTML = (libraryState.up_folders || []).map(f => {
+      const cnt = ups.filter(u => getUpTagIds(u.mid).includes(f.id)).length;
+      const active = currentRoute === 'folder' && activeFolderScope === 'up' && activeFolderId === f.id ? ' active' : '';
+      return '<button class="folder-nav-item' + active + '" data-fid="' + esc(f.id) + '" data-tip="UP · ' + esc(f.name) + (cnt ? (' (' + cnt + ')') : '') + '" onclick="navigateFolder(\'up\',\'' + esc(f.id) + '\')">' +
+        '<span class="folder-dot" style="background:' + esc(f.color) + '"></span>' +
+        '<span class="rail-label">' + esc(f.name) + '</span>' +
+        (cnt ? '<span class="rail-badge">' + cnt + '</span>' : '') +
+      '</button>';
+    }).join('');
+  }
 }
 
 // ── User Preferences ──
@@ -3641,13 +4074,75 @@ function saveUserPrefs() {
 function clearLocalCaches() { clearFeedCache(); toast('已清空 UP 主动态封面缓存'); }
 
 // ── Submit Modal (Single & Batch, Ctrl+K) ──
+function renderSubmitFolderPicker() {
+  const box = document.getElementById('submitFolderPicker');
+  if (!box) return;
+  box.innerHTML = (libraryState.summary_folders || []).map(f => {
+    const sel = submitSelectedFolders.has(f.id) ? ' selected' : '';
+    return '<button type="button" class="pick-chip' + sel + '" onclick="toggleSubmitFolderPick(\'' + esc(f.id) + '\')"><span class="folder-dot" style="width:7px;height:7px;background:' + esc(f.color) + '"></span><span>' + esc(f.name) + '</span></button>';
+  }).join('');
+}
+function toggleSubmitFolderPick(fid) {
+  if (submitSelectedFolders.has(fid)) submitSelectedFolders.delete(fid); else submitSelectedFolders.add(fid);
+  renderSubmitFolderPicker();
+}
 function openSubmitModal(tab) {
+  submitSelectedFolders.clear();
+  renderSubmitFolderPicker();
   openModal('submitModal');
   switchSubmitTab(tab || 'single', true);
   setTimeout(() => {
     const el = document.getElementById(submitModalTab === 'batch' ? 'batchUrlsInput' : 'modalVideoUrl');
     if (el) el.focus();
   }, 60);
+}
+function renderAddUpFolderPicker() {
+  const box = document.getElementById('addUpFolderPicker');
+  if (!box) return;
+  box.innerHTML = (libraryState.up_folders || []).map(f => {
+    const sel = addUpSelectedFolders.has(f.id) ? ' selected' : '';
+    return '<button type="button" class="pick-chip' + sel + '" onclick="toggleAddUpFolderPick(\'' + esc(f.id) + '\')"><span class="folder-dot" style="width:7px;height:7px;background:' + esc(f.color) + '"></span><span>' + esc(f.name) + '</span></button>';
+  }).join('');
+}
+function toggleAddUpFolderPick(fid) {
+  if (addUpSelectedFolders.has(fid)) addUpSelectedFolders.delete(fid); else addUpSelectedFolders.add(fid);
+  renderAddUpFolderPicker();
+}
+function openAddMonitorModal() {
+  addUpSelectedFolders.clear();
+  renderAddUpFolderPicker();
+  document.getElementById('modalAddUpInput').value = '';
+  document.getElementById('modalAddUpToast').className = 'sb-toast';
+  openModal('addMonitorModal');
+  setTimeout(() => document.getElementById('modalAddUpInput').focus(), 60);
+}
+async function submitModalAddUp() {
+  const inp = document.getElementById('modalAddUpInput'), q = inp.value.trim();
+  if (!q) { showToast('modalAddUpToast', '请输入 UP 主 UID 或主页链接', 'err'); return; }
+  const btn = document.getElementById('modalAddUpBtn'); btn.disabled = true; btn.textContent = '解析中...';
+  try {
+    const r = await apiFetch('/api/up-lookup?q=' + encodeURIComponent(q));
+    const d = await r.json();
+    if (!r.ok) { showToast('modalAddUpToast', d.error || '解析失败', 'err'); return; }
+    if (!monitorConfig.up_list) monitorConfig.up_list = [];
+    if (!monitorConfig.up_list.some(x => Number(x.mid) === Number(d.mid))) {
+      monitorConfig.up_list.push({ mid: Number(d.mid), name: d.name || String(d.mid), face: d.face || '' });
+      const sr = await apiFetch('/api/monitor-config', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(monitorConfig) });
+      const sd = await sr.json();
+      if (sr.ok && sd.config) monitorConfig = sd.config;
+    }
+    if (addUpSelectedFolders.size) {
+      const k = String(d.mid);
+      libraryState.up_tags[k] = [...new Set([...(libraryState.up_tags[k] || []), ...Array.from(addUpSelectedFolders)])];
+      saveLibraryLocalAndCloud();
+    }
+    clearFeedCache('all');
+    updateNavBadges(); renderRailFolders();
+    if (currentRoute === 'monitor') { updateMonitorHeaderSummary(); renderMonitorFolderBar(); renderUpSidebar(); }
+    closeModal('addMonitorModal');
+    toast('已新增监控 UP 主：' + (d.name || d.mid));
+  } catch (e) { showToast('modalAddUpToast', '添加异常：' + e.message, 'err'); }
+  finally { btn.disabled = false; btn.textContent = '解析并添加监控'; }
 }
 function switchSubmitTab(tab, instant) {
   submitModalTab = tab;
@@ -3714,10 +4209,15 @@ async function submitVideo(overrideUrl, meta, stayOnPage) {
       title: data.title || (meta && meta.title) || data.bvid,
       owner: data.owner || (meta && meta.owner) || '',
       duration: data.duration || (meta && meta.duration) || '',
+      pic: data.pic || (meta && meta.pic) || '',
       status: 'pending',
       created_at: new Date().toISOString(),
       video_url: 'https://www.bilibili.com/video/' + data.bvid,
     };
+    if (submitSelectedFolders.size && newJob.bvid) {
+      libraryState.job_tags[newJob.bvid] = [...new Set([...(libraryState.job_tags[newJob.bvid] || []), ...Array.from(submitSelectedFolders)])];
+      saveLibraryLocalAndCloud();
+    }
     const jobs = [newJob, ...getJobs().filter(j => j.id !== newJob.id)];
     saveJobs(jobs);
     if (!stayOnPage) {
@@ -3837,11 +4337,11 @@ function toggleFavoriteVideo(videoObj) {
 
 function toggleWatchLaterCurrent() {
   const job = getJobs().find(j => j.id === selectedJobId);
-  if (job) toggleWatchLaterVideo({ bvid: job.bvid, job_id: job.id, title: job.title, author: job.owner, duration: job.duration, url: job.video_url });
+  if (job) toggleWatchLaterVideo({ bvid: job.bvid, job_id: job.id, title: job.title, author: job.owner, duration: job.duration, pic: job.pic || '', url: job.video_url });
 }
 function toggleStarCurrent() {
   const job = getJobs().find(j => j.id === selectedJobId);
-  if (job) toggleFavoriteVideo({ bvid: job.bvid, job_id: job.id, title: job.title, author: job.owner, duration: job.duration, url: job.video_url });
+  if (job) toggleFavoriteVideo({ bvid: job.bvid, job_id: job.id, title: job.title, author: job.owner, duration: job.duration, pic: job.pic || '', url: job.video_url });
 }
 function updateStarBtn(job) {
   const btn = document.getElementById('starBtn'), txt = document.getElementById('starBtnText');
@@ -3887,20 +4387,43 @@ function closeTagPopover() {
 function refreshOpenTagPopover() {
   if (activeTagPopoverCtx) renderTagPopoverBody(activeTagPopoverCtx.targetType, activeTagPopoverCtx.targetKey);
 }
+function toggleFavFolderAssign(bvid, folderId) {
+  if (!bvid || !folderId) return;
+  const cur = new Set(getFavFolderIds(bvid));
+  if (cur.has(folderId)) {
+    if (cur.size > 1) cur.delete(folderId);
+    else { toast('每条收藏至少需保留在 1 个收藏文件夹中', true); return; }
+  } else {
+    cur.add(folderId);
+  }
+  libraryState.fav_folder_map[bvid] = Array.from(cur);
+  saveLibraryLocalAndCloud();
+  refreshAllLibraryViews();
+  refreshOpenTagPopover();
+}
+function openCurrentJobTagPopover(btn) {
+  const job = getJobs().find(j => j.id === selectedJobId);
+  if (job) openTagPopover(btn, 'job', jobTagKey(job));
+}
 function renderTagPopoverBody(targetType, targetKey) {
   const pop = document.getElementById('tagPopover');
   if (!pop) return;
-  const folders = libraryState.folders || [];
-  const chosen = new Set(targetType === 'up' ? getUpTagIds(targetKey) : (libraryState.job_tags[targetKey] || []));
-  const fnName = targetType === 'up' ? 'toggleUpTag' : 'toggleJobTag';
-  let html = '<div class="tag-pop-head">选择标签文件夹</div>';
+  const scope = targetType === 'up' ? 'up' : (targetType === 'fav' ? 'fav' : 'summary');
+  const folders = getScopeFolders(scope);
+  const chosen = new Set(
+    targetType === 'up' ? getUpTagIds(targetKey)
+    : (targetType === 'fav' ? getFavFolderIds(targetKey) : (libraryState.job_tags[targetKey] || []))
+  );
+  const fnName = targetType === 'up' ? 'toggleUpTag' : (targetType === 'fav' ? 'toggleFavFolderAssign' : 'toggleJobTag');
+  const headText = targetType === 'up' ? '归入 UP 主分类' : (targetType === 'fav' ? '选择收藏文件夹' : '选择摘要分类');
+  let html = '<div class="tag-pop-head">' + headText + '</div>';
   html += folders.map(f => {
     const sel = chosen.has(f.id);
     return '<button type="button" class="tag-pop-item' + (sel ? ' selected' : '') + '" onclick="' + fnName + '(\'' + esc(targetKey) + '\',\'' + esc(f.id) + '\')">' +
       '<span class="tag-pop-left"><span class="folder-dot" style="background:' + esc(f.color) + '"></span><span>' + esc(f.name) + '</span></span>' +
       (sel ? SVG_CHK : '') + '</button>';
   }).join('');
-  html += '<div class="tag-pop-sep"></div><button type="button" class="tag-pop-item" onclick="closeTagPopover();openTagManagerModal()"><span class="tag-pop-left" style="color:var(--brand-dark);font-weight:600">+ 新建或管理文件夹</span></button>';
+  html += '<div class="tag-pop-sep"></div><button type="button" class="tag-pop-item" onclick="closeTagPopover();openTagManagerModal(\'' + scope + '\')"><span class="tag-pop-left" style="color:var(--brand-dark);font-weight:600">+ 管理' + (scope === 'up' ? ' UP 分类' : (scope === 'fav' ? '收藏文件夹' : '摘要分类')) + '</span></button>';
   pop.innerHTML = html;
 }
 function openTagPopover(anchorEl, targetType, targetKey) {
@@ -3925,45 +4448,78 @@ document.addEventListener('click', (e) => {
   closeTagPopover();
 });
 
-function openTagManagerModal() {
+function openTagManagerModal(scope) {
   closeTagPopover();
+  folderMgrScope = (scope === 'up' || scope === 'fav') ? scope : 'summary';
   renderFolderColorSwatches();
-  renderFolderManagerList();
   openModal('tagManagerModal');
+  switchFolderMgrScope(folderMgrScope, true);
+}
+function switchFolderMgrScope(scope, instant) {
+  folderMgrScope = scope;
+  document.querySelectorAll('#folderMgrTabs .seg-tab').forEach(b => b.classList.toggle('active', b.dataset.fscope === scope));
+  requestAnimationFrame(() => moveSlider('folderMgrTabs', Boolean(instant)));
+  const labels = { summary: '新建摘要分类', up: '新建 UP 主分类', fav: '新建收藏文件夹' };
+  const titles = { summary: '已有摘要分类', up: '已有 UP 主分类', fav: '已有收藏文件夹' };
+  const phs = { summary: '例如：科技、历史、游戏、AI工具...', up: '例如：国际时政、数码测评、学习干货...', fav: '例如：深度干货、稍后精读、灵感素材...' };
+  document.getElementById('newFolderLabel').textContent = labels[scope] || '新建分类';
+  document.getElementById('existingFolderTitle').textContent = titles[scope] || '已有分类';
+  document.getElementById('newFolderNameInput').placeholder = phs[scope] || '输入名称...';
+  renderFolderManagerList();
 }
 function renderFolderColorSwatches() {
   const box = document.getElementById('folderColorSwatches');
   if (!box) return;
   box.innerHTML = FOLDER_COLORS.map(c => '<button type="button" class="color-sw' + (selectedNewFolderColor === c ? ' active' : '') + '" style="background:' + c + '" onclick="selectedNewFolderColor=\'' + c + '\';renderFolderColorSwatches()"></button>').join('');
 }
+function getAllFavoritesMerged() {
+  const jobs = getJobs();
+  const map = new Map();
+  (libraryState.favorites || []).forEach(v => { if (v && v.bvid) map.set(v.bvid, { ...v }); });
+  jobs.forEach(j => {
+    if (j.starred && j.bvid) {
+      const ex = map.get(j.bvid);
+      if (!ex) map.set(j.bvid, { bvid: j.bvid, job_id: j.id, title: j.title, author: j.owner, duration: j.duration, pic: j.pic || '', url: j.video_url, added_at: j.created_at });
+      else if (!ex.pic && j.pic) ex.pic = j.pic;
+    }
+  });
+  return Array.from(map.values()).sort((a, b) => new Date(b.added_at || 0) - new Date(a.added_at || 0));
+}
 function renderFolderManagerList() {
   const box = document.getElementById('folderMgrList');
   if (!box) return;
-  const jobs = getJobs(), ups = monitorConfig.up_list || [], folders = libraryState.folders || [];
-  if (!folders.length) { box.innerHTML = '<div style="text-align:center;color:var(--muted);padding:16px;font-size:12.5px">暂无标签文件夹</div>'; return; }
-  box.innerHTML = folders.map(f => {
-    const jCnt = jobs.filter(j => getJobTagIds(j).includes(f.id)).length;
-    const uCnt = ups.filter(u => getUpTagIds(u.mid).includes(f.id)).length;
-    return '<div class="folder-mgr-row"><div class="folder-mgr-left"><span class="folder-dot" style="width:10px;height:10px;background:' + esc(f.color) + '"></span><div><div class="folder-mgr-name">' + esc(f.name) + '</div><div class="folder-mgr-stat">摘要 ' + jCnt + ' 条 · UP主 ' + uCnt + ' 位</div></div></div><div style="display:flex;gap:6px"><button type="button" class="btn btn-sm" onclick="renameFolder(\'' + esc(f.id) + '\')">重命名</button><button type="button" class="btn btn-sm" style="color:var(--err)" onclick="deleteFolder(\'' + esc(f.id) + '\')">删除</button></div></div>';
+  const jobs = getJobs(), ups = monitorConfig.up_list || [], favs = getAllFavoritesMerged();
+  const folders = getScopeFolders(folderMgrScope);
+  if (!folders.length) { box.innerHTML = '<div style="text-align:center;color:var(--muted);padding:16px;font-size:12.5px">暂无文件夹</div>'; return; }
+  box.innerHTML = folders.map((f, idx) => {
+    let stat = '';
+    if (folderMgrScope === 'summary') stat = '摘要 ' + jobs.filter(j => getJobTagIds(j).includes(f.id)).length + ' 篇';
+    else if (folderMgrScope === 'up') stat = 'UP主 ' + ups.filter(u => getUpTagIds(u.mid).includes(f.id)).length + ' 位';
+    else stat = '收藏 ' + favs.filter(v => getFavFolderIds(v.bvid).includes(f.id)).length + ' 条';
+    const canDel = !(folderMgrScope === 'fav' && folders.length <= 1);
+    return '<div class="folder-mgr-row"><div class="folder-mgr-left"><span class="folder-dot" style="width:10px;height:10px;background:' + esc(f.color) + '"></span><div><div class="folder-mgr-name">' + esc(f.name) + '</div><div class="folder-mgr-stat">' + stat + '</div></div></div><div style="display:flex;gap:6px"><button type="button" class="btn btn-sm" onclick="renameFolder(\'' + esc(f.id) + '\',\'' + folderMgrScope + '\')">重命名</button>' + (canDel ? '<button type="button" class="btn btn-sm" style="color:var(--err)" onclick="deleteFolder(\'' + esc(f.id) + '\',\'' + folderMgrScope + '\')">删除</button>' : '') + '</div></div>';
   }).join('');
 }
 function createNewFolder() {
   const inp = document.getElementById('newFolderNameInput');
   const name = (inp.value || '').trim().slice(0, 16);
   if (!name) { toast('请输入文件夹名称', true); return; }
-  if ((libraryState.folders || []).some(f => f.name === name)) { toast('已存在同名文件夹', true); return; }
-  const id = 'f_' + Date.now().toString(36) + '_' + Math.random().toString(36).slice(2, 5);
-  libraryState.folders.push({ id, name, color: selectedNewFolderColor || FOLDER_COLORS[0] });
+  const arr = getScopeFolders(folderMgrScope);
+  if (arr.some(f => f.name === name)) { toast('已存在同名文件夹', true); return; }
+  const id = folderMgrScope.slice(0, 2) + '_' + Date.now().toString(36) + '_' + Math.random().toString(36).slice(2, 5);
+  arr.push({ id, name, color: selectedNewFolderColor || FOLDER_COLORS[0] });
+  setScopeFolders(folderMgrScope, arr);
   inp.value = '';
   saveLibraryLocalAndCloud();
   renderFolderManagerList();
   refreshAllLibraryViews();
-  toast('已创建标签文件夹：' + name);
+  toast('已创建：' + name);
 }
-function renameFolder(id) {
-  const f = getFolderById(id);
+function renameFolder(id, scope) {
+  const sc = scope || folderMgrScope;
+  const f = getFolderById(id, sc);
   if (!f) return;
-  const next = prompt('输入新的标签文件夹名称：', f.name);
+  const next = prompt('输入新的名称：', f.name);
   if (next === null) return;
   const clean = next.trim().slice(0, 16);
   if (!clean) return;
@@ -3973,27 +4529,37 @@ function renameFolder(id) {
   refreshAllLibraryViews();
   toast('已重命名为：' + clean);
 }
-function deleteFolder(id) {
-  const f = getFolderById(id);
+function deleteFolder(id, scope) {
+  const sc = scope || folderMgrScope;
+  const arr = getScopeFolders(sc);
+  if (sc === 'fav' && arr.length <= 1) { toast('至少需保留一个收藏文件夹', true); return; }
+  const f = getFolderById(id, sc);
   if (!f) return;
-  if (!confirm('确定删除标签文件夹「' + f.name + '」？（不会删除视频或 UP 主本身）')) return;
-  libraryState.folders = (libraryState.folders || []).filter(x => x.id !== id);
-  if (selectedMonFolder === id) selectedMonFolder = '';
-  if (favFolderFilter === id) favFolderFilter = '';
-  if (histFolderFilter === id) histFolderFilter = '';
-  Object.keys(libraryState.job_tags).forEach(k => {
-    libraryState.job_tags[k] = (libraryState.job_tags[k] || []).filter(x => x !== id);
-    if (!libraryState.job_tags[k].length) delete libraryState.job_tags[k];
-  });
-  Object.keys(libraryState.up_tags).forEach(k => {
-    libraryState.up_tags[k] = (libraryState.up_tags[k] || []).filter(x => x !== id);
-    if (!libraryState.up_tags[k].length) delete libraryState.up_tags[k];
-  });
+  if (!confirm('确定删除「' + f.name + '」？（不会删除视频或 UP 主本身）')) return;
+  setScopeFolders(sc, arr.filter(x => x.id !== id));
+  if (sc === 'up') {
+    if (selectedMonFolder === id) selectedMonFolder = '';
+    Object.keys(libraryState.up_tags).forEach(k => {
+      libraryState.up_tags[k] = (libraryState.up_tags[k] || []).filter(x => x !== id);
+      if (!libraryState.up_tags[k].length) delete libraryState.up_tags[k];
+    });
+  } else if (sc === 'fav') {
+    Object.keys(libraryState.fav_folder_map).forEach(k => {
+      libraryState.fav_folder_map[k] = (libraryState.fav_folder_map[k] || []).filter(x => x !== id);
+      if (!libraryState.fav_folder_map[k].length) delete libraryState.fav_folder_map[k];
+    });
+  } else {
+    if (histFolderFilter === id) histFolderFilter = '';
+    Object.keys(libraryState.job_tags).forEach(k => {
+      libraryState.job_tags[k] = (libraryState.job_tags[k] || []).filter(x => x !== id);
+      if (!libraryState.job_tags[k].length) delete libraryState.job_tags[k];
+    });
+  }
   saveLibraryLocalAndCloud();
   renderFolderManagerList();
-  if (currentRoute === 'folder' && activeFolderId === id) navigate('history');
+  if (currentRoute === 'folder' && activeFolderId === id) navigate(sc === 'up' ? 'monitor' : 'history');
   else refreshAllLibraryViews();
-  toast('已删除文件夹：' + f.name);
+  toast('已删除：' + f.name);
 }
 
 // ── PAGE 1: SUMMARY WORKSPACE ──
@@ -4484,7 +5050,7 @@ function setMonFolder(fid) {
 function renderMonitorFolderBar() {
   const bar = document.getElementById('monFolderBar');
   if (!bar) return;
-  const ups = monitorConfig.up_list || [], folders = libraryState.folders || [];
+  const ups = monitorConfig.up_list || [], folders = libraryState.up_folders || [];
   let html = '<button class="folder-chip' + (!selectedMonFolder ? ' active' : '') + '" onclick="selectedMonFolder=\'\';renderMonitorFolderBar();renderUpSidebar();selectMonitorUp(\'all\')">全部</button>';
   folders.forEach(f => {
     const cnt = ups.filter(u => getUpTagIds(u.mid).includes(f.id)).length;
@@ -4843,55 +5409,131 @@ function renderWatchLaterPage() {
   grid.innerHTML = vids.map((v, idx) => buildVideoCardHtml(v, idx, { pool: 'wl', showCheck: true })).join('');
 }
 
-// ── PAGE 4: FAVORITES COLLECTION ──
-function setFavType(t) {
-  favType = t;
-  document.querySelectorAll('#favTypeTabs .seg-tab').forEach(b => b.classList.toggle('active', b.dataset.ft === t));
-  moveSlider('favTypeTabs');
-  renderFavoritesPage();
+// ── PAGE 4: FAVORITES STACKED FAN-DECK FOLDERS & ACCORDION EXPAND ──
+function toggleFavDeckExpand(fid) {
+  if (expandedFavFolders.has(fid)) expandedFavFolders.delete(fid);
+  else expandedFavFolders.add(fid);
+  const card = document.getElementById('favDeck_' + fid);
+  if (card) card.classList.toggle('expanded', expandedFavFolders.has(fid));
 }
-function setFavFolder(fid) {
-  favFolderFilter = favFolderFilter === fid ? '' : fid;
+function cycleFavDeck(fid, delta, count) {
+  if (count <= 1) return;
+  const cur = favDeckOffsets[fid] || 0;
+  favDeckOffsets[fid] = (cur + delta + count) % count;
   renderFavoritesPage();
 }
 function renderFavoritesPage() {
   const kw = (document.getElementById('favSearchInput').value || '').trim().toLowerCase();
   const jobs = getJobs();
   const jobByBvid = new Map(jobs.map(j => [j.bvid, j]));
+  const allFavs = getAllFavoritesMerged();
+  const folders = libraryState.fav_folders || [];
 
-  // Merge favorited videos + starred jobs deduplicated by bvid
-  const mergedMap = new Map();
-  (libraryState.favorites || []).forEach(v => { if (v && v.bvid) mergedMap.set(v.bvid, { ...v }); });
-  jobs.forEach(j => {
-    if (j.starred && j.bvid && !mergedMap.has(j.bvid)) {
-      mergedMap.set(j.bvid, { bvid: j.bvid, job_id: j.id, title: j.title, author: j.owner, duration: j.duration, url: j.video_url, added_at: j.created_at });
-    }
-  });
-  let items = Array.from(mergedMap.values());
-
-  // Folder filter chips
-  const bar = document.getElementById('favFolderBar');
-  const folders = libraryState.folders || [];
-  let barHtml = '<button class="folder-chip' + (!favFolderFilter ? ' active' : '') + '" onclick="setFavFolder(\'\')">全部标签</button>';
-  folders.forEach(f => {
-    const cnt = items.filter(v => (libraryState.job_tags[v.bvid] || []).includes(f.id)).length;
-    barHtml += '<button class="folder-chip' + (favFolderFilter === f.id ? ' active' : '') + '" onclick="setFavFolder(\'' + esc(f.id) + '\')"><span class="folder-dot" style="background:' + esc(f.color) + '"></span><span>' + esc(f.name) + '</span>' + (cnt ? '<span class="folder-cnt">' + cnt + '</span>' : '') + '</button>';
-  });
-  bar.innerHTML = barHtml;
-
-  if (favType === 'summary') items = items.filter(v => { const j = jobByBvid.get(v.bvid); return Boolean(j && normStatus(j.status) === 'completed'); });
-  else if (favType === 'video') items = items.filter(v => { const j = jobByBvid.get(v.bvid); return !j || normStatus(j.status) !== 'completed'; });
-  if (favFolderFilter) items = items.filter(v => (libraryState.job_tags[v.bvid] || []).includes(favFolderFilter));
-  if (kw) items = items.filter(v => (v.title || '').toLowerCase().includes(kw) || (v.author || '').toLowerCase().includes(kw) || (v.bvid || '').toLowerCase().includes(kw));
-
-  favRenderPool = items;
-  document.getElementById('favPageSub').textContent = '共收藏 ' + mergedMap.size + ' 条高价值内容（当前筛选 ' + items.length + ' 条）';
-  const grid = document.getElementById('favGrid');
-  if (!items.length) {
-    grid.innerHTML = '<div class="reader-card" style="grid-column:1/-1;text-align:center;color:var(--muted);padding:44px">暂无匹配的收藏内容。点击摘要页或视频封面上的星标图标即可收入收藏夹。</div>';
+  document.getElementById('favPageSub').textContent = folders.length + ' 个收藏文件夹 · 共收藏 ' + allFavs.length + ' 条内容 · 点击文件夹卡片下滑展开';
+  const listEl = document.getElementById('favDeckList');
+  if (!folders.length) {
+    listEl.innerHTML = '<div class="reader-card" style="text-align:center;color:var(--muted);padding:44px">暂无收藏文件夹，点击右上角「+ 新建收藏夹」开始分类收藏。</div>';
     return;
   }
-  grid.innerHTML = items.map((v, idx) => buildVideoCardHtml(v, idx, { pool: 'fav' })).join('');
+
+  favRenderPool = allFavs;
+  const favIdxByBvid = new Map(allFavs.map((v, i) => [v.bvid, i]));
+
+  const htmlParts = folders.map(f => {
+    let items = allFavs.filter(v => getFavFolderIds(v.bvid).includes(f.id));
+    if (kw) items = items.filter(v => (v.title || '').toLowerCase().includes(kw) || (v.author || '').toLowerCase().includes(kw) || (v.bvid || '').toLowerCase().includes(kw));
+    if (kw && !items.length) return '';
+
+    const isExp = expandedFavFolders.has(f.id) || Boolean(kw);
+    const total = items.length;
+    const offset = total ? ((favDeckOffsets[f.id] || 0) % total) : 0;
+
+    // Build 3-layer stacked fan deck (newest, 2nd newest, 3rd newest rotated by offset)
+    let deckHtml = '';
+    if (total === 0) {
+      deckHtml = '<div class="fan-card pos-0"><div class="fan-card-fb" style="border-top:3px solid ' + esc(f.color) + '">' + esc(f.name) + '</div></div>';
+    } else {
+      const showN = Math.min(3, total);
+      for (let layer = showN - 1; layer >= 0; layer--) {
+        const v = items[(offset + layer) % total];
+        const pic = v.pic ? (v.pic.replace(/^http:\/\//, 'https://') + '@672w_378h_1c.webp') : '';
+        deckHtml += '<div class="fan-card pos-' + layer + '">' +
+          (pic ? '<img src="' + esc(pic) + '" referrerpolicy="no-referrer" loading="lazy" alt="">' : '<div class="fan-card-fb">' + esc(v.title || v.bvid) + '</div>') +
+        '</div>';
+      }
+    }
+
+    const navHtml = total > 1
+      ? '<div class="fan-nav" onclick="event.stopPropagation()">' +
+          '<button type="button" class="fan-nav-btn" title="上一张封面" onclick="cycleFavDeck(\'' + esc(f.id) + '\',-1,' + total + ')">&lsaquo;</button>' +
+          '<span class="fan-nav-idx">' + (offset + 1) + '/' + total + '</span>' +
+          '<button type="button" class="fan-nav-btn" title="下一张封面" onclick="cycleFavDeck(\'' + esc(f.id) + '\',1,' + total + ')">&rsaquo;</button>' +
+        '</div>'
+      : '';
+
+    const previewsHtml = total
+      ? items.slice(0, 3).map((v, i) => '<div class="fav-deck-pv"><span class="fav-deck-pv-num">0' + (i + 1) + '</span><span>' + esc(v.title || v.bvid) + '</span></div>').join('')
+      : '<div class="fav-deck-pv" style="color:var(--muted)">暂无收藏内容，在视频封面或摘要页点星标即可收入</div>';
+
+    const rowsHtml = total
+      ? items.map(v => {
+          const gIdx = favIdxByBvid.get(v.bvid) || 0;
+          const matchedJob = jobByBvid.get(v.bvid);
+          const hasSum = Boolean(matchedJob && normStatus(matchedJob.status) === 'completed' && matchedJob.summary);
+          const coverUrl = v.pic ? (v.pic.replace(/^http:\/\//, 'https://') + '@672w_378h_1c.webp') : '';
+          const excerpt = hasSum ? String(matchedJob.summary || '').replace(/[#*\x60>]/g, '').replace(/\s+/g, ' ').trim().slice(0, 95) : '';
+          const vUrl = v.url || ('https://www.bilibili.com/video/' + v.bvid);
+          return '<div class="fav-item-row">' +
+            '<a class="fav-item-thumb" href="' + esc(vUrl) + '" target="_blank" rel="noopener">' +
+              (coverUrl ? '<img src="' + esc(coverUrl) + '" referrerpolicy="no-referrer" loading="lazy" alt="">' : '<div class="v-thumb-fallback" style="font-size:11.5px">' + esc(v.title || v.bvid) + '</div>') +
+              (hasSum ? '<span class="v-sum-badge">已有摘要</span>' : '') +
+              (v.duration ? '<span class="v-dur">' + esc(v.duration) + '</span>' : '') +
+            '</a>' +
+            '<div class="fav-item-mid">' +
+              '<a class="fav-item-title" href="' + esc(vUrl) + '" target="_blank" rel="noopener">' + esc(v.title || v.bvid) + '</a>' +
+              '<div class="fav-item-meta">' +
+                (v.author ? '<span>UP主：' + esc(v.author) + '</span>' : '') +
+                (v.duration ? '<span>· ' + esc(v.duration) + '</span>' : '') +
+                '<span>· ' + esc(v.bvid) + '</span>' +
+                (v.added_at ? '<span>· 收藏于 ' + esc(fmtShortDate(v.added_at)) + '</span>' : '') +
+              '</div>' +
+              (excerpt ? '<div class="fav-item-excerpt">' + esc(excerpt) + '</div>' : '') +
+            '</div>' +
+            '<div class="fav-item-acts">' +
+              (hasSum ? '<button class="btn btn-sm btn-primary" onclick="selectJob(\'' + esc(matchedJob.id) + '\',true)">打开摘要</button>' : '<button class="btn btn-sm btn-primary" onclick="submitPoolVideo(\'fav\',' + gIdx + ')">一键总结</button>') +
+              '<button class="btn btn-sm" onclick="openTagPopover(this,\'fav\',\'' + esc(v.bvid) + '\')">移动收藏夹</button>' +
+              '<a class="btn btn-sm" href="' + esc(vUrl) + '" target="_blank" rel="noopener">原视频 ↗</a>' +
+              '<button class="arch-ic-btn del" title="取消收藏" onclick="togglePoolVideoFav(\'fav\',' + gIdx + ')">' + SVG_TRASH_SM + '</button>' +
+            '</div>' +
+          '</div>';
+        }).join('')
+      : '<div style="text-align:center;color:var(--muted);padding:18px;font-size:12.5px">该收藏夹为空</div>';
+
+    return '<div class="fav-deck-card' + (isExp ? ' expanded' : '') + '" id="favDeck_' + esc(f.id) + '">' +
+      '<div class="fav-deck-head" onclick="toggleFavDeckExpand(\'' + esc(f.id) + '\')">' +
+        '<div class="fan-deck-wrap" onclick="if(' + total + '>1){event.stopPropagation();cycleFavDeck(\'' + esc(f.id) + '\',1,' + total + ');}">' +
+          '<div class="fan-deck">' + deckHtml + '</div>' +
+          navHtml +
+        '</div>' +
+        '<div class="fav-deck-info">' +
+          '<div class="fav-deck-title-row">' +
+            '<span class="folder-dot" style="width:10px;height:10px;background:' + esc(f.color) + '"></span>' +
+            '<span class="fav-deck-name">' + esc(f.name) + '</span>' +
+            '<span class="fav-deck-cnt">' + total + ' 条收藏</span>' +
+          '</div>' +
+          '<div class="fav-deck-previews">' + previewsHtml + '</div>' +
+        '</div>' +
+        '<div class="fav-deck-right" onclick="event.stopPropagation()">' +
+          '<button type="button" class="btn btn-sm" onclick="renameFolder(\'' + esc(f.id) + '\',\'fav\')">重命名</button>' +
+          (folders.length > 1 ? '<button type="button" class="btn btn-sm" style="color:var(--err)" onclick="deleteFolder(\'' + esc(f.id) + '\',\'fav\')">删除</button>' : '') +
+          '<button type="button" class="fav-deck-chev" onclick="toggleFavDeckExpand(\'' + esc(f.id) + '\')" title="展开 / 收起">' + SVG_CHEV + '</button>' +
+        '</div>' +
+      '</div>' +
+      '<div class="fav-deck-collapse"><div class="fav-deck-collapse-inner"><div class="fav-deck-items">' + rowsHtml + '</div></div></div>' +
+    '</div>';
+  }).filter(Boolean).join('');
+
+  listEl.innerHTML = htmlParts || '<div class="reader-card" style="text-align:center;color:var(--muted);padding:44px">没有找到匹配的收藏内容</div>';
 }
 
 // ── PAGE 5: HISTORY ARCHIVE + KPI STATS ──
@@ -4999,7 +5641,7 @@ function renderHistoryPage() {
     '<div class="kpi-card"><div class="kpi-label">累计免费转录</div><div class="kpi-val">' + (totalChars >= 10000 ? (totalChars / 10000).toFixed(1) + ' 万字' : totalChars + ' 字') + '</div><div class="kpi-sub">100% 免费模型驱动</div></div>';
 
   // Folder filter bar
-  const folders = libraryState.folders || [];
+  const folders = libraryState.summary_folders || [];
   let fHtml = '<button class="folder-chip' + (!histFolderFilter ? ' active' : '') + '" onclick="setHistFolder(\'\')">全部标签</button>';
   folders.forEach(f => {
     const cnt = jobs.filter(j => getJobTagIds(j).includes(f.id)).length;
@@ -5044,24 +5686,33 @@ function renderFolderSummaries(fid) {
 
 function renderFolderPage(fid, resetTab) {
   initFeedObservers();
-  const f = getFolderById(fid);
-  if (!f) { navigate('history'); return; }
+  const scope = activeFolderScope === 'up' ? 'up' : 'summary';
+  const f = getFolderById(fid, scope) || getFolderById(fid);
+  if (!f) { navigate(scope === 'up' ? 'monitor' : 'history'); return; }
   const sumCnt = getJobs().filter(j => getJobTagIds(j).includes(fid)).length;
   const upCnt = (monitorConfig.up_list || []).filter(u => getUpTagIds(u.mid).includes(fid)).length;
 
-  document.getElementById('topbarTitle').textContent = '文件夹 · ' + f.name;
+  document.getElementById('topbarTitle').textContent = (scope === 'up' ? 'UP 分类 · ' : '摘要分类 · ') + f.name;
   document.getElementById('folderPageDot').style.background = f.color;
   document.getElementById('folderPageName').textContent = f.name;
-  document.getElementById('folderPageSub').textContent = '已收录 ' + sumCnt + ' 篇摘要 · 关联 ' + upCnt + ' 位监控 UP 主';
-  renderFolderSummaries(fid);
+  document.getElementById('folderPageSub').textContent = scope === 'up'
+    ? ('UP 主分类 · 关联 ' + upCnt + ' 位监控 UP 主（支持向下滚动无限翻页）')
+    : ('摘要工作台分类 · 已归档 ' + sumCnt + ' 篇 AI 摘要');
 
-  if (resetTab) {
-    folderViewTab = (sumCnt === 0 && upCnt > 0) ? 'ups' : 'summaries';
-    document.querySelectorAll('#folderViewTabs .seg-tab').forEach(b => b.classList.toggle('active', b.dataset.fvt === folderViewTab));
-    document.getElementById('folderSummariesPane').classList.toggle('hidden', folderViewTab !== 'summaries');
-    document.getElementById('folderUpsPane').classList.toggle('hidden', folderViewTab !== 'ups');
+  const tabsEl = document.getElementById('folderViewTabs');
+  if (tabsEl) tabsEl.classList.add('hidden');
+
+  if (scope === 'up') {
+    folderViewTab = 'ups';
+    document.getElementById('folderSummariesPane').classList.add('hidden');
+    document.getElementById('folderUpsPane').classList.remove('hidden');
+    loadFolderUpsFeed(fid, false);
+  } else {
+    folderViewTab = 'summaries';
+    document.getElementById('folderSummariesPane').classList.remove('hidden');
+    document.getElementById('folderUpsPane').classList.add('hidden');
+    renderFolderSummaries(fid);
   }
-  if (folderViewTab === 'ups') loadFolderUpsFeed(fid, false);
 }
 
 function renderFolderFeedFooter() {
