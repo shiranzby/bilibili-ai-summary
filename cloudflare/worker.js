@@ -1381,9 +1381,9 @@ async function handleCron(event, env) {
 // ═══════════════════════════════════════════════════════
 
 const FREE_EDGE_LLMS = [
+  'Qwen/Qwen2.5-7B-Instruct',
   'Qwen/Qwen3-8B',
   'THUDM/GLM-4-9B-0414',
-  'Qwen/Qwen2.5-7B-Instruct',
 ];
 
 function smartTrimText(text, maxChars = 9000) {
@@ -1421,7 +1421,7 @@ async function callFreeSiliconFlowChat(env, messages, maxTokens = 1600) {
           'Content-Type': 'application/json',
         },
         body: JSON.stringify(payload),
-        signal: AbortSignal.timeout(26000),
+        signal: AbortSignal.timeout(14000),
       });
       if (resp.ok) {
         const data = await resp.json();
@@ -1484,7 +1484,7 @@ async function handleResummarize(request, env) {
   }
 
   const t0 = Date.now();
-  const { text: trimmed, trimmed: wasTrimmed } = smartTrimText(transcript, 6000);
+  const { text: trimmed, trimmed: wasTrimmed } = smartTrimText(transcript, 4200);
   const note = wasTrimmed ? '\n\n[注：原视频较长，已按开篇/中段/结尾采样精简]' : '';
   const messages = [
     { role: 'system', content: RESUMMARIZE_PROMPTS[style].sys },
@@ -1492,15 +1492,16 @@ async function handleResummarize(request, env) {
   ];
 
   try {
-    const { content, model } = await callFreeSiliconFlowChat(env, messages, 1200);
+    const { content, model } = await callFreeSiliconFlowChat(env, messages, 950);
     const elapsed = Number(((Date.now() - t0) / 1000).toFixed(1));
 
-    // Persist updated summary to R2 result if exists
+    // Persist updated summary & per-style cache to R2 result if exists
     if (jobId && env.BILIBILI_BUCKET) {
       try {
         const obj = await env.BILIBILI_BUCKET.get(`results/${jobId}.json`);
         if (obj) {
           const rec = await obj.json();
+          rec.summaries = { ...(rec.summaries || {}), [style]: content };
           rec.summary = content;
           rec.error = '';
           rec.error_stage = '';
@@ -1596,6 +1597,8 @@ function generateFrontendPage() {
   --shadow-lg:0 20px 50px rgba(15,23,42,.16);
   --shadow-pill:0 2px 8px rgba(15,23,42,.11),0 0 0 1px rgba(15,23,42,.05);
   --rail-w:228px;
+  --fd-surface:#ffffff;--fd-surface-2:#f4f5f7;--fd-surface-hover:rgba(0,0,0,0.025);
+  --fd-border:rgba(15,23,42,0.1);--fd-accent:#FB7299;--fd-text:#111827;--fd-muted:#6b7280;--fd-radius:16px;
 }
 [data-theme="dark"]{
   --bg:#0B0D12;--surface:#131722;--surface-2:#0F121A;--surface-3:#1B2030;--surface-hover:#181D2B;
@@ -1611,6 +1614,8 @@ function generateFrontendPage() {
   --shadow-md:0 8px 24px rgba(0,0,0,.45);
   --shadow-lg:0 24px 60px rgba(0,0,0,.65);
   --shadow-pill:0 2px 10px rgba(0,0,0,.45),0 0 0 1px rgba(255,255,255,.12);
+  --fd-surface:#131722;--fd-surface-2:#1B2030;--fd-surface-hover:rgba(255,255,255,0.03);
+  --fd-border:#23293A;--fd-accent:#FB7299;--fd-text:#F3F4F6;--fd-muted:#9CA3AF;
 }
 html,body{height:100%;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI','PingFang SC','Hiragino Sans GB','Microsoft YaHei',sans-serif;background:var(--bg);color:var(--text);font-size:14px;line-height:1.6;-webkit-font-smoothing:antialiased;overflow:hidden}
 button,input,select,textarea{font-family:inherit;color:inherit}
@@ -1948,11 +1953,19 @@ select.c-select-native{position:absolute!important;opacity:0!important;pointer-e
 
 .style-switch-bar{display:flex;align-items:center;justify-content:space-between;gap:10px;padding-bottom:14px;margin-bottom:18px;border-bottom:1px solid var(--border);flex-wrap:wrap}
 .style-pills{display:flex;align-items:center;gap:6px;flex-wrap:wrap}
-.style-pill{border:1px solid var(--border);background:var(--bg);color:var(--soft);height:28px;padding:0 11px;border-radius:999px;font-size:12px;font-weight:600;transition:all .15s}
+.style-pill{border:1px solid var(--border);background:var(--bg);color:var(--soft);height:28px;padding:0 11px;border-radius:999px;font-size:12px;font-weight:600;transition:all .15s;display:inline-flex;align-items:center;gap:5px}
 .style-pill:hover{border-color:var(--brand);color:var(--brand-dark)}
 .style-pill.active{border-color:var(--brand-border);background:var(--brand-soft);color:var(--brand-dark)}
-.style-pill:disabled{opacity:.5;cursor:not-allowed}
-.fs-group{display:inline-flex;align-items:center;gap:4px}
+.style-pill.has-cache::after{content:'';width:5px;height:5px;border-radius:50%;background:var(--ok);opacity:.75}
+.style-pill.is-loading::after{content:'';width:8px;height:8px;border-radius:50%;border:1.5px solid var(--brand);border-top-color:transparent;animation:spin .7s linear infinite}
+@keyframes spin{to{transform:rotate(360deg)}}
+.style-regen-btn{
+  border:1px solid var(--border);background:var(--surface);color:var(--soft);height:28px;padding:0 10px;
+  border-radius:8px;font-size:12px;font-weight:600;display:inline-flex;align-items:center;gap:5px;transition:all .15s;
+}
+.style-regen-btn:hover{border-color:var(--brand);color:var(--brand-dark);background:var(--brand-soft)}
+.style-regen-btn:disabled{opacity:.55;cursor:not-allowed}
+.fs-group{display:inline-flex;align-items:center;gap:6px}
 .fs-btn{width:28px;height:28px;border:1px solid var(--border);background:var(--surface);color:var(--soft);border-radius:7px;font-size:12px;font-weight:700}
 .fs-btn:hover{color:var(--text);border-color:var(--border-strong)}
 
@@ -2065,6 +2078,7 @@ select.c-select-native{position:absolute!important;opacity:0!important;pointer-e
   background:rgba(15,17,22,.48);backdrop-filter:blur(6px);-webkit-backdrop-filter:blur(6px);
   border:1px solid rgba(110,231,183,.42);color:#A7F3D0;
   font-size:11px;font-weight:600;padding:2px 8px;border-radius:999px;line-height:1.35;
+  opacity:0;pointer-events:none;transition:opacity .16s ease;
 }
 .v-chk-wrap{
   position:absolute;left:8px;bottom:8px;z-index:4;
@@ -2073,8 +2087,9 @@ select.c-select-native{position:absolute!important;opacity:0!important;pointer-e
   display:flex;align-items:center;gap:5px;color:#fff;font-size:11px;font-weight:600;
 }
 .v-chk-wrap input{accent-color:var(--brand);width:14px;height:14px;cursor:pointer}
-.v-quick-acts{position:absolute;top:8px;right:8px;display:flex;gap:5px;z-index:3;opacity:0;transition:opacity .16s ease}
-.v-card:hover .v-quick-acts,.v-quick-acts.has-active{opacity:1}
+.v-quick-acts{position:absolute;top:8px;right:8px;display:flex;gap:5px;z-index:3;opacity:0;pointer-events:none;transition:opacity .16s ease}
+.v-thumb-wrap:hover .v-quick-acts,.v-card:hover .v-quick-acts{opacity:1;pointer-events:auto}
+.v-thumb-wrap:hover .v-sum-badge,.v-card:hover .v-sum-badge,.fav-item-thumb:hover .v-sum-badge{opacity:1}
 .v-qbtn{
   height:25px;padding:0 8px;border-radius:999px;border:1px solid rgba(255,255,255,.24);
   background:rgba(15,17,22,.46);backdrop-filter:blur(6px);-webkit-backdrop-filter:blur(6px);
@@ -2293,71 +2308,78 @@ theme-button{flex-shrink:0}
   .topbar-title{font-size:14px}
 }
 
-/* Stacked Fan-Deck Favorite Folder Rows & Accordion Expand */
+/* Stacked Fan-Deck 扇形卡组 & 手风琴收藏夹组件 (with Portal Float Layer) */
 .fav-deck-list{display:flex;flex-direction:column;gap:14px}
-.fav-deck-card{
-  background:var(--surface);border:1px solid var(--border);border-radius:16px;
-  box-shadow:var(--shadow-sm);overflow:hidden;
-  transition:border-color .2s,box-shadow .2s;
+.fan-float-layer{position:fixed;inset:0;pointer-events:none;z-index:9999}
+.fan-folder-card{
+  position:relative;background:var(--fd-surface);border:1px solid var(--fd-border);
+  border-radius:var(--fd-radius);box-shadow:0 2px 10px rgba(15,23,42,0.04);
+  overflow:visible;transition:border-color 0.2s ease,box-shadow 0.2s ease;
 }
-.fav-deck-card:hover{border-color:var(--border-strong);box-shadow:var(--shadow-md)}
-.fav-deck-card.expanded{border-color:var(--brand-border);box-shadow:var(--shadow-md)}
-.fav-deck-head{
-  display:flex;align-items:center;gap:22px;padding:18px 22px;cursor:pointer;
-  transition:background .15s;
+.fan-folder-card.is-shuffling{z-index:25}
+.fan-folder-card:hover{border-color:color-mix(in srgb,var(--fd-accent) 45%,var(--fd-border));box-shadow:var(--shadow-md)}
+.fan-folder-card.expanded{border-color:var(--brand-border);box-shadow:var(--shadow-md)}
+.fan-folder-head{
+  display:flex;align-items:center;flex-wrap:wrap;gap:18px 22px;padding:18px 22px;
+  border-radius:var(--fd-radius);cursor:pointer;transition:background-color 0.15s ease;
 }
-.fav-deck-head:hover{background:var(--surface-hover)}
+.fan-folder-card.expanded .fan-folder-head{border-radius:var(--fd-radius) var(--fd-radius) 0 0}
+.fan-folder-head:hover{background-color:var(--fd-surface-hover)}
 
-.fan-deck-wrap{position:relative;width:206px;height:118px;flex-shrink:0;user-select:none}
+.fan-deck-wrap{
+  position:relative;z-index:10;width:206px;height:118px;flex-shrink:0;
+  user-select:none;touch-action:pan-y;cursor:grab;
+}
+.fan-deck-wrap.is-dragging{cursor:grabbing}
 .fan-deck{position:relative;width:180px;height:101px;perspective:700px}
+
 .fan-card{
   position:absolute;inset:0;border-radius:11px;overflow:hidden;
-  border:1.5px solid var(--surface);background:var(--surface-3);
+  border:1.5px solid var(--fd-surface);background:var(--fd-surface-2);
   transform-origin:15% 88%;
-  transition:transform .42s cubic-bezier(.34,1.32,.64,1),opacity .32s ease,box-shadow .32s ease;
+  transition:transform 0.38s cubic-bezier(0.22,1,0.36,1),opacity 0.28s ease,box-shadow 0.28s ease;
   will-change:transform,opacity;
 }
-.fan-card img{width:100%;height:100%;object-fit:cover;display:block}
-.fan-card-fb{
-  width:100%;height:100%;display:flex;align-items:center;justify-content:center;padding:10px;
-  text-align:center;font-size:11.5px;font-weight:700;color:var(--soft);
-  background:linear-gradient(135deg,var(--surface-3),var(--surface-2));
+.fan-card img.fan-cover-img{width:100%;height:100%;object-fit:cover;display:block}
+.fan-card-inner{
+  width:100%;height:100%;display:flex;flex-direction:column;justify-content:center;align-items:center;
+  text-align:center;padding:10px 12px;font-size:11.5px;font-weight:700;color:var(--fd-muted);
+  background:linear-gradient(135deg,var(--fd-surface-2),var(--fd-surface));
+  border:1px solid var(--fd-border);border-radius:11px;box-sizing:border-box;
 }
-.fan-card.pos-0{z-index:3;transform:translate(0,0) rotate(0deg) scale(1);box-shadow:0 8px 20px rgba(15,23,42,.20);opacity:1}
-.fan-card.pos-1{z-index:2;transform:translate(13px,7px) rotate(3.6deg) scale(.94);box-shadow:0 5px 14px rgba(15,23,42,.13);opacity:.92}
-.fan-card.pos-2{z-index:1;transform:translate(24px,14px) rotate(7.2deg) scale(.88);box-shadow:0 3px 10px rgba(15,23,42,.08);opacity:.76}
-.fav-deck-head:hover .fan-card.pos-0{transform:translate(-3px,-2px) rotate(-1.2deg) scale(1.02)}
-.fav-deck-head:hover .fan-card.pos-1{transform:translate(17px,9px) rotate(5.2deg) scale(.94)}
-.fav-deck-head:hover .fan-card.pos-2{transform:translate(30px,17px) rotate(9.8deg) scale(.88)}
+.fan-card.pos-0{z-index:3;transform:translate(0,0) rotate(0deg) scale(1);box-shadow:0 8px 20px rgba(15,23,42,0.18);opacity:1}
+.fan-card.pos-1{z-index:2;transform:translate(13px,7px) rotate(3.6deg) scale(0.94);box-shadow:0 5px 14px rgba(15,23,42,0.12);opacity:0.92}
+.fan-card.pos-2{z-index:1;transform:translate(24px,14px) rotate(7.2deg) scale(0.88);box-shadow:0 3px 10px rgba(15,23,42,0.08);opacity:0.76}
+.fan-card.pos-back{z-index:0;transform:translate(28px,17px) rotate(9deg) scale(0.84);box-shadow:none;opacity:0;pointer-events:none}
 
-.fan-nav{
-  position:absolute;left:6px;bottom:10px;z-index:5;display:inline-flex;align-items:center;gap:4px;
-  background:rgba(15,17,22,.72);backdrop-filter:blur(6px);border-radius:999px;padding:2px 5px;color:#fff;
+.fan-folder-head:hover .fan-deck-wrap:not(.is-dragging) .fan-card.pos-0{transform:translate(-3px,-2px) rotate(-1.2deg) scale(1.02)}
+.fan-folder-head:hover .fan-deck-wrap:not(.is-dragging) .fan-card.pos-1{transform:translate(17px,9px) rotate(5.2deg) scale(0.94)}
+.fan-folder-head:hover .fan-deck-wrap:not(.is-dragging) .fan-card.pos-2{transform:translate(30px,17px) rotate(9.8deg) scale(0.88)}
+
+.fan-folder-info{flex:1 1 220px;min-width:200px}
+.fan-folder-title-row{display:flex;align-items:center;gap:9px;margin-bottom:7px;flex-wrap:wrap}
+.fan-folder-dot{width:10px;height:10px;border-radius:50%;flex-shrink:0}
+.fan-folder-name{font-size:15.5px;font-weight:700;color:var(--fd-text)}
+.fan-folder-cnt{font-size:11.5px;font-weight:600;padding:2px 9px;border-radius:999px;background:var(--fd-surface-2);color:var(--fd-muted)}
+.fan-folder-previews{display:flex;flex-direction:column;gap:4px}
+.fan-folder-pv{font-size:12.5px;color:var(--fd-muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;display:flex;align-items:center;gap:7px}
+.fan-folder-pv span.pv-num{font-size:11px;font-weight:700;color:var(--brand);font-family:Consolas,monospace;flex-shrink:0}
+.fan-folder-right{display:flex;align-items:center;gap:8px;flex-shrink:0;margin-left:auto}
+.fan-chev-btn{
+  width:30px;height:30px;border-radius:8px;border:1px solid var(--fd-border);
+  background:var(--fd-surface);color:var(--fd-muted);
+  display:inline-flex;align-items:center;justify-content:center;cursor:pointer;
+  transition:transform 0.28s cubic-bezier(0.22,1,0.36,1),background-color 0.15s ease;
 }
-.fan-nav-btn{
-  width:20px;height:20px;border:none;border-radius:50%;background:transparent;color:#fff;
-  display:inline-flex;align-items:center;justify-content:center;font-size:13px;line-height:1;
+.fan-folder-card.expanded .fan-chev-btn{transform:rotate(180deg);color:var(--fd-accent);border-color:var(--fd-accent);background:var(--brand-soft)}
+
+.fan-folder-collapse{
+  display:grid;grid-template-rows:0fr;border-radius:0 0 var(--fd-radius) var(--fd-radius);
+  overflow:hidden;transition:grid-template-rows 0.34s cubic-bezier(0.22,1,0.36,1);
 }
-.fan-nav-btn:hover{background:rgba(255,255,255,.22)}
-.fan-nav-idx{font-size:10.5px;font-weight:700;font-variant-numeric:tabular-nums;padding:0 3px}
-
-.fav-deck-info{flex:1;min-width:0}
-.fav-deck-title-row{display:flex;align-items:center;gap:9px;margin-bottom:7px;flex-wrap:wrap}
-.fav-deck-name{font-size:16px;font-weight:800;color:var(--text)}
-.fav-deck-cnt{font-size:11.5px;font-weight:700;padding:2px 9px;border-radius:999px;background:var(--surface-3);color:var(--soft)}
-.fav-deck-previews{display:flex;flex-direction:column;gap:4px}
-.fav-deck-pv{font-size:12.5px;color:var(--soft);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;display:flex;align-items:center;gap:7px}
-.fav-deck-pv-num{font-size:11px;font-weight:700;color:var(--brand);font-family:Consolas,monospace;flex-shrink:0}
-
-.fav-deck-right{display:flex;align-items:center;gap:8px;flex-shrink:0}
-.fav-deck-chev{width:30px;height:30px;border-radius:8px;border:1px solid var(--border);background:var(--surface);color:var(--soft);display:inline-flex;align-items:center;justify-content:center;transition:transform .28s cubic-bezier(.22,1,.36,1),background .15s}
-.fav-deck-card.expanded .fav-deck-chev{transform:rotate(180deg);background:var(--brand-soft);border-color:var(--brand-border);color:var(--brand-dark)}
-
-/* Smooth Top-to-Bottom Accordion Expand */
-.fav-deck-collapse{display:grid;grid-template-rows:0fr;transition:grid-template-rows .34s cubic-bezier(.22,1,.36,1)}
-.fav-deck-card.expanded .fav-deck-collapse{grid-template-rows:1fr}
-.fav-deck-collapse-inner{overflow:hidden}
-.fav-deck-items{border-top:1px solid var(--border);background:var(--bg);padding:12px 18px;display:flex;flex-direction:column;gap:10px}
+.fan-folder-card.expanded .fan-folder-collapse{grid-template-rows:1fr}
+.fan-folder-collapse-inner{overflow:hidden}
+.fan-folder-items{border-top:1px solid var(--fd-border);background:var(--bg);padding:14px 18px;display:flex;flex-direction:column;gap:10px}
 
 .fav-item-row{
   display:flex;align-items:center;gap:15px;padding:11px 14px;border-radius:12px;
@@ -2378,8 +2400,8 @@ theme-button{flex-shrink:0}
 .fav-item-acts{display:flex;align-items:center;gap:6px;flex-shrink:0;flex-wrap:wrap}
 
 @media(max-width:768px){
-  .fav-deck-head{flex-direction:column;align-items:flex-start;gap:14px;padding:14px}
-  .fav-deck-right{width:100%;justify-content:flex-end}
+  .fan-folder-head{flex-direction:column;align-items:flex-start;gap:14px;padding:14px}
+  .fan-folder-right{width:100%;justify-content:flex-end}
   .fav-item-row{flex-direction:column;align-items:stretch;gap:10px}
   .fav-item-thumb{width:100%}
   .fav-item-acts{justify-content:flex-end}
@@ -2684,13 +2706,17 @@ theme-button{flex-shrink:0}
             <article class="reader-card" id="summaryCard">
               <div class="style-switch-bar" id="styleSwitchBar">
                 <div class="style-pills">
-                  <span style="font-size:12px;color:var(--muted);font-weight:600;margin-right:2px">秒速重总结：</span>
+                  <span style="font-size:12px;color:var(--muted);font-weight:600;margin-right:2px">摘要风格：</span>
                   <button class="style-pill active" data-rs="daily" onclick="resummarizeCurrent('daily')">精炼日报</button>
                   <button class="style-pill" data-rs="notes" onclick="resummarizeCurrent('notes')">深度笔记</button>
                   <button class="style-pill" data-rs="quotes" onclick="resummarizeCurrent('quotes')">金句观点</button>
                   <button class="style-pill" data-rs="flashcards" onclick="resummarizeCurrent('flashcards')">学习闪卡</button>
                 </div>
                 <div class="fs-group">
+                  <button class="style-regen-btn" id="regenStyleBtn" type="button" onclick="forceRegenerateCurrentStyle()" title="强制重新生成当前选中风格">
+                    <svg class="ic" style="width:13px;height:13px" viewBox="0 0 24 24"><polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/></svg>
+                    <span>重新生成</span>
+                  </button>
                   <button class="fs-btn" onclick="adjustFontSize(-1)" title="减小字号">A-</button>
                   <button class="fs-btn" onclick="adjustFontSize(1)" title="增大字号">A+</button>
                 </div>
@@ -3478,6 +3504,9 @@ theme-button{flex-shrink:0}
     </div>
   </div>
 </div>
+
+<!-- 允许拖拽/洗牌中的扇形卡片越过任何容器与侧边栏飞出 -->
+<div id="fan-float-layer" class="fan-float-layer"></div>
 
 <script>
 
@@ -4270,7 +4299,7 @@ async function syncFromR2() {
       if (!j || !j.id) continue;
       const ex = map.get(j.id);
       if (!ex) map.set(j.id, j);
-      else map.set(j.id, { ...ex, ...j, pic: j.pic || ex.pic || '', summary: ex.summary || j.summary, transcript: ex.transcript || j.transcript, starred: Boolean(j.starred || ex.starred) });
+      else map.set(j.id, { ...ex, ...j, pic: j.pic || ex.pic || '', summary: ex.summary || j.summary, summaries: { ...(ex.summaries || {}), ...(j.summaries || {}) }, transcript: ex.transcript || j.transcript, starred: Boolean(j.starred || ex.starred) });
     }
     const merged = Array.from(map.values()).sort((a, b) => new Date(b.created_at || 0) - new Date(a.created_at || 0));
     saveJobs(merged, true);
@@ -5593,26 +5622,89 @@ function copyMindmapOutline() {
   navigator.clipboard.writeText(out).then(() => toast('导图 Markdown 大纲已复制')).catch(() => {});
 }
 
-async function resummarizeCurrent(style) {
+const STYLE_LABELS = { daily: '精炼日报', notes: '深度笔记', quotes: '金句观点', flashcards: '学习闪卡' };
+const resumInFlight = new Map(); // jobId:style -> true
+
+function ensureJobSummaries(job) {
+  if (!job) return {};
+  if (!job.summaries || typeof job.summaries !== 'object') job.summaries = {};
+  const curStyle = job.summary_style || 'daily';
+  const raw = (job.summary || '').trim();
+  if (raw && !raw.startsWith('（AI总结失败') && !raw.startsWith('(AI总结失败') && !job.summaries[curStyle]) {
+    job.summaries[curStyle] = raw;
+  }
+  return job.summaries;
+}
+
+function forceRegenerateCurrentStyle() {
+  const job = getJobs().find(j => j.id === selectedJobId);
+  if (!job) return;
+  resummarizeCurrent(job.summary_style || 'daily', true);
+}
+
+async function resummarizeCurrent(style, forceRegen) {
   const jobs = getJobs(), idx = jobs.findIndex(j => j.id === selectedJobId);
   if (idx < 0) return;
   const job = jobs[idx];
-  if (!job.transcript || job.transcript.length < 30) { toast('当前任务没有可用转录文本，无法秒速重总结', true); return; }
-  document.querySelectorAll('#styleSwitchBar .style-pill').forEach(b => { b.disabled = true; b.classList.toggle('active', b.dataset.rs === style); });
-  document.getElementById('summaryContent').innerHTML = '<div class="pending-banner">正在通过免费 AI 模型秒速重生成（约 4~8 秒，无需重下音频）...</div>';
+  if (!job.transcript || job.transcript.length < 30) { toast('当前任务没有可用转录文本，无法重总结', true); return; }
+
+  const cache = ensureJobSummaries(job);
+  const reqKey = job.id + ':' + style;
+
+  // Instant 0ms switch if already generated and not forced to regenerate
+  if (!forceRegen && cache[style]) {
+    jobs[idx].summary = cache[style];
+    jobs[idx].summary_style = style;
+    saveJobs(jobs);
+    renderDetail(jobs[idx]);
+    return;
+  }
+
+  // Switch active style view immediately (non-blocking: user can freely switch back or browse elsewhere!)
+  jobs[idx].summary_style = style;
+  saveJobs(jobs, true);
+
+  if (resumInFlight.has(reqKey)) {
+    renderDetail(jobs[idx]);
+    return;
+  }
+
+  resumInFlight.set(reqKey, true);
+  renderDetail(jobs[idx]);
+
+  const targetJobId = job.id;
   try {
     const r = await apiFetch('/api/resummarize', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ job_id: job.id, bvid: job.bvid, title: job.title, transcript: job.transcript, style }),
     });
     const d = await r.json();
-    if (!r.ok) { toast(d.error || '重生成失败', true); renderDetail(job); return; }
-    jobs[idx].summary = d.summary; jobs[idx].summary_style = style;
-    jobs[idx].error = ''; jobs[idx].error_stage = ''; jobs[idx].error_hint = '';
-    saveJobs(jobs); renderDetail(jobs[idx]);
-    toast('已秒速重生成（' + (d.elapsed || 5) + 's · 免费模型 ' + (d.model || '') + '）');
-  } catch (e) { toast('重生成异常：' + e.message, true); renderDetail(job); }
-  finally { document.querySelectorAll('#styleSwitchBar .style-pill').forEach(b => { b.disabled = false; }); }
+    resumInFlight.delete(reqKey);
+    if (!r.ok) {
+      toast(d.error || '生成失败', true);
+      const latest = getJobs().find(j => j.id === targetJobId);
+      if (latest && selectedJobId === targetJobId) renderDetail(latest);
+      return;
+    }
+    const curJobs = getJobs();
+    const tIdx = curJobs.findIndex(j => j.id === targetJobId);
+    if (tIdx >= 0) {
+      ensureJobSummaries(curJobs[tIdx]);
+      curJobs[tIdx].summaries[style] = d.summary;
+      if ((curJobs[tIdx].summary_style || 'daily') === style) {
+        curJobs[tIdx].summary = d.summary;
+      }
+      curJobs[tIdx].error = ''; curJobs[tIdx].error_stage = ''; curJobs[tIdx].error_hint = '';
+      saveJobs(curJobs);
+      if (selectedJobId === targetJobId && currentRoute === 'summary') renderDetail(curJobs[tIdx]);
+    }
+    toast('「' + (STYLE_LABELS[style] || style) + '」已生成（' + (d.elapsed || 3) + 's · ' + (d.model || '') + '）');
+  } catch (e) {
+    resumInFlight.delete(reqKey);
+    toast('生成异常：' + e.message, true);
+    const latest = getJobs().find(j => j.id === targetJobId);
+    if (latest && selectedJobId === targetJobId) renderDetail(latest);
+  }
 }
 
 function adjustFontSize(delta) {
@@ -5894,15 +5986,34 @@ function renderDetail(job) {
   if (durSec >= 120 && normStatus(job.status) === 'completed') pills.push('<span class="meta-pill saved">帮你节省约 ' + Math.max(1, Math.round(durSec / 60 * 0.85)) + ' 分钟</span>');
   document.getElementById('dPills').innerHTML = pills.join('');
 
-  const st = normStatus(job.status), rawSummary = (job.summary || '').trim(), rawTranscript = (job.transcript || '').trim();
+  const st = normStatus(job.status);
+  const cache = ensureJobSummaries(job);
+  const activeStyle = job.summary_style || 'daily';
+  const rawSummary = ((cache[activeStyle] !== undefined ? cache[activeStyle] : job.summary) || '').trim();
+  const rawTranscript = (job.transcript || '').trim();
   const isAiFailed = rawSummary.startsWith('（AI总结失败') || rawSummary.startsWith('(AI总结失败');
+  const isGeneratingActive = resumInFlight.has(job.id + ':' + activeStyle);
+
   document.getElementById('styleSwitchBar').classList.toggle('hidden', st !== 'completed' || !rawTranscript);
-  document.querySelectorAll('#styleSwitchBar .style-pill').forEach(b => b.classList.toggle('active', b.dataset.rs === (job.summary_style || 'daily')));
+  document.querySelectorAll('#styleSwitchBar .style-pill').forEach(b => {
+    const rs = b.dataset.rs;
+    b.disabled = false;
+    b.classList.toggle('active', rs === activeStyle);
+    b.classList.toggle('has-cache', Boolean(cache[rs]));
+    b.classList.toggle('is-loading', resumInFlight.has(job.id + ':' + rs));
+  });
+  const regenBtn = document.getElementById('regenStyleBtn');
+  if (regenBtn) {
+    regenBtn.disabled = isGeneratingActive;
+    const regenSpan = regenBtn.querySelector('span');
+    if (regenSpan) regenSpan.textContent = isGeneratingActive ? '生成中...' : '重新生成';
+  }
 
   let sumHtml = '';
   if (st === 'pending') sumHtml = '<div class="pending-banner">GitHub Actions 正在提取音频、免费语音转文字并生成 AI 摘要，页面会自动刷新...</div>';
+  else if (isGeneratingActive) sumHtml = '<div class="pending-banner">正在后台生成「' + esc(STYLE_LABELS[activeStyle] || activeStyle) + '」，你可以随时点击上方其他风格或切换任务，完成后会自动保存...</div>';
   else if (st === 'failed') sumHtml = renderFailureDiagnostics(job);
-  else if (isAiFailed || !rawSummary) sumHtml = renderFailureDiagnostics({ ...job, error_stage: 'summarize', error: rawSummary || 'AI 总结返回为空', error_hint: '可能触发免费模型限流，点击下方即可 5 秒内免费重生成总结（无需重下音频）。' });
+  else if (isAiFailed || !rawSummary) sumHtml = renderFailureDiagnostics({ ...job, error_stage: 'summarize', error: rawSummary || 'AI 总结返回为空', error_hint: '可能触发免费模型限流，点击下方即可重生成总结（无需重下音频）。' });
   else sumHtml = renderRichSummary(rawSummary);
 
   document.getElementById('summaryContent').innerHTML = sumHtml;
@@ -6189,9 +6300,9 @@ function buildVideoCardHtml(v, idx, opts) {
         (v.duration ? '<span class="v-dur">' + esc(v.duration) + '</span>' : '') +
       '</a>' +
       chkHtml +
-      '<div class="v-quick-acts' + ((wlOn || favOn) ? ' has-active' : '') + '">' +
-        '<button type="button" class="v-qbtn v-qbtn-wl' + (wlOn ? ' wl-on' : '') + '" title="稍后再看" onclick="event.preventDefault();event.stopPropagation();togglePoolVideoWl(\'' + poolName + '\',' + idx + ')">' + SVG_CLOCK_SM + '<span>稍后再看</span></button>' +
-        '<button type="button" class="v-qbtn v-qbtn-fav' + (favOn ? ' fav-on' : '') + '" data-fav-bvid="' + esc(v.bvid) + '" title="收藏（长按可多选收藏夹）" onclick="event.preventDefault();event.stopPropagation();togglePoolVideoFav(\'' + poolName + '\',' + idx + ')">' + SVG_STAR_LINE + '<span>收藏</span></button>' +
+      '<div class="v-quick-acts">' +
+        '<button type="button" class="v-qbtn v-qbtn-wl' + (wlOn ? ' wl-on' : '') + '" title="' + (wlOn ? '移除稍后再看' : '稍后再看') + '" onclick="event.preventDefault();event.stopPropagation();togglePoolVideoWl(\'' + poolName + '\',' + idx + ')">' + SVG_CLOCK_SM + '<span>' + (wlOn ? '移除稍后再看' : '稍后再看') + '</span></button>' +
+        '<button type="button" class="v-qbtn v-qbtn-fav' + (favOn ? ' fav-on' : '') + '" data-fav-bvid="' + esc(v.bvid) + '" title="' + (favOn ? '移除收藏（长按可多选收藏夹）' : '收藏（长按可多选收藏夹）') + '" onclick="event.preventDefault();event.stopPropagation();togglePoolVideoFav(\'' + poolName + '\',' + idx + ')">' + SVG_STAR_LINE + '<span>' + (favOn ? '移除收藏' : '收藏') + '</span></button>' +
       '</div>' +
     '</div>' +
     '<div class="v-body">' + avaHtml +
@@ -6238,12 +6349,21 @@ function copyModalSummary() { navigator.clipboard.writeText(modalSummaryRaw || '
 
 function syncFeedCardQuickStates(bvid) {
   if (!bvid) return;
-  const wlOn = isWatchLater(bvid), favOn = isFavBvid(bvid);
+  const jobs = getJobs();
+  const matchedJob = jobs.find(j => j.bvid === bvid && j.starred);
+  const wlOn = isWatchLater(bvid), favOn = isFavBvid(bvid) || Boolean(matchedJob);
   document.querySelectorAll('.v-card[data-bvid="' + bvid.replace(/"/g, '') + '"]').forEach(card => {
-    const acts = card.querySelector('.v-quick-acts'), wlB = card.querySelector('.v-qbtn-wl'), favB = card.querySelector('.v-qbtn-fav');
-    if (acts) acts.classList.toggle('has-active', wlOn || favOn);
-    if (wlB) { wlB.classList.toggle('wl-on', wlOn); wlB.title = '稍后再看'; }
-    if (favB) { favB.classList.toggle('fav-on', favOn); favB.title = '收藏（长按可多选收藏夹）'; }
+    const wlB = card.querySelector('.v-qbtn-wl'), favB = card.querySelector('.v-qbtn-fav');
+    if (wlB) {
+      wlB.classList.toggle('wl-on', wlOn);
+      wlB.title = wlOn ? '移除稍后再看' : '稍后再看';
+      const s = wlB.querySelector('span'); if (s) s.textContent = wlOn ? '移除稍后再看' : '稍后再看';
+    }
+    if (favB) {
+      favB.classList.toggle('fav-on', favOn);
+      favB.title = favOn ? '移除收藏（长按可多选收藏夹）' : '收藏（长按可多选收藏夹）';
+      const s = favB.querySelector('span'); if (s) s.textContent = favOn ? '移除收藏' : '收藏';
+    }
   });
 }
 
@@ -6419,19 +6539,202 @@ function renderWatchLaterPage() {
   grid.innerHTML = vids.map((v, idx) => buildVideoCardHtml(v, idx, { pool: 'wl', showCheck: true })).join('');
 }
 
-// ── PAGE 4: FAVORITES STACKED FAN-DECK FOLDERS & ACCORDION EXPAND ──
-function toggleFavDeckExpand(fid) {
-  if (expandedFavFolders.has(fid)) expandedFavFolders.delete(fid);
-  else expandedFavFolders.add(fid);
-  const card = document.getElementById('favDeck_' + fid);
-  if (card) card.classList.toggle('expanded', expandedFavFolders.has(fid));
-}
-function cycleFavDeck(fid, delta, count) {
-  if (count <= 1) return;
-  const cur = favDeckOffsets[fid] || 0;
-  favDeckOffsets[fid] = (cur + delta + count) % count;
-  renderFavoritesPage();
-}
+// ── PAGE 4: STACKED FAN-DECK 扇形卡组 & 手风琴收藏夹组件 ──
+const FanDeck = (() => {
+  const offsets = {};
+  let activeSwipe = null;
+
+  function getPosClass(rel) {
+    if (rel === 0) return 'pos-0';
+    if (rel === 1) return 'pos-1';
+    if (rel === 2) return 'pos-2';
+    return 'pos-back';
+  }
+
+  function mountCards(deckId, items, renderCardContent) {
+    const wrap = document.getElementById('fanDeckWrap_' + deckId);
+    if (!wrap) return;
+    const deck = wrap.querySelector('.fan-deck');
+    if (!deck) return;
+
+    const total = items.length;
+    const offset = total ? (((offsets[deckId] || 0) % total) + total) % total : 0;
+
+    if (total === 0) {
+      deck.innerHTML = '<div class="fan-card pos-0"><div class="fan-card-inner">暂无收藏内容</div></div>';
+      return;
+    }
+
+    deck.innerHTML = items.map((item, idx) => {
+      const rel = (idx - offset + total) % total;
+      return '<div class="fan-card ' + getPosClass(rel) + '" data-fan-idx="' + idx + '">' + renderCardContent(item, idx) + '</div>';
+    }).join('');
+  }
+
+  function createFloatClone(cardEl, deckEl) {
+    let layer = document.getElementById('fan-float-layer');
+    if (!layer) {
+      layer = document.createElement('div');
+      layer.id = 'fan-float-layer';
+      layer.className = 'fan-float-layer';
+      document.body.appendChild(layer);
+    }
+    const r = deckEl.getBoundingClientRect();
+    const clone = cardEl.cloneNode(true);
+    clone.classList.remove('pos-0', 'pos-1', 'pos-2', 'pos-back');
+    clone.style.cssText = 'position:fixed;left:' + r.left + 'px;top:' + r.top + 'px;width:' + r.width + 'px;height:' + r.height + 'px;margin:0;transform-origin:15% 88%;transition:none;pointer-events:none;box-shadow:0 12px 28px rgba(15,23,42,0.22);';
+    layer.appendChild(clone);
+    return clone;
+  }
+
+  function cycle(deckId, delta, startDragTransform, existingClone) {
+    const wrap = document.getElementById('fanDeckWrap_' + deckId);
+    const deckEl = wrap ? wrap.querySelector('.fan-deck') : null;
+    const folderCard = document.getElementById('folderCard_' + deckId);
+    if (!wrap || !deckEl) {
+      if (existingClone) existingClone.remove();
+      return;
+    }
+
+    const cards = Array.from(wrap.querySelectorAll('.fan-card[data-fan-idx]'));
+    const total = cards.length;
+    if (total <= 1) {
+      if (existingClone) existingClone.remove();
+      return;
+    }
+
+    const prevOffset = (((offsets[deckId] || 0) % total) + total) % total;
+    const nextOffset = (prevOffset + delta + total) % total;
+    offsets[deckId] = nextOffset;
+
+    const oldTopEl = cards.find((c) => Number(c.getAttribute('data-fan-idx')) === prevOffset);
+    const newTopEl = cards.find((c) => Number(c.getAttribute('data-fan-idx')) === nextOffset);
+
+    if (folderCard) {
+      folderCard.classList.add('is-shuffling');
+      clearTimeout(folderCard._shuffleTimer);
+      folderCard._shuffleTimer = setTimeout(() => folderCard.classList.remove('is-shuffling'), 450);
+    }
+
+    cards.forEach((c) => {
+      const idx = Number(c.getAttribute('data-fan-idx'));
+      const rel = (idx - nextOffset + total) % total;
+      c.classList.remove('pos-0', 'pos-1', 'pos-2', 'pos-back');
+      c.classList.add(getPosClass(rel));
+    });
+
+    const backTf = total >= 4
+      ? 'translate(28px, 17px) rotate(9deg) scale(0.84)'
+      : (total === 3 ? 'translate(24px, 14px) rotate(7.2deg) scale(0.88)' : 'translate(13px, 7px) rotate(3.6deg) scale(0.94)');
+
+    if (delta > 0 && oldTopEl) {
+      const clone = existingClone || createFloatClone(oldTopEl, deckEl);
+      if (clone && clone.animate) {
+        oldTopEl.style.visibility = 'hidden';
+        const anim = clone.animate([
+          { transform: startDragTransform || 'translate(0px, 0px) rotate(0deg) scale(1)', opacity: 1, offset: 0 },
+          { transform: 'translate(-96px, -14px) rotate(-16deg) scale(0.95)', opacity: 0.98, offset: 0.44 },
+          { transform: backTf, opacity: total >= 4 ? 0 : 0.35, offset: 0.92 },
+          { transform: backTf, opacity: 0, offset: 1 },
+        ], { duration: 420, easing: 'cubic-bezier(0.22, 1, 0.36, 1)', fill: 'forwards' });
+        setTimeout(() => { oldTopEl.style.visibility = ''; }, 240);
+        anim.onfinish = () => { oldTopEl.style.visibility = ''; clone.remove(); };
+      } else if (clone) {
+        clone.remove();
+      }
+    } else if (delta < 0 && newTopEl) {
+      if (existingClone) existingClone.remove();
+      if (oldTopEl) oldTopEl.style.visibility = '';
+      const clone = createFloatClone(newTopEl, deckEl);
+      if (clone && clone.animate) {
+        newTopEl.style.visibility = 'hidden';
+        const anim = clone.animate([
+          { transform: backTf, opacity: total >= 4 ? 0.25 : 0.76, offset: 0 },
+          { transform: 'translate(-96px, -14px) rotate(-16deg) scale(0.98)', opacity: 1, offset: 0.46 },
+          { transform: 'translate(0px, 0px) rotate(0deg) scale(1)', opacity: 1, offset: 1 },
+        ], { duration: 420, easing: 'cubic-bezier(0.22, 1, 0.36, 1)', fill: 'forwards' });
+        anim.onfinish = () => { newTopEl.style.visibility = ''; clone.remove(); };
+      } else if (clone) {
+        clone.remove();
+      }
+    } else if (existingClone) {
+      existingClone.remove();
+    }
+  }
+
+  function toggleFolder(deckId) {
+    if (expandedFavFolders.has(deckId)) expandedFavFolders.delete(deckId);
+    else expandedFavFolders.add(deckId);
+    const card = document.getElementById('folderCard_' + deckId);
+    if (card) card.classList.toggle('expanded', expandedFavFolders.has(deckId));
+  }
+
+  document.addEventListener('pointerdown', (e) => {
+    const wrap = e.target.closest && e.target.closest('.fan-deck-wrap');
+    if (!wrap || e.button > 0) return;
+    const deckId = wrap.getAttribute('data-deck-id');
+    if (!deckId) return;
+    activeSwipe = {
+      wrap, deckId, pointerId: e.pointerId,
+      startX: e.clientX, startY: e.clientY,
+      dx: 0, moved: false, topCard: null, floatClone: null,
+    };
+    try { wrap.setPointerCapture(e.pointerId); } catch {}
+  });
+
+  document.addEventListener('pointermove', (e) => {
+    if (!activeSwipe || e.pointerId !== activeSwipe.pointerId) return;
+    const dx = e.clientX - activeSwipe.startX;
+    const dy = e.clientY - activeSwipe.startY;
+    if (!activeSwipe.moved && Math.abs(dx) > 6 && Math.abs(dx) >= Math.abs(dy) * 0.8) {
+      activeSwipe.moved = true;
+      activeSwipe.wrap.classList.add('is-dragging');
+      const deckEl = activeSwipe.wrap.querySelector('.fan-deck');
+      const topCard = activeSwipe.wrap.querySelector('.fan-card.pos-0');
+      if (topCard && deckEl) {
+        activeSwipe.topCard = topCard;
+        activeSwipe.floatClone = createFloatClone(topCard, deckEl);
+        if (activeSwipe.floatClone) topCard.style.visibility = 'hidden';
+      }
+    }
+    if (!activeSwipe.moved) return;
+    activeSwipe.dx = dx;
+    if (activeSwipe.floatClone) {
+      const clamped = Math.max(-130, Math.min(110, dx));
+      activeSwipe.floatClone.style.transform = 'translate(' + (clamped * 0.78) + 'px, ' + (Math.abs(clamped) * -0.07) + 'px) rotate(' + (clamped * 0.12) + 'deg)';
+    }
+  });
+
+  function finishSwipe(e) {
+    if (!activeSwipe || e.pointerId !== activeSwipe.pointerId) return;
+    const { wrap, deckId, dx, moved, topCard, floatClone } = activeSwipe;
+    activeSwipe = null;
+    wrap.classList.remove('is-dragging');
+    const dragTf = floatClone ? floatClone.style.transform : '';
+    try { wrap.releasePointerCapture(e.pointerId); } catch {}
+
+    if (moved) {
+      if (dx <= -24) return cycle(deckId, 1, dragTf, floatClone);
+      if (dx >= 24) {
+        if (topCard) topCard.style.visibility = '';
+        if (floatClone) floatClone.remove();
+        return cycle(deckId, -1);
+      }
+    }
+    if (floatClone) floatClone.remove();
+    if (topCard) topCard.style.visibility = '';
+    if (!moved && e.type === 'pointerup') cycle(deckId, 1);
+  }
+
+  document.addEventListener('pointerup', finishSwipe);
+  document.addEventListener('pointercancel', finishSwipe);
+  document.addEventListener('click', (e) => {
+    if (e.target.closest && e.target.closest('.fan-deck-wrap')) e.stopPropagation();
+  }, true);
+
+  return { mountCards, cycle, toggleFolder };
+})();
+
 function renderFavoritesPage() {
   const kw = (document.getElementById('favSearchInput').value || '').trim().toLowerCase();
   const jobs = getJobs();
@@ -6439,7 +6742,7 @@ function renderFavoritesPage() {
   const allFavs = getAllFavoritesMerged();
   const folders = libraryState.fav_folders || [];
 
-  document.getElementById('favPageSub').textContent = folders.length + ' 个收藏文件夹 · 共收藏 ' + allFavs.length + ' 条内容 · 点击文件夹卡片下滑展开';
+  document.getElementById('favPageSub').textContent = folders.length + ' 个收藏文件夹 · 共收藏 ' + allFavs.length + ' 条内容 · 拖拽/点击封面扇形洗牌，点击卡片展开';
   const listEl = document.getElementById('favDeckList');
   if (!folders.length) {
     listEl.innerHTML = '<div class="reader-card" style="text-align:center;color:var(--muted);padding:44px">暂无收藏文件夹，点击右上角「+ 新建收藏夹」开始分类收藏。</div>';
@@ -6448,6 +6751,7 @@ function renderFavoritesPage() {
 
   favRenderPool = allFavs;
   const favIdxByBvid = new Map(allFavs.map((v, i) => [v.bvid, i]));
+  const mountQueue = [];
 
   const htmlParts = folders.map(f => {
     let items = allFavs.filter(v => getFavFolderIds(v.bvid).includes(f.id));
@@ -6456,34 +6760,11 @@ function renderFavoritesPage() {
 
     const isExp = expandedFavFolders.has(f.id) || Boolean(kw);
     const total = items.length;
-    const offset = total ? ((favDeckOffsets[f.id] || 0) % total) : 0;
-
-    // Build 3-layer stacked fan deck (newest, 2nd newest, 3rd newest rotated by offset)
-    let deckHtml = '';
-    if (total === 0) {
-      deckHtml = '<div class="fan-card pos-0"><div class="fan-card-fb" style="border-top:3px solid ' + esc(f.color) + '">' + esc(f.name) + '</div></div>';
-    } else {
-      const showN = Math.min(3, total);
-      for (let layer = showN - 1; layer >= 0; layer--) {
-        const v = items[(offset + layer) % total];
-        const pic = v.pic ? (v.pic.replace(/^http:\/\//, 'https://') + '@672w_378h_1c.webp') : '';
-        deckHtml += '<div class="fan-card pos-' + layer + '">' +
-          (pic ? '<img src="' + esc(pic) + '" referrerpolicy="no-referrer" loading="lazy" alt="">' : '<div class="fan-card-fb">' + esc(v.title || v.bvid) + '</div>') +
-        '</div>';
-      }
-    }
-
-    const navHtml = total > 1
-      ? '<div class="fan-nav" onclick="event.stopPropagation()">' +
-          '<button type="button" class="fan-nav-btn" title="上一张封面" onclick="cycleFavDeck(\'' + esc(f.id) + '\',-1,' + total + ')">&lsaquo;</button>' +
-          '<span class="fan-nav-idx">' + (offset + 1) + '/' + total + '</span>' +
-          '<button type="button" class="fan-nav-btn" title="下一张封面" onclick="cycleFavDeck(\'' + esc(f.id) + '\',1,' + total + ')">&rsaquo;</button>' +
-        '</div>'
-      : '';
+    mountQueue.push({ id: f.id, color: f.color, items });
 
     const previewsHtml = total
-      ? items.slice(0, 3).map((v, i) => '<div class="fav-deck-pv"><span class="fav-deck-pv-num">0' + (i + 1) + '</span><span>' + esc(v.title || v.bvid) + '</span></div>').join('')
-      : '<div class="fav-deck-pv" style="color:var(--muted)">暂无收藏内容，在视频封面或摘要页点星标即可收入</div>';
+      ? items.slice(0, 3).map((v, i) => '<div class="fan-folder-pv"><span class="pv-num">0' + (i + 1) + '</span><span>' + esc(v.title || v.bvid) + '</span></div>').join('')
+      : '<div class="fan-folder-pv">暂无收藏内容，在视频封面或摘要页点星标即可收入</div>';
 
     const rowsHtml = total
       ? items.map(v => {
@@ -6519,31 +6800,39 @@ function renderFavoritesPage() {
         }).join('')
       : '<div style="text-align:center;color:var(--muted);padding:18px;font-size:12.5px">该收藏夹为空</div>';
 
-    return '<div class="fav-deck-card' + (isExp ? ' expanded' : '') + '" id="favDeck_' + esc(f.id) + '">' +
-      '<div class="fav-deck-head" onclick="toggleFavDeckExpand(\'' + esc(f.id) + '\')">' +
-        '<div class="fan-deck-wrap" onclick="if(' + total + '>1){event.stopPropagation();cycleFavDeck(\'' + esc(f.id) + '\',1,' + total + ');}">' +
-          '<div class="fan-deck">' + deckHtml + '</div>' +
-          navHtml +
+    return '<div class="fan-folder-card' + (isExp ? ' expanded' : '') + '" id="folderCard_' + esc(f.id) + '">' +
+      '<div class="fan-folder-head" onclick="FanDeck.toggleFolder(\'' + esc(f.id) + '\')">' +
+        '<div class="fan-deck-wrap" id="fanDeckWrap_' + esc(f.id) + '" data-deck-id="' + esc(f.id) + '">' +
+          '<div class="fan-deck"></div>' +
         '</div>' +
-        '<div class="fav-deck-info">' +
-          '<div class="fav-deck-title-row">' +
-            '<span class="folder-dot" style="width:10px;height:10px;background:' + esc(f.color) + '"></span>' +
-            '<span class="fav-deck-name">' + esc(f.name) + '</span>' +
-            '<span class="fav-deck-cnt">' + total + ' 条收藏</span>' +
+        '<div class="fan-folder-info">' +
+          '<div class="fan-folder-title-row">' +
+            '<span class="fan-folder-dot" style="background:' + esc(f.color) + '"></span>' +
+            '<span class="fan-folder-name">' + esc(f.name) + '</span>' +
+            '<span class="fan-folder-cnt">' + total + ' 条收藏</span>' +
           '</div>' +
-          '<div class="fav-deck-previews">' + previewsHtml + '</div>' +
+          '<div class="fan-folder-previews">' + previewsHtml + '</div>' +
         '</div>' +
-        '<div class="fav-deck-right" onclick="event.stopPropagation()">' +
+        '<div class="fan-folder-right" onclick="event.stopPropagation()">' +
           '<button type="button" class="btn btn-sm" onclick="renameFolder(\'' + esc(f.id) + '\',\'fav\')">重命名</button>' +
           (folders.length > 1 ? '<button type="button" class="btn btn-sm" style="color:var(--err)" onclick="deleteFolder(\'' + esc(f.id) + '\',\'fav\')">删除</button>' : '') +
-          '<button type="button" class="fav-deck-chev" onclick="toggleFavDeckExpand(\'' + esc(f.id) + '\')" title="展开 / 收起">' + SVG_CHEV + '</button>' +
+          '<button type="button" class="fan-chev-btn" onclick="FanDeck.toggleFolder(\'' + esc(f.id) + '\')" title="展开 / 收起">' + SVG_CHEV + '</button>' +
         '</div>' +
       '</div>' +
-      '<div class="fav-deck-collapse"><div class="fav-deck-collapse-inner"><div class="fav-deck-items">' + rowsHtml + '</div></div></div>' +
+      '<div class="fan-folder-collapse"><div class="fan-folder-collapse-inner"><div class="fan-folder-items">' + rowsHtml + '</div></div></div>' +
     '</div>';
   }).filter(Boolean).join('');
 
   listEl.innerHTML = htmlParts || '<div class="reader-card" style="text-align:center;color:var(--muted);padding:44px">没有找到匹配的收藏内容</div>';
+
+  mountQueue.forEach(q => {
+    FanDeck.mountCards(q.id, q.items, (v) => {
+      const pic = v.pic ? (v.pic.replace(/^http:\/\//, 'https://') + '@672w_378h_1c.webp') : '';
+      return pic
+        ? '<img class="fan-cover-img" src="' + esc(pic) + '" referrerpolicy="no-referrer" loading="lazy" alt="">'
+        : '<div class="fan-card-inner" style="border-top:3px solid ' + esc(q.color) + '">' + esc(v.title || v.bvid) + '</div>';
+    });
+  });
 }
 
 // ── PAGE 5: HISTORY ARCHIVE + KPI STATS ──
