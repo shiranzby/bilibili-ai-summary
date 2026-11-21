@@ -2328,19 +2328,20 @@ theme-button{flex-shrink:0}
 
 .fan-deck-wrap{
   position:relative;z-index:10;width:206px;height:118px;flex-shrink:0;
-  user-select:none;touch-action:pan-y;cursor:grab;
+  user-select:none;-webkit-user-select:none;-webkit-user-drag:none;user-drag:none;
+  touch-action:pan-y;cursor:grab;
 }
 .fan-deck-wrap.is-dragging{cursor:grabbing}
-.fan-deck{position:relative;width:180px;height:101px;perspective:700px}
+.fan-deck{position:relative;width:180px;height:101px;perspective:700px;-webkit-user-drag:none;user-drag:none}
 
 .fan-card{
   position:absolute;inset:0;border-radius:11px;overflow:hidden;
   border:1.5px solid var(--fd-surface);background:var(--fd-surface-2);
-  transform-origin:15% 88%;
+  transform-origin:15% 88%;-webkit-user-drag:none;user-drag:none;
   transition:transform 0.38s cubic-bezier(0.22,1,0.36,1),opacity 0.28s ease,box-shadow 0.28s ease;
   will-change:transform,opacity;
 }
-.fan-card img.fan-cover-img{width:100%;height:100%;object-fit:cover;display:block}
+.fan-card img.fan-cover-img{width:100%;height:100%;object-fit:cover;display:block;pointer-events:none;-webkit-user-drag:none;user-drag:none}
 .fan-card-inner{
   width:100%;height:100%;display:flex;flex-direction:column;justify-content:center;align-items:center;
   text-align:center;padding:10px 12px;font-size:11.5px;font-weight:700;color:var(--fd-muted);
@@ -6728,6 +6729,15 @@ const FanDeck = (() => {
 
   document.addEventListener('pointerup', finishSwipe);
   document.addEventListener('pointercancel', finishSwipe);
+  document.addEventListener('mousedown', (e) => {
+    if (e.button === 0 && e.target.closest && e.target.closest('.fan-deck-wrap')) e.preventDefault();
+  }, true);
+  document.addEventListener('dragstart', (e) => {
+    if (e.target.closest && e.target.closest('.fan-deck-wrap')) {
+      e.preventDefault();
+      e.stopPropagation();
+    }
+  }, true);
   document.addEventListener('click', (e) => {
     if (e.target.closest && e.target.closest('.fan-deck-wrap')) e.stopPropagation();
   }, true);
@@ -6829,7 +6839,7 @@ function renderFavoritesPage() {
     FanDeck.mountCards(q.id, q.items, (v) => {
       const pic = v.pic ? (v.pic.replace(/^http:\/\//, 'https://') + '@672w_378h_1c.webp') : '';
       return pic
-        ? '<img class="fan-cover-img" src="' + esc(pic) + '" referrerpolicy="no-referrer" loading="lazy" alt="">'
+        ? '<img class="fan-cover-img" draggable="false" src="' + esc(pic) + '" referrerpolicy="no-referrer" loading="lazy" alt="">'
         : '<div class="fan-card-inner" style="border-top:3px solid ' + esc(q.color) + '">' + esc(v.title || v.bvid) + '</div>';
     });
   });
