@@ -111,21 +111,61 @@ async function getSigningKey(env) {
   );
 }
 
-async function createSessionToken(env, username) {
-  const exp = Date.now() + 7 * 24 * 3600 * 1000; // 7 days
-  const payload = JSON.stringify({ u: username, exp });
+const SESSION_COOKIE_NAME = 'bilisum_session';
+const PERSIST_TTL_MS = 90 * 24 * 3600 * 1000; // 90 days persistent single-device login
+const SHORT_TTL_MS = 24 * 3600 * 1000;        // 24 hours non-persistent session
+
+function getCookieValue(request, name) {
+  const raw = request.headers.get('Cookie') || '';
+  const parts = raw.split(';');
+  for (const p of parts) {
+    const idx = p.indexOf('=');
+    if (idx < 0) continue;
+    if (p.slice(0, idx).trim() === name) return decodeURIComponent(p.slice(idx + 1).trim());
+  }
+  return '';
+}
+
+function buildSessionCookie(request, token, remember) {
+  const isHttps = (request.url || '').startsWith('https://');
+  const attrs = [
+    `${SESSION_COOKIE_NAME}=${encodeURIComponent(token)}`,
+    'Path=/',
+    'HttpOnly',
+    'SameSite=Lax',
+  ];
+  if (isHttps) attrs.push('Secure');
+  if (remember) attrs.push(`Max-Age=${Math.floor(PERSIST_TTL_MS / 1000)}`);
+  return attrs.join('; ');
+}
+
+function buildClearSessionCookie(request) {
+  const isHttps = (request.url || '').startsWith('https://');
+  const attrs = [
+    `${SESSION_COOKIE_NAME}=`,
+    'Path=/',
+    'HttpOnly',
+    'SameSite=Lax',
+    'Max-Age=0',
+  ];
+  if (isHttps) attrs.push('Secure');
+  return attrs.join('; ');
+}
+
+async function createSessionToken(env, username, remember = true) {
+  const ttl = remember ? PERSIST_TTL_MS : SHORT_TTL_MS;
+  const exp = Date.now() + ttl;
+  const payload = JSON.stringify({ u: username, exp, rem: remember ? 1 : 0 });
   const payloadB64 = base64UrlEncode(new TextEncoder().encode(payload));
   const key = await getSigningKey(env);
   const sigBuf = await crypto.subtle.sign('HMAC', key, new TextEncoder().encode(payloadB64));
   const sigB64 = base64UrlEncode(new Uint8Array(sigBuf));
-  return { token: `${payloadB64}.${sigB64}`, expires_at: new Date(exp).toISOString() };
+  return { token: `${payloadB64}.${sigB64}`, expires_at: new Date(exp).toISOString(), remember };
 }
 
-async function verifySessionToken(request, env) {
-  const auth = request.headers.get('Authorization') || '';
-  const m = auth.match(/^Bearer\s+(.+)$/i);
-  if (!m) return null;
-  const parts = m[1].trim().split('.');
+async function verifyRawToken(tokenStr, env) {
+  if (!tokenStr) return null;
+  const parts = String(tokenStr).trim().split('.');
   if (parts.length !== 2) return null;
   const [payloadB64, sigB64] = parts;
   try {
@@ -135,16 +175,32 @@ async function verifySessionToken(request, env) {
     if (!ok) return null;
     const payload = JSON.parse(new TextDecoder().decode(base64UrlDecode(payloadB64)));
     if (!payload.exp || Date.now() > payload.exp) return null;
-    return { username: payload.u || 'admin', exp: payload.exp };
+    return { username: payload.u || 'admin', exp: payload.exp, remember: Boolean(payload.rem), token: tokenStr };
   } catch {
     return null;
   }
+}
+
+async function verifySessionToken(request, env) {
+  const auth = request.headers.get('Authorization') || '';
+  const m = auth.match(/^Bearer\s+(.+)$/i);
+  if (m) {
+    const res = await verifyRawToken(m[1], env);
+    if (res) return res;
+  }
+  const cookieTok = getCookieValue(request, SESSION_COOKIE_NAME);
+  if (cookieTok) {
+    const res = await verifyRawToken(cookieTok, env);
+    if (res) return res;
+  }
+  return null;
 }
 
 async function handleLogin(request, env) {
   const body = await request.json().catch(() => ({}));
   const username = String(body.username || '').trim();
   const password = String(body.password || '');
+  const remember = body.remember !== false;
   const expectedUser = (env.ADMIN_USERNAME || 'shiran').trim();
   const expectedPass = env.ADMIN_PASSWORD || '';
 
@@ -154,14 +210,59 @@ async function handleLogin(request, env) {
   if (!safeEqual(username, expectedUser) || !safeEqual(password, expectedPass)) {
     return errorResponse('账号或密码错误', 401);
   }
-  const sess = await createSessionToken(env, expectedUser);
-  return jsonResponse({ ok: true, username: expectedUser, token: sess.token, expires_at: sess.expires_at });
+  const sess = await createSessionToken(env, expectedUser, remember);
+  return new Response(JSON.stringify({
+    ok: true,
+    username: expectedUser,
+    token: sess.token,
+    expires_at: sess.expires_at,
+    remember,
+  }), {
+    status: 200,
+    headers: {
+      ...CORS_HEADERS,
+      'Content-Type': 'application/json; charset=utf-8',
+      'Set-Cookie': buildSessionCookie(request, sess.token, remember),
+    },
+  });
 }
 
 async function handleAuthMe(request, env) {
   const sess = await verifySessionToken(request, env);
   if (!sess) return jsonResponse({ authenticated: false, username: '' });
-  return jsonResponse({ authenticated: true, username: sess.username });
+
+  // Sliding auto-renewal for persistent single-device logins (< 60 days remaining -> refresh to 90 days)
+  const remaining = sess.exp - Date.now();
+  const shouldRenew = sess.remember && remaining < 60 * 24 * 3600 * 1000;
+  let freshToken = sess.token;
+  let expiresAt = new Date(sess.exp).toISOString();
+  const headers = { ...CORS_HEADERS, 'Content-Type': 'application/json; charset=utf-8' };
+
+  if (shouldRenew) {
+    const renewed = await createSessionToken(env, sess.username, true);
+    freshToken = renewed.token;
+    expiresAt = renewed.expires_at;
+    headers['Set-Cookie'] = buildSessionCookie(request, freshToken, true);
+  }
+
+  return new Response(JSON.stringify({
+    authenticated: true,
+    username: sess.username,
+    token: freshToken,
+    expires_at: expiresAt,
+    remember: sess.remember,
+  }), { status: 200, headers });
+}
+
+async function handleLogout(request) {
+  return new Response(JSON.stringify({ ok: true }), {
+    status: 200,
+    headers: {
+      ...CORS_HEADERS,
+      'Content-Type': 'application/json; charset=utf-8',
+      'Set-Cookie': buildClearSessionCookie(request),
+    },
+  });
 }
 
 // ═══════════════════════════════════════════════════════
@@ -1336,84 +1437,54 @@ function generateFrontendPage() {
 <html lang="zh-CN" data-theme="light">
 <head>
 <meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>B站AI摘要 · 视频知识库工作台</title>
+<meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>B站AI摘要 · Bilibili AI Summary</title>
 <style>
 *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
 :root{
   --bg:#F6F7F9;--surface:#FFFFFF;--surface-2:#ECEEF2;--surface-3:#F3F4F6;--surface-hover:#F9FAFB;
   --border:#E5E7EB;--border-strong:#D1D5DB;
   --text:#111827;--soft:#4B5563;--muted:#9CA3AF;
-  --brand:#FB7299;--brand-dark:#E11D48;--brand-soft:#FFF1F5;--brand-border:#FECDD3;
-  --cta:#111827;--cta-hover:#1F2937;--cta-text:#FFFFFF;
+  --brand:#FB7299;--brand-dark:#E0527B;--brand-soft:#FFF1F5;--brand-border:#FECDD3;
+  --cta:#18181B;--cta-text:#FFFFFF;--cta-hover:#27272A;
   --ok:#10B981;--ok-soft:#ECFDF5;--ok-text:#047857;
-  --err:#EF4444;--err-soft:#FEF2F2;--err-border:#FECACA;--err-text:#B91C1C;
+  --err:#EF4444;--err-soft:#FEF2F2;--err-text:#B91C1C;--err-border:#FECACA;
   --warn:#F59E0B;--warn-soft:#FFFBEB;--warn-text:#B45309;
-  --shadow-sm:0 1px 2px rgba(16,24,40,.05);
+  --blue:#2563EB;--blue-soft:rgba(37,99,235,.10);--blue-border:#93C5FD;
+  --shadow-sm:0 1px 2px rgba(15,23,42,.04);
+  --shadow-md:0 6px 20px rgba(15,23,42,.07);
+  --shadow-lg:0 20px 50px rgba(15,23,42,.16);
   --shadow-pill:0 2px 8px rgba(15,23,42,.11),0 0 0 1px rgba(15,23,42,.05);
-  --shadow-md:0 6px 20px rgba(16,24,40,.08);
-  --shadow-lg:0 24px 54px rgba(16,24,40,.16);
-  --reader-fs:14px;
+  --rail-w:228px;
 }
 [data-theme="dark"]{
   --bg:#0B0D12;--surface:#131722;--surface-2:#0F121A;--surface-3:#1B2030;--surface-hover:#181D2B;
-  --border:rgba(255,255,255,.09);--border-strong:rgba(255,255,255,.17);
-  --text:#F3F4F6;--soft:#CBD5E1;--muted:#6B7280;
-  --brand:#FB7299;--brand-dark:#FDA4AF;--brand-soft:rgba(251,114,153,.13);--brand-border:rgba(251,114,153,.32);
-  --cta:#FB7299;--cta-hover:#F43F7A;--cta-text:#FFFFFF;
-  --ok:#10B981;--ok-soft:rgba(16,185,129,.14);--ok-text:#6EE7B7;
-  --err:#F87171;--err-soft:rgba(239,68,68,.12);--err-border:rgba(239,68,68,.28);--err-text:#FCA5A5;
-  --warn:#FBBF24;--warn-soft:rgba(245,158,11,.14);--warn-text:#FCD34D;
-  --shadow-sm:0 1px 3px rgba(0,0,0,.32);
+  --border:#23293A;--border-strong:#333C52;
+  --text:#F3F4F6;--soft:#9CA3AF;--muted:#6B7280;
+  --brand:#FB7299;--brand-dark:#FF85A7;--brand-soft:rgba(251,114,153,.13);--brand-border:rgba(251,114,153,.32);
+  --cta:#F3F4F6;--cta-text:#0B0D12;--cta-hover:#FFFFFF;
+  --ok:#34D399;--ok-soft:rgba(16,185,129,.12);--ok-text:#6EE7B7;
+  --err:#F87171;--err-soft:rgba(239,68,68,.12);--err-text:#FCA5A5;--err-border:rgba(239,68,68,.35);
+  --warn:#FBBF24;--warn-soft:rgba(245,158,11,.13);--warn-text:#FDE68A;
+  --blue:#60A5FA;--blue-soft:rgba(59,130,246,.16);--blue-border:rgba(96,165,250,.45);
+  --shadow-sm:0 1px 2px rgba(0,0,0,.35);
+  --shadow-md:0 8px 24px rgba(0,0,0,.45);
+  --shadow-lg:0 24px 60px rgba(0,0,0,.65);
   --shadow-pill:0 2px 10px rgba(0,0,0,.45),0 0 0 1px rgba(255,255,255,.12);
-  --shadow-md:0 8px 24px rgba(0,0,0,.42);
-  --shadow-lg:0 26px 60px rgba(0,0,0,.65);
 }
-html,body{height:100%;font-family:-apple-system,BlinkMacSystemFont,'PingFang SC','Segoe UI','Microsoft YaHei',sans-serif;background:var(--bg);color:var(--text);-webkit-font-smoothing:antialiased;overflow:hidden}
+html,body{height:100%;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI','PingFang SC','Hiragino Sans GB','Microsoft YaHei',sans-serif;background:var(--bg);color:var(--text);font-size:14px;line-height:1.6;-webkit-font-smoothing:antialiased;overflow:hidden}
 button,input,select,textarea{font-family:inherit;color:inherit}
 button{cursor:pointer}
 .hidden{display:none!important}
-svg.ic{width:14px;height:14px;stroke:currentColor;fill:none;stroke-width:2;stroke-linecap:round;stroke-linejoin:round;flex-shrink:0}
+.ic{width:15px;height:15px;stroke:currentColor;fill:none;stroke-width:1.9;stroke-linecap:round;stroke-linejoin:round;flex-shrink:0}
+.ic-lg{width:18px;height:18px;stroke:currentColor;fill:none;stroke-width:1.9;stroke-linecap:round;stroke-linejoin:round;flex-shrink:0}
+::-webkit-scrollbar{width:6px;height:6px}
+::-webkit-scrollbar-track{background:transparent}
+::-webkit-scrollbar-thumb{background:var(--border-strong);border-radius:3px}
 
-/* Unified Form Controls */
-.ctrl{width:100%;height:38px;padding:0 12px;font-size:13px;border:1px solid var(--border);border-radius:9px;background:var(--surface);color:var(--text);outline:none;transition:border-color .15s,box-shadow .15s}
-.ctrl:focus{border-color:var(--brand);box-shadow:0 0 0 3px var(--brand-soft)}
-.ctrl::placeholder{color:var(--muted)}
-select.ctrl{appearance:none;-webkit-appearance:none;padding-right:32px}
-textarea.ctrl{height:auto;min-height:84px;padding:10px 12px;resize:vertical;line-height:1.55}
-
-/* Custom Card-Style Select */
-.c-select{position:relative;width:100%}
-.c-select-native{position:absolute;opacity:0;pointer-events:none;width:1px;height:1px}
-.c-select-btn{width:100%;height:38px;padding:0 12px;font-size:13px;border:1px solid var(--border);border-radius:9px;background:var(--surface);color:var(--text);display:flex;align-items:center;justify-content:space-between;gap:8px;text-align:left;transition:border-color .15s,box-shadow .15s,background .15s}
-.c-select-btn:hover{border-color:var(--border-strong);background:var(--surface-hover)}
-.c-select.open .c-select-btn{border-color:var(--brand);box-shadow:0 0 0 3px var(--brand-soft)}
-.c-select-label{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1;min-width:0}
-.c-select-chev{color:var(--muted);transition:transform .22s cubic-bezier(.34,1.35,.64,1);flex-shrink:0}
-.c-select.open .c-select-chev{transform:rotate(180deg);color:var(--brand-dark)}
-.c-select-menu{position:absolute;left:0;right:0;top:calc(100% + 6px);background:var(--surface);border:1px solid var(--border);border-radius:11px;box-shadow:var(--shadow-md);padding:5px;z-index:260;opacity:0;transform:translateY(-6px) scale(.98);pointer-events:none;transition:opacity .16s ease,transform .2s cubic-bezier(.22,1,.36,1);max-height:240px;overflow-y:auto}
-.c-select.open .c-select-menu{opacity:1;transform:translateY(0) scale(1);pointer-events:auto}
-.c-select.drop-up .c-select-menu{top:auto;bottom:calc(100% + 6px);transform:translateY(6px) scale(.98)}
-.c-select.drop-up.open .c-select-menu{transform:translateY(0) scale(1)}
-.c-select-opt{width:100%;border:none;background:transparent;padding:8px 10px;border-radius:7px;font-size:13px;color:var(--soft);display:flex;align-items:center;justify-content:space-between;gap:8px;text-align:left;transition:background .12s,color .12s}
-.c-select-opt:hover{background:var(--surface-3);color:var(--text)}
-.c-select-opt.selected{background:var(--brand-soft);color:var(--brand-dark);font-weight:600}
-.c-select-chk{opacity:0;flex-shrink:0}
-.c-select-opt.selected .c-select-chk{opacity:1}
-
-/* Toggle Switch */
-.tog-switch{position:relative;display:inline-flex;align-items:center;width:40px;height:22px;flex-shrink:0;cursor:pointer}
-.tog-switch input{opacity:0;width:0;height:0;position:absolute}
-.tog-track{position:absolute;inset:0;background:var(--border-strong);border-radius:999px;transition:background .22s ease}
-.tog-thumb{position:absolute;left:3px;top:3px;width:16px;height:16px;border-radius:50%;background:#fff;box-shadow:0 1px 3px rgba(0,0,0,.22);transition:transform .28s cubic-bezier(.34,1.38,.64,1)}
-.tog-switch input:checked + .tog-track{background:var(--brand)}
-.tog-switch input:checked ~ .tog-thumb{transform:translateX(18px)}
-
-/* Spring Sliding Pill & Panel Animations */
-@keyframes panelFadeIn{from{opacity:0;transform:translateY(6px)}to{opacity:1;transform:translateY(0)}}
+/* Animations */
 @keyframes modalPop{from{opacity:0;transform:scale(.96) translateY(8px)}to{opacity:1;transform:scale(1) translateY(0)}}
 @keyframes shimmer{0%{background-position:-200% 0}100%{background-position:200% 0}}
-.anim-in{animation:panelFadeIn .24s cubic-bezier(.22,1,.36,1)}
 .seg-slider{
   position:absolute;top:3px;bottom:3px;left:0;border-radius:7px;
   background:var(--surface);box-shadow:var(--shadow-pill);z-index:0;pointer-events:none;
@@ -1422,138 +1493,273 @@ textarea.ctrl{height:auto;min-height:84px;padding:10px 12px;resize:vertical;line
 }
 [data-theme="dark"] .seg-slider{background:var(--surface-3)}
 
-/* Layout */
-.app{display:grid;grid-template-columns:var(--sidebar-w,342px) 1px 1fr;height:100vh}
-.divider{background:var(--border);cursor:col-resize;position:relative;transition:background .15s}
-.divider:hover,.divider.dragging{background:var(--brand)}
-.divider::after{content:'';position:absolute;left:-4px;right:-4px;top:0;bottom:0}
+/* Full-Screen Auth Gate */
+.auth-gate{
+  position:fixed;inset:0;z-index:500;background:var(--bg);
+  display:flex;align-items:center;justify-content:center;padding:20px;
+}
+.auth-gate-theme{position:fixed;top:18px;right:20px;z-index:510}
+.auth-card{
+  width:100%;max-width:410px;background:var(--surface);border:1px solid var(--border);
+  border-radius:20px;padding:32px 30px 26px;box-shadow:var(--shadow-lg);
+  animation:modalPop .24s cubic-bezier(.22,1,.36,1);
+}
+.auth-brand{display:flex;align-items:center;gap:12px;margin-bottom:22px}
+.auth-brand h1{font-size:19px;font-weight:800;letter-spacing:-.2px}
+.auth-brand p{font-size:12.5px;color:var(--muted);margin-top:1px}
+.auth-note{font-size:12px;color:var(--muted);margin-top:14px;line-height:1.6;text-align:center}
 
-/* Sidebar */
-.sidebar{background:var(--surface);display:flex;flex-direction:column;height:100vh;overflow:hidden;padding:18px 16px 14px}
-.brand{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:14px;padding:0 2px}
-.brand-l{display:flex;align-items:center;gap:10px}
+/* App Shell: Plan A (Expanded 228px) / Plan B (Collapsed 64px) / Mobile Drawer */
+.app-shell{display:flex;height:100vh;width:100vw;overflow:hidden;position:relative}
+.nav-rail{
+  width:var(--rail-w);min-width:var(--rail-w);height:100vh;background:var(--surface);
+  border-right:1px solid var(--border);display:flex;flex-direction:column;
+  padding:14px 12px 12px;transition:width .24s cubic-bezier(.22,1,.36,1),min-width .24s cubic-bezier(.22,1,.36,1);
+  position:relative;z-index:40;flex-shrink:0;
+}
+.app-shell.rail-collapsed .nav-rail{width:64px;min-width:64px;padding:14px 9px 12px}
+
+.rail-head{display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:14px;min-height:36px;padding:0 2px}
+.brand-link{display:flex;align-items:center;gap:10px;min-width:0;cursor:pointer;border:none;background:none;padding:0;text-align:left}
 .brand-icon{width:34px;height:34px;border-radius:10px;background:var(--brand);display:flex;align-items:center;justify-content:center;flex-shrink:0;box-shadow:0 3px 10px rgba(251,114,153,.28)}
-.brand-title{font-size:17px;font-weight:800;letter-spacing:-.2px;color:var(--text)}
-.brand-sub{font-size:11px;color:var(--muted);margin-top:1px}
-.brand-home-btn{border:none;background:var(--surface-3);color:var(--soft);height:28px;padding:0 9px;border-radius:7px;font-size:11.5px;font-weight:600}
-.brand-home-btn:hover{color:var(--text);background:var(--surface-2)}
+.brand-text{min-width:0;transition:opacity .15s}
+.brand-title{font-size:15.5px;font-weight:800;letter-spacing:-.2px;color:var(--text);white-space:nowrap}
+.brand-sub{font-size:11px;color:var(--muted);white-space:nowrap}
+.rail-collapse-btn{
+  width:28px;height:28px;border:1px solid transparent;border-radius:7px;background:transparent;
+  color:var(--muted);display:inline-flex;align-items:center;justify-content:center;flex-shrink:0;
+  transition:background .15s,color .15s,border-color .15s;
+}
+.rail-collapse-btn:hover{background:var(--surface-3);color:var(--text);border-color:var(--border)}
 
-/* Top-Left Mode Switcher */
-.side-switcher{position:relative;display:grid;grid-template-columns:1fr 1fr;gap:4px;background:var(--surface-2);padding:3px;border-radius:10px;border:1px solid var(--border);margin-bottom:14px;flex-shrink:0}
-.side-sw-btn{position:relative;z-index:1;border:none;background:transparent;height:32px;border-radius:7px;font-size:13px;font-weight:600;color:var(--soft);white-space:nowrap;transition:color .22s ease;display:inline-flex;align-items:center;justify-content:center;gap:5px}
-.side-sw-btn:hover{color:var(--text)}
-.side-sw-btn.active{color:var(--text)}
-.side-pane{flex:1;min-height:0;display:flex;flex-direction:column;overflow:hidden}
+.app-shell.rail-collapsed .brand-text,
+.app-shell.rail-collapsed .rail-label,
+.app-shell.rail-collapsed .rail-badge,
+.app-shell.rail-collapsed .rail-sec-title,
+.app-shell.rail-collapsed .rail-collapse-btn,
+.app-shell.rail-collapsed .rail-user-meta{display:none!important}
+.app-shell.rail-collapsed .rail-head{justify-content:center;padding:0}
 
-/* Submit Bar */
-.input-shell{display:flex;align-items:center;gap:6px;background:var(--bg);border:1px solid var(--border);border-radius:11px;padding:4px 4px 4px 12px;transition:border-color .15s,box-shadow .15s}
-.input-shell:focus-within{border-color:var(--brand);box-shadow:0 0 0 3px var(--brand-soft)}
-.input-shell input{flex:1;min-width:0;border:none;background:transparent;font-size:13px;outline:none;height:34px;color:var(--text)}
-.input-shell input::placeholder{color:var(--muted)}
-.btn-submit{border:none;background:var(--cta);color:var(--cta-text);height:34px;padding:0 13px;border-radius:8px;font-size:13px;font-weight:600;white-space:nowrap;flex-shrink:0;transition:background .15s}
-.btn-submit:hover{background:var(--cta-hover)}
-.btn-submit:disabled{opacity:.5;cursor:not-allowed}
+/* Primary New Summary CTA */
+.rail-cta{
+  width:100%;height:38px;border-radius:10px;border:none;background:var(--cta);color:var(--cta-text);
+  display:flex;align-items:center;justify-content:center;gap:8px;font-size:13px;font-weight:700;
+  margin-bottom:14px;transition:background .15s,transform .1s;position:relative;flex-shrink:0;
+}
+.rail-cta:hover{background:var(--cta-hover)}
+.rail-cta:active{transform:scale(.98)}
+.rail-cta-kbd{font-size:10.5px;font-weight:600;opacity:.65;padding:1px 5px;border-radius:4px;border:1px solid currentColor;margin-left:auto}
+.app-shell.rail-collapsed .rail-cta{width:44px;margin:0 auto 14px;padding:0}
+.app-shell.rail-collapsed .rail-cta-kbd{display:none}
 
-.sub-actions{display:flex;align-items:center;justify-content:space-between;gap:6px;margin-top:8px}
-.adv-toggle{display:inline-flex;align-items:center;gap:5px;background:transparent;border:none;border-radius:7px;color:var(--soft);font-size:12px;font-weight:500;padding:5px 7px;transition:background .15s,color .15s}
-.adv-toggle:hover{background:var(--surface-3);color:var(--text)}
-.adv-toggle .caret{transition:transform .2s ease}
-.adv-toggle.open .caret{transform:rotate(180deg)}
-.adv-box{margin-top:6px;padding:12px;background:var(--bg);border:1px solid var(--border);border-radius:11px;display:flex;flex-direction:column;gap:10px}
-.field{display:flex;flex-direction:column;gap:5px}
-.field label{font-size:12px;font-weight:600;color:var(--soft);white-space:nowrap}
+/* Primary 5-Page Nav with Vertical Spring Slider */
+.rail-scroll{flex:1;overflow-y:auto;overflow-x:hidden;margin:0 -4px;padding:0 4px}
+.app-shell.rail-collapsed .rail-scroll{overflow:visible}
+.rail-nav{position:relative;display:flex;flex-direction:column;gap:2px}
+.nav-slider{
+  position:absolute;left:0;right:0;top:0;height:36px;border-radius:9px;
+  background:var(--brand-soft);border:1px solid var(--brand-border);z-index:0;pointer-events:none;
+  transition:transform .34s cubic-bezier(.34,1.38,.64,1),height .24s ease,opacity .2s ease;
+  will-change:transform;
+}
+.nav-slider.off{opacity:0}
+.rail-item{
+  position:relative;z-index:1;width:100%;height:36px;padding:0 10px;border-radius:9px;
+  border:none;background:transparent;color:var(--soft);display:flex;align-items:center;gap:10px;
+  font-size:13.5px;font-weight:600;text-align:left;white-space:nowrap;
+  transition:color .18s ease,background .15s ease;
+}
+.rail-item:hover{color:var(--text);background:var(--surface-hover)}
+.rail-item.active{color:var(--brand-dark);background:transparent}
+.rail-item.active:hover{background:transparent}
+.rail-badge{margin-left:auto;font-size:11px;font-weight:700;padding:1px 7px;border-radius:999px;background:var(--surface-3);color:var(--soft);font-variant-numeric:tabular-nums}
+.rail-item.active .rail-badge{background:rgba(251,114,153,.18);color:var(--brand-dark)}
+.app-shell.rail-collapsed .rail-item{justify-content:center;padding:0;width:44px;margin:0 auto}
 
-/* History & Filter Tabs */
-.history-wrap{flex:1;min-height:0;display:flex;flex-direction:column;margin-top:12px;padding-top:12px;border-top:1px solid var(--border)}
-.search-box{position:relative;margin-bottom:9px}
-.search-box .ctrl{padding-left:34px;background-color:var(--bg);height:35px}
-.search-box .s-ic{position:absolute;left:11px;top:50%;transform:translateY(-50%);color:var(--muted);pointer-events:none;display:flex}
+/* Folder Section in Sidebar */
+.rail-sep{height:1px;background:var(--border);margin:12px 4px}
+.rail-sec-head{display:flex;align-items:center;justify-content:space-between;padding:0 8px 6px}
+.rail-sec-title{font-size:11px;font-weight:700;color:var(--muted);letter-spacing:.3px;text-transform:uppercase}
+.rail-sec-add{
+  width:22px;height:22px;border:none;border-radius:6px;background:transparent;color:var(--muted);
+  display:inline-flex;align-items:center;justify-content:center;transition:all .15s;
+}
+.rail-sec-add:hover{background:var(--surface-3);color:var(--brand-dark)}
+.app-shell.rail-collapsed .rail-sec-head{justify-content:center;padding:0 0 6px}
+.rail-folders{display:flex;flex-direction:column;gap:2px}
+.folder-nav-item{
+  position:relative;width:100%;height:34px;padding:0 10px;border-radius:9px;border:1px solid transparent;
+  background:transparent;color:var(--soft);display:flex;align-items:center;gap:10px;
+  font-size:13px;font-weight:600;text-align:left;white-space:nowrap;transition:all .15s;
+}
+.folder-nav-item:hover{background:var(--surface-hover);color:var(--text)}
+.folder-nav-item.active{background:var(--brand-soft);border-color:var(--brand-border);color:var(--brand-dark)}
+.folder-dot{width:8px;height:8px;border-radius:50%;flex-shrink:0}
+.app-shell.rail-collapsed .folder-nav-item{justify-content:center;padding:0;width:44px;margin:0 auto}
+.app-shell.rail-collapsed .folder-dot{width:10px;height:10px}
 
-.h-filter-tabs{position:relative;display:grid;grid-template-columns:repeat(4,1fr);gap:2px;background:var(--surface-2);padding:3px;border-radius:9px;border:1px solid var(--border);margin-bottom:10px}
-.h-ftab{position:relative;z-index:1;border:none;background:transparent;height:26px;border-radius:6px;font-size:11.5px;font-weight:600;color:var(--soft);transition:color .2s}
-.h-ftab.active{color:var(--text)}
+/* Plan B Hover Tooltips */
+.app-shell.rail-collapsed [data-tip]{position:relative}
+.app-shell.rail-collapsed [data-tip]:hover::after{
+  content:attr(data-tip);position:absolute;left:calc(100% + 10px);top:50%;transform:translateY(-50%);
+  background:#111827;color:#fff;font-size:12px;font-weight:600;padding:5px 10px;border-radius:7px;
+  white-space:nowrap;box-shadow:var(--shadow-md);z-index:200;pointer-events:none;
+}
+[data-theme="dark"] .app-shell.rail-collapsed [data-tip]:hover::after{background:#F3F4F6;color:#0B0D12}
 
-.quick-add-box{padding:10px;background:var(--bg);border:1px solid var(--border);border-radius:10px;margin-bottom:12px}
-.quick-add-label{font-size:11.5px;font-weight:600;color:var(--soft);margin-bottom:6px;display:block}
-.quick-add-row{display:flex;gap:6px;align-items:center}
-.quick-add-row .ctrl{height:34px;font-size:12.5px;flex:1;min-width:0}
-.quick-add-row .btn{height:34px;padding:0 12px;font-size:12.5px}
+/* Sidebar Footer */
+.rail-foot{margin-top:auto;padding-top:10px;border-top:1px solid var(--border);display:flex;flex-direction:column;gap:6px;flex-shrink:0}
+.rail-user-row{display:flex;align-items:center;gap:8px;padding:6px 8px;border-radius:9px;background:var(--bg);border:1px solid var(--border)}
+.rail-user-ava{width:28px;height:28px;border-radius:50%;background:var(--brand-soft);border:1px solid var(--brand-border);color:var(--brand-dark);font-size:12px;font-weight:800;display:flex;align-items:center;justify-content:center;flex-shrink:0}
+.rail-user-meta{flex:1;min-width:0}
+.rail-user-name{font-size:12.5px;font-weight:700;color:var(--text);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.rail-user-sub{font-size:10.5px;color:var(--muted);white-space:nowrap}
+.rail-foot-acts{display:flex;align-items:center;gap:5px}
+.rail-foot-btn{
+  flex:1;height:32px;border-radius:8px;border:1px solid var(--border);background:var(--surface);
+  color:var(--soft);display:inline-flex;align-items:center;justify-content:center;gap:6px;
+  font-size:12px;font-weight:600;transition:all .15s;
+}
+.rail-foot-btn:hover{border-color:var(--border-strong);color:var(--text);background:var(--surface-hover)}
+.app-shell.rail-collapsed .rail-user-row{justify-content:center;padding:5px;width:44px;margin:0 auto;cursor:pointer}
+.app-shell.rail-collapsed .rail-foot-acts{flex-direction:column;gap:5px}
+.app-shell.rail-collapsed .rail-foot-btn{width:44px;flex:none;padding:0;margin:0 auto}
 
-.history-head{display:flex;align-items:center;justify-content:space-between;margin-bottom:7px;padding:0 2px}
-.history-head h3{font-size:12px;font-weight:700;color:var(--soft);display:inline-flex;align-items:center;gap:6px}
-.count-pill{font-size:11px;font-weight:600;color:var(--muted);background:var(--surface-3);padding:1px 7px;border-radius:999px}
-.text-btn{background:none;border:none;font-size:12px;color:var(--muted);padding:3px 7px;border-radius:6px;white-space:nowrap}
-.text-btn:hover{color:var(--text);background:var(--surface-3)}
-.text-btn.danger{color:var(--err)}
-.batch-bar{display:flex;align-items:center;gap:6px;margin-bottom:8px;padding:6px 8px;background:var(--surface-3);border-radius:8px;font-size:12px}
+/* Mobile Drawer Backdrop */
+.mobile-backdrop{display:none;position:fixed;inset:0;background:rgba(10,12,18,.48);backdrop-filter:blur(3px);z-index:35}
+.mobile-backdrop.show{display:block}
 
-.history-list{flex:1;overflow-y:auto;display:flex;flex-direction:column;gap:7px;padding-right:2px}
-.history-list::-webkit-scrollbar{width:5px}
-.history-list::-webkit-scrollbar-thumb{background:var(--border);border-radius:99px}
-.h-card{position:relative;padding:10px 12px;border:1px solid var(--border);border-radius:11px;background:var(--surface);cursor:pointer;transition:border-color .15s,background .15s,box-shadow .15s,transform .15s;display:flex;align-items:flex-start;gap:9px}
-.h-card:hover{background:var(--surface-hover);border-color:var(--border-strong)}
-.h-card.active{border-color:var(--text);box-shadow:var(--shadow-sm)}
-[data-theme="dark"] .h-card.active{border-color:var(--brand);box-shadow:inset 3px 0 0 var(--brand)}
-.h-body{flex:1;min-width:0}
-.h-title{font-size:13px;font-weight:600;line-height:1.42;color:var(--text);display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;margin-bottom:4px}
-.h-meta{font-size:11.5px;color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.h-right{display:flex;flex-direction:column;align-items:flex-end;gap:5px;flex-shrink:0;padding-top:3px}
-.dot{width:8px;height:8px;border-radius:50%;flex-shrink:0}
-.dot.ok{background:var(--ok)}
-.dot.pending{background:var(--warn);animation:pulse 1.4s infinite}
-.dot.err{background:var(--err)}
-@keyframes pulse{0%,100%{opacity:1}50%{opacity:.35}}
-.h-del{opacity:0;background:none;border:none;color:var(--muted);padding:2px 4px;border-radius:5px;display:inline-flex;transition:opacity .12s,color .12s}
-.h-card:hover .h-del{opacity:1}
-.h-del:hover{color:var(--err);background:var(--err-soft)}
-.h-star-dot{color:#F59E0B;display:inline-flex}
-.h-chk{margin-top:3px;accent-color:var(--brand)}
-
-/* Sidebar UP Card */
-.up-side-card{padding:9px 11px;border:1px solid var(--border);border-radius:11px;background:var(--surface);cursor:pointer;transition:border-color .15s,background .15s;display:flex;align-items:center;gap:10px}
-.up-side-card:hover{background:var(--surface-hover);border-color:var(--border-strong)}
-.up-side-card.active{border-color:var(--brand);background:var(--brand-soft)}
-.up-ava{width:34px;height:34px;border-radius:50%;object-fit:cover;background:var(--surface-3);flex-shrink:0;border:1px solid var(--border)}
-.up-ava-fb{width:34px;height:34px;border-radius:50%;background:var(--surface-3);color:var(--soft);font-size:13px;font-weight:700;display:flex;align-items:center;justify-content:center;flex-shrink:0;border:1px solid var(--border)}
-.up-side-info{flex:1;min-width:0}
-.up-side-name{font-size:13.5px;font-weight:600;color:var(--text);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.up-side-uid{font-size:11.5px;color:var(--muted);font-family:Consolas,monospace;margin-top:1px}
-.up-side-card .h-del{opacity:0}
-.up-side-card:hover .h-del{opacity:1}
-
-/* Main Workspace */
-.main{display:flex;flex-direction:column;height:100vh;overflow:hidden;background:var(--bg);min-width:0}
-.topbar{display:flex;align-items:center;justify-content:space-between;gap:12px;height:56px;padding:0 28px;border-bottom:1px solid var(--border);background:var(--surface);flex-shrink:0}
-.topbar-title{font-size:14.5px;font-weight:700;color:var(--text);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.topbar-sub{font-size:12px;color:var(--muted);font-weight:400;margin-left:10px;white-space:nowrap}
+/* Main Area & Topbar */
+.main-col{flex:1;min-width:0;display:flex;flex-direction:column;height:100vh;overflow:hidden;background:var(--bg)}
+.topbar{
+  height:56px;padding:0 24px;border-bottom:1px solid var(--border);background:var(--surface);
+  display:flex;align-items:center;justify-content:space-between;gap:12px;flex-shrink:0;
+}
+.tb-left{display:flex;align-items:center;gap:10px;min-width:0}
+.mobile-logo-btn{
+  display:none;width:36px;height:36px;border-radius:10px;background:var(--brand);border:none;
+  align-items:center;justify-content:center;flex-shrink:0;box-shadow:0 3px 10px rgba(251,114,153,.28);
+}
+.tb-expand-btn{
+  display:none;width:32px;height:32px;border-radius:8px;border:1px solid var(--border);
+  background:var(--surface);color:var(--soft);align-items:center;justify-content:center;flex-shrink:0;
+}
+.tb-expand-btn:hover{color:var(--text);border-color:var(--border-strong);background:var(--surface-hover)}
+.app-shell.rail-collapsed .tb-expand-btn{display:inline-flex}
+.topbar-title{font-size:15px;font-weight:800;color:var(--text);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.topbar-sub{font-size:12px;color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .topbar-actions{display:flex;align-items:center;gap:8px;flex-shrink:0}
 .pill-btn{display:inline-flex;align-items:center;gap:6px;height:34px;padding:0 12px;border:1px solid var(--border);border-radius:9px;background:var(--surface);color:var(--text);font-size:12.5px;font-weight:600;white-space:nowrap;transition:border-color .15s,background .15s}
 .pill-btn:hover{border-color:var(--border-strong);background:var(--surface-hover)}
-.pill-btn.authed{border-color:var(--brand-border);background:var(--brand-soft);color:var(--brand-dark)}
+.pill-btn.brand{border-color:var(--brand-border);background:var(--brand-soft);color:var(--brand-dark)}
 .icon-btn{width:34px;height:34px;display:inline-flex;align-items:center;justify-content:center;border:1px solid var(--border);border-radius:9px;background:var(--surface);color:var(--soft);flex-shrink:0;transition:border-color .15s,color .15s,background .15s}
 .icon-btn:hover{border-color:var(--border-strong);color:var(--text);background:var(--surface-hover)}
 
-.content-scroll{flex:1;overflow-y:auto;scrollbar-gutter:stable;padding:22px 28px 48px}
-.content-inner{max-width:980px;margin:0 auto}
-.content-inner.wide-feed{max-width:100%}
+/* Keep-Alive Route Host */
+.route-host{flex:1;min-height:0;position:relative;display:flex;flex-direction:column;overflow:hidden}
+.route-view{flex:1;min-height:0;overflow-y:auto;scrollbar-gutter:stable;padding:22px 26px 48px}
+.route-view.no-pad{padding:0;overflow:hidden;display:flex}
+.page-inner{max-width:1060px;margin:0 auto;width:100%}
+.page-inner.full{max-width:100%}
 
-/* Dashboard Overview (Empty / Home State) */
-.dash-hero{background:var(--surface);border:1px solid var(--border);border-radius:16px;padding:26px 28px;margin-bottom:16px;box-shadow:var(--shadow-sm)}
-.dash-hero h2{font-size:20px;font-weight:800;margin-bottom:6px;letter-spacing:-.2px}
-.dash-hero p{font-size:13.5px;color:var(--soft);line-height:1.65;max-width:680px}
-.kpi-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin-bottom:16px}
-.kpi-card{background:var(--surface);border:1px solid var(--border);border-radius:13px;padding:16px 18px;box-shadow:var(--shadow-sm)}
-.kpi-label{font-size:12px;color:var(--muted);font-weight:600;margin-bottom:6px}
-.kpi-val{font-size:24px;font-weight:800;color:var(--text);font-variant-numeric:tabular-nums}
-.kpi-sub{font-size:11.5px;color:var(--soft);margin-top:4px}
-.recent-grid{display:grid;grid-template-columns:repeat(2,1fr);gap:12px}
-.recent-card{background:var(--surface);border:1px solid var(--border);border-radius:13px;padding:16px 18px;cursor:pointer;transition:border-color .15s,transform .15s,box-shadow .15s}
-.recent-card:hover{border-color:var(--brand);transform:translateY(-2px);box-shadow:var(--shadow-md)}
-.recent-card h4{font-size:14px;font-weight:700;line-height:1.45;margin-bottom:6px;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
-.recent-card p{font-size:12px;color:var(--muted)}
+/* Form Controls & Custom Select */
+.field{display:flex;flex-direction:column;gap:6px}
+.field+.field{margin-top:12px}
+.field label{font-size:12px;font-weight:600;color:var(--soft)}
+.ctrl{width:100%;border:1px solid var(--border);border-radius:9px;padding:8px 11px;font-size:13px;background:var(--surface);color:var(--text);outline:none;transition:border-color .15s,box-shadow .15s}
+.ctrl:focus{border-color:var(--brand);box-shadow:0 0 0 3px rgba(251,114,153,.13)}
+textarea.ctrl{min-height:76px;resize:vertical;line-height:1.55}
+.search-box{position:relative}
+.search-box input{padding-left:32px}
+.search-box .s-ic{position:absolute;left:10px;top:50%;transform:translateY(-50%);color:var(--muted);pointer-events:none;display:flex}
 
-/* Stepper */
-.stepper{display:flex;align-items:center;justify-content:space-between;gap:6px;background:var(--surface);border:1px solid var(--border);border-radius:11px;padding:9px 16px;margin-bottom:14px;font-size:12.5px}
+select.c-select-native{position:absolute!important;opacity:0!important;pointer-events:none!important;width:0!important;height:0!important}
+.c-select{position:relative;width:100%}
+.c-select-btn{width:100%;min-height:38px;display:flex;align-items:center;justify-content:space-between;gap:8px;padding:8px 11px;border:1px solid var(--border);border-radius:9px;background:var(--surface);color:var(--text);font-size:13px;font-weight:500;text-align:left;transition:border-color .15s,box-shadow .15s,background .15s}
+.c-select-btn:hover{border-color:var(--border-strong);background:var(--surface-hover)}
+.c-select.open .c-select-btn{border-color:var(--brand);box-shadow:0 0 0 3px rgba(251,114,153,.13)}
+.c-select-label{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.c-select-chev{color:var(--muted);transition:transform .2s ease;flex-shrink:0}
+.c-select.open .c-select-chev{transform:rotate(180deg);color:var(--brand)}
+.c-select-menu{position:absolute;left:0;right:0;top:calc(100% + 6px);z-index:260;background:var(--surface);border:1px solid var(--border-strong);border-radius:11px;box-shadow:var(--shadow-lg);padding:5px;max-height:240px;overflow-y:auto;opacity:0;transform:translateY(-4px) scale(.98);pointer-events:none;transition:opacity .16s ease,transform .16s cubic-bezier(.22,1,.36,1)}
+.c-select.drop-up .c-select-menu{top:auto;bottom:calc(100% + 6px);transform:translateY(4px) scale(.98)}
+.c-select.open .c-select-menu{opacity:1;transform:translateY(0) scale(1);pointer-events:auto}
+.c-select-opt{width:100%;display:flex;align-items:center;justify-content:space-between;gap:8px;padding:8px 10px;border:none;background:transparent;border-radius:7px;font-size:13px;color:var(--text);text-align:left;transition:background .12s,color .12s}
+.c-select-opt:hover{background:var(--surface-hover)}
+.c-select-opt.selected{background:var(--brand-soft);color:var(--brand-dark);font-weight:600}
+.c-select-chk{opacity:0;color:var(--brand);flex-shrink:0}
+.c-select-opt.selected .c-select-chk{opacity:1}
+
+.tog-switch{position:relative;display:inline-flex;align-items:center;cursor:pointer;flex-shrink:0}
+.tog-switch input{position:absolute;opacity:0;width:0;height:0}
+.tog-track{width:40px;height:22px;border-radius:999px;background:var(--border-strong);transition:background .22s ease;position:relative;display:block}
+.tog-track::after{content:'';position:absolute;top:2px;left:2px;width:18px;height:18px;border-radius:50%;background:#fff;box-shadow:0 1px 3px rgba(0,0,0,.22);transition:transform .24s cubic-bezier(.34,1.38,.64,1)}
+.tog-switch input:checked+.tog-track{background:var(--brand)}
+.tog-switch input:checked+.tog-track::after{transform:translateX(18px)}
+
+.btn{display:inline-flex;align-items:center;justify-content:center;gap:6px;height:36px;padding:0 14px;border-radius:9px;font-size:13px;font-weight:600;border:1px solid var(--border);background:var(--surface);color:var(--text);white-space:nowrap;text-decoration:none;transition:background .15s,border-color .15s}
+.btn:hover{background:var(--surface-hover);border-color:var(--border-strong)}
+.btn:disabled{opacity:.55;cursor:not-allowed}
+.btn-sm{height:30px;padding:0 11px;font-size:12px;border-radius:7px}
+.btn-primary{background:var(--cta);color:var(--cta-text);border-color:transparent}
+.btn-primary:hover{background:var(--cta-hover);border-color:transparent}
+.btn-brand{background:var(--brand);color:#fff;border-color:transparent}
+.btn-brand:hover{opacity:.92;border-color:transparent}
+
+/* Segmented Tabs (Horizontal Spring Pill) */
+.seg-tabs{position:relative;display:inline-flex;background:var(--surface-2);padding:3px;border-radius:10px;border:1px solid var(--border)}
+.seg-tab{position:relative;z-index:1;border:none;background:transparent;padding:6px 14px;border-radius:7px;font-size:13px;font-weight:600;color:var(--soft);white-space:nowrap;transition:color .22s ease}
+.seg-tab:hover{color:var(--text)}
+.seg-tab.active{color:var(--text)}
+
+/* Tag Pills & Popover */
+.folder-bar{display:flex;flex-wrap:wrap;gap:6px;align-items:center}
+.folder-chip{display:inline-flex;align-items:center;gap:5px;height:27px;padding:0 10px;border-radius:999px;border:1px solid var(--border);background:var(--surface);color:var(--soft);font-size:12px;font-weight:600;white-space:nowrap;transition:all .15s}
+.folder-chip:hover{border-color:var(--border-strong);color:var(--text);background:var(--surface-hover)}
+.folder-chip.active{border-color:var(--brand-border);background:var(--brand-soft);color:var(--brand-dark)}
+.folder-cnt{font-size:10.5px;opacity:.75;font-weight:500}
+.mini-tags{display:flex;flex-wrap:wrap;gap:4px;margin-top:6px}
+.mini-tag{display:inline-flex;align-items:center;gap:4px;padding:1px 7px;border-radius:5px;font-size:11px;font-weight:600;background:var(--surface-3);color:var(--soft);line-height:1.45}
+.mini-tag.wl{background:var(--blue-soft);color:var(--blue)}
+.mini-tag.fav{background:var(--warn-soft);color:var(--warn-text)}
+
+.vh-tag-row{display:flex;flex-wrap:wrap;align-items:center;gap:6px;margin-top:10px}
+.tag-pill{display:inline-flex;align-items:center;gap:5px;height:25px;padding:0 9px;border-radius:999px;border:1px solid var(--border);background:var(--bg);color:var(--text);font-size:11.5px;font-weight:600}
+.tag-pill button{border:none;background:none;color:var(--muted);font-size:13px;line-height:1;padding:0 1px;cursor:pointer}
+.tag-pill button:hover{color:var(--err)}
+.tag-add-btn{display:inline-flex;align-items:center;gap:4px;height:25px;padding:0 10px;border-radius:999px;border:1px dashed var(--border-strong);background:transparent;color:var(--soft);font-size:11.5px;font-weight:600;transition:all .15s}
+.tag-add-btn:hover{border-color:var(--brand);color:var(--brand-dark);background:var(--brand-soft)}
+
+.tag-popover{position:fixed;z-index:290;min-width:205px;max-width:255px;background:var(--surface);border:1px solid var(--border-strong);border-radius:12px;box-shadow:var(--shadow-lg);padding:6px;animation:modalPop .14s cubic-bezier(.22,1,.36,1)}
+.tag-pop-head{font-size:11px;font-weight:700;color:var(--muted);padding:5px 8px 6px}
+.tag-pop-item{width:100%;display:flex;align-items:center;justify-content:space-between;gap:8px;padding:7px 9px;border:none;background:transparent;border-radius:8px;font-size:12.5px;font-weight:500;color:var(--text);text-align:left;cursor:pointer}
+.tag-pop-item:hover{background:var(--surface-hover)}
+.tag-pop-item.selected{background:var(--brand-soft);color:var(--brand-dark);font-weight:600}
+.tag-pop-left{display:inline-flex;align-items:center;gap:7px;min-width:0}
+.tag-pop-sep{height:1px;background:var(--border);margin:5px 2px}
+
+/* PAGE 1: SUMMARY WORKSPACE */
+.recent-strip{display:flex;align-items:center;gap:8px;overflow-x:auto;padding-bottom:6px;margin-bottom:14px}
+.recent-strip-label{font-size:11.5px;font-weight:700;color:var(--muted);white-space:nowrap;flex-shrink:0}
+.rec-pill{
+  display:inline-flex;align-items:center;gap:6px;height:30px;padding:0 11px;border-radius:999px;
+  border:1px solid var(--border);background:var(--surface);color:var(--soft);font-size:12px;font-weight:600;
+  white-space:nowrap;max-width:220px;flex-shrink:0;transition:all .15s;
+}
+.rec-pill span{overflow:hidden;text-overflow:ellipsis}
+.rec-pill:hover{border-color:var(--border-strong);color:var(--text)}
+.rec-pill.active{border-color:var(--brand);background:var(--brand-soft);color:var(--brand-dark)}
+.dot{width:7px;height:7px;border-radius:50%;flex-shrink:0}
+.dot.ok{background:var(--ok)}
+.dot.pending{background:var(--warn)}
+.dot.err{background:var(--err)}
+
+.empty-ws-card{background:var(--surface);border:1px solid var(--border);border-radius:16px;padding:34px 28px;text-align:center;box-shadow:var(--shadow-sm)}
+.empty-ws-card h2{font-size:19px;font-weight:800;margin-bottom:8px}
+.empty-ws-card p{font-size:13.5px;color:var(--soft);max-width:520px;margin:0 auto 20px;line-height:1.65}
+.quick-inline-bar{display:flex;gap:8px;max-width:540px;margin:0 auto}
+
+.stepper{display:flex;align-items:center;justify-content:space-between;gap:6px;background:var(--surface);border:1px solid var(--border);border-radius:11px;padding:9px 16px;margin-bottom:14px;font-size:12.5px;overflow-x:auto}
 .st-item{display:inline-flex;align-items:center;gap:6px;color:var(--muted);white-space:nowrap;font-weight:500}
 .st-item.done{color:var(--text)}
 .st-item.done .st-dot{background:var(--ok);border-color:var(--ok);color:#fff}
@@ -1567,8 +1773,7 @@ textarea.ctrl{height:auto;min-height:84px;padding:10px 12px;resize:vertical;line
 .st-badge.err{background:var(--err-soft);color:var(--err-text)}
 .st-badge.pending{background:var(--warn-soft);color:var(--warn-text)}
 
-/* Video Header Card */
-.video-head{background:var(--surface);border:1px solid var(--border);border-radius:14px;padding:18px 22px;margin-bottom:14px;display:flex;align-items:flex-start;justify-content:space-between;gap:16px;box-shadow:var(--shadow-sm)}
+.video-head{background:var(--surface);border:1px solid var(--border);border-radius:14px;padding:18px 22px;margin-bottom:14px;display:flex;align-items:flex-start;justify-content:space-between;gap:16px;box-shadow:var(--shadow-sm);flex-wrap:wrap}
 .vh-left{min-width:0;flex:1}
 .vh-title{font-size:18.5px;font-weight:800;line-height:1.4;color:var(--text);margin-bottom:10px;word-break:break-word}
 .vh-title a{color:inherit;text-decoration:none}
@@ -1576,87 +1781,19 @@ textarea.ctrl{height:auto;min-height:84px;padding:10px 12px;resize:vertical;line
 .vh-pills{display:flex;flex-wrap:wrap;gap:7px}
 .meta-pill{display:inline-flex;align-items:center;gap:4px;padding:3px 10px;border-radius:999px;background:var(--surface-3);color:var(--soft);font-size:12px;font-weight:500;white-space:nowrap}
 .meta-pill.saved{background:var(--ok-soft);color:var(--ok-text);font-weight:600}
-.vh-actions{display:flex;align-items:center;gap:8px;flex-shrink:0}
-.star-btn{height:34px;padding:0 11px;border:1px solid var(--border);border-radius:9px;background:var(--surface);color:var(--soft);font-size:12.5px;font-weight:600;display:inline-flex;align-items:center;gap:5px;transition:all .15s;white-space:nowrap}
-.star-btn:hover{border-color:var(--border-strong);color:var(--text)}
-.star-btn.starred{border-color:#FCD34D;background:var(--warn-soft);color:#B45309}
-.wl-btn{height:34px;padding:0 11px;border:1px solid var(--border);border-radius:9px;background:var(--surface);color:var(--soft);font-size:12.5px;font-weight:600;display:inline-flex;align-items:center;gap:5px;transition:all .15s;white-space:nowrap}
-.wl-btn:hover{border-color:var(--border-strong);color:var(--text)}
-.wl-btn.active{border-color:#93C5FD;background:rgba(37,99,235,.10);color:#2563EB}
-[data-theme="dark"] .wl-btn.active{border-color:rgba(96,165,250,.45);background:rgba(59,130,246,.16);color:#93C5FD}
+.vh-actions{display:flex;align-items:center;gap:8px;flex-shrink:0;flex-wrap:wrap}
+.star-btn,.wl-btn{height:34px;padding:0 11px;border:1px solid var(--border);border-radius:9px;background:var(--surface);color:var(--soft);font-size:12.5px;font-weight:600;display:inline-flex;align-items:center;gap:5px;transition:all .15s;white-space:nowrap}
+.star-btn:hover,.wl-btn:hover{border-color:var(--border-strong);color:var(--text)}
+.star-btn.starred{border-color:#FCD34D;background:var(--warn-soft);color:var(--warn-text)}
+.wl-btn.active{border-color:var(--blue-border);background:var(--blue-soft);color:var(--blue)}
 .watch-btn{display:inline-flex;align-items:center;gap:5px;height:34px;padding:0 13px;border:1px solid var(--border);border-radius:9px;background:var(--surface);color:var(--text);font-size:12.5px;font-weight:600;text-decoration:none;white-space:nowrap;flex-shrink:0;transition:border-color .15s,color .15s}
 .watch-btn:hover{border-color:var(--brand);color:var(--brand)}
 
-/* Tag Folders & Watch Later System */
-.folder-bar{display:flex;flex-wrap:wrap;gap:5px;margin-bottom:10px;align-items:center}
-.folder-chip{display:inline-flex;align-items:center;gap:5px;height:25px;padding:0 9px;border-radius:999px;border:1px solid var(--border);background:var(--surface);color:var(--soft);font-size:11.5px;font-weight:600;white-space:nowrap;transition:border-color .15s,background .15s,color .15s}
-.folder-chip:hover{border-color:var(--border-strong);color:var(--text);background:var(--surface-hover)}
-.folder-chip.active{border-color:var(--brand-border);background:var(--brand-soft);color:var(--brand-dark)}
-.folder-dot{width:7px;height:7px;border-radius:50%;flex-shrink:0}
-.folder-cnt{font-size:10.5px;opacity:.75;font-weight:500}
-.folder-add-btn{display:inline-flex;align-items:center;gap:3px;height:25px;padding:0 8px;border-radius:999px;border:1px dashed var(--border-strong);background:transparent;color:var(--muted);font-size:11.5px;font-weight:600;white-space:nowrap;transition:all .15s}
-.folder-add-btn:hover{border-color:var(--brand);color:var(--brand-dark);background:var(--brand-soft)}
-
-.mini-tags{display:flex;flex-wrap:wrap;gap:4px;margin-top:5px}
-.mini-tag{display:inline-flex;align-items:center;gap:4px;padding:1px 6px;border-radius:5px;font-size:10.5px;font-weight:600;background:var(--surface-3);color:var(--soft);line-height:1.45}
-.mini-tag.wl{background:rgba(37,99,235,.10);color:#2563EB}
-[data-theme="dark"] .mini-tag.wl{background:rgba(59,130,246,.18);color:#93C5FD}
-
-.vh-tag-row{display:flex;flex-wrap:wrap;align-items:center;gap:6px;margin-top:10px;position:relative}
-.tag-pill{display:inline-flex;align-items:center;gap:5px;height:24px;padding:0 8px;border-radius:999px;border:1px solid var(--border);background:var(--bg);color:var(--text);font-size:11.5px;font-weight:600}
-.tag-pill button{border:none;background:none;color:var(--muted);font-size:13px;line-height:1;padding:0 1px;cursor:pointer}
-.tag-pill button:hover{color:var(--err)}
-.tag-add-btn{display:inline-flex;align-items:center;gap:4px;height:24px;padding:0 9px;border-radius:999px;border:1px dashed var(--border-strong);background:transparent;color:var(--soft);font-size:11.5px;font-weight:600;transition:all .15s}
-.tag-add-btn:hover{border-color:var(--brand);color:var(--brand-dark);background:var(--brand-soft)}
-
-.tag-popover{position:fixed;z-index:260;min-width:200px;max-width:250px;background:var(--surface);border:1px solid var(--border-strong);border-radius:12px;box-shadow:var(--shadow-lg);padding:6px;animation:modalPop .14s cubic-bezier(.22,1,.36,1)}
-.tag-pop-head{font-size:11px;font-weight:700;color:var(--muted);padding:5px 8px 6px;display:flex;align-items:center;justify-content:space-between}
-.tag-pop-item{width:100%;display:flex;align-items:center;justify-content:space-between;gap:8px;padding:7px 9px;border:none;background:transparent;border-radius:8px;font-size:12.5px;font-weight:500;color:var(--text);text-align:left;cursor:pointer}
-.tag-pop-item:hover{background:var(--surface-hover)}
-.tag-pop-item.selected{background:var(--brand-soft);color:var(--brand-dark);font-weight:600}
-.tag-pop-left{display:inline-flex;align-items:center;gap:7px;min-width:0}
-.tag-pop-sep{height:1px;background:var(--border);margin:5px 2px}
-
-.up-side-acts{display:flex;align-items:center;gap:2px;flex-shrink:0}
-.up-tag-btn{border:none;background:none;color:var(--muted);width:22px;height:22px;border-radius:6px;display:flex;align-items:center;justify-content:center;opacity:0;transition:opacity .15s,color .15s,background .15s}
-.up-side-card:hover .up-tag-btn,.up-side-card.active .up-tag-btn{opacity:1}
-.up-tag-btn:hover{color:var(--brand-dark);background:var(--brand-soft)}
-
-.v-thumb-wrap{position:relative;width:100%}
-.v-quick-acts{position:absolute;top:8px;right:8px;display:flex;gap:5px;z-index:3;opacity:0;transition:opacity .16s ease}
-.v-card:hover .v-quick-acts,.v-quick-acts.has-active{opacity:1}
-.v-qbtn{width:28px;height:28px;border-radius:8px;border:1px solid rgba(255,255,255,.22);background:rgba(15,17,22,.72);backdrop-filter:blur(6px);color:#fff;display:inline-flex;align-items:center;justify-content:center;transition:transform .12s,background .15s,border-color .15s}
-.v-qbtn:hover{background:rgba(15,17,22,.92);transform:scale(1.06)}
-.v-qbtn.wl-on{background:#2563EB;border-color:#60A5FA;color:#fff}
-.v-qbtn.fav-on{background:#D97706;border-color:#FCD34D;color:#fff}
-
-.feed-footer{margin-top:26px;display:flex;flex-direction:column;align-items:center;gap:10px;padding:12px 0 8px}
-.feed-load-btn{height:38px;padding:0 22px;border-radius:10px;border:1px solid var(--border);background:var(--surface);color:var(--text);font-size:13px;font-weight:600;display:inline-flex;align-items:center;gap:8px;box-shadow:var(--shadow-sm);transition:all .15s}
-.feed-load-btn:hover{border-color:var(--brand);color:var(--brand-dark);background:var(--brand-soft)}
-.feed-load-btn:disabled{opacity:.65;cursor:default}
-.feed-meta-note{font-size:12px;color:var(--muted)}
-
-.color-swatches{display:flex;gap:7px;flex-wrap:wrap;margin-top:6px}
-.color-sw{width:24px;height:24px;border-radius:50%;border:2px solid transparent;cursor:pointer;transition:transform .12s,box-shadow .12s}
-.color-sw:hover{transform:scale(1.1)}
-.color-sw.active{box-shadow:0 0 0 2px var(--surface),0 0 0 4px var(--text)}
-.folder-mgr-list{display:flex;flex-direction:column;gap:8px;margin-top:12px}
-.folder-mgr-row{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:10px 12px;border:1px solid var(--border);border-radius:10px;background:var(--bg)}
-.folder-mgr-left{display:flex;align-items:center;gap:9px;min-width:0}
-.folder-mgr-name{font-size:13.5px;font-weight:700;color:var(--text)}
-.folder-mgr-stat{font-size:11.5px;color:var(--muted)}
-
-/* View Tabs + Independent Action Buttons */
 .view-bar{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:14px;flex-wrap:wrap}
-.seg-tabs{position:relative;display:inline-flex;background:var(--surface-2);padding:3px;border-radius:10px;border:1px solid var(--border)}
-.seg-tab{position:relative;z-index:1;border:none;background:transparent;padding:6px 14px;border-radius:7px;font-size:13px;font-weight:600;color:var(--soft);white-space:nowrap;transition:color .22s ease}
-.seg-tab:hover{color:var(--text)}
-.seg-tab.active{color:var(--text)}
 .action-group{display:inline-flex;align-items:center;gap:7px;flex-wrap:wrap}
 .act-btn{display:inline-flex;align-items:center;gap:5px;height:33px;padding:0 11px;border:1px solid var(--border);border-radius:8px;background:var(--surface);color:var(--soft);font-size:12.5px;font-weight:600;white-space:nowrap;transition:border-color .15s,color .15s,background .15s}
 .act-btn:hover{border-color:var(--border-strong);color:var(--text);background:var(--surface-hover)}
 
-/* Instant Style Switch Bar inside Summary Card */
 .style-switch-bar{display:flex;align-items:center;justify-content:space-between;gap:10px;padding-bottom:14px;margin-bottom:18px;border-bottom:1px solid var(--border);flex-wrap:wrap}
 .style-pills{display:flex;align-items:center;gap:6px;flex-wrap:wrap}
 .style-pill{border:1px solid var(--border);background:var(--bg);color:var(--soft);height:28px;padding:0 11px;border-radius:999px;font-size:12px;font-weight:600;transition:all .15s}
@@ -1667,39 +1804,33 @@ textarea.ctrl{height:auto;min-height:84px;padding:10px 12px;resize:vertical;line
 .fs-btn{width:28px;height:28px;border:1px solid var(--border);background:var(--surface);color:var(--soft);border-radius:7px;font-size:12px;font-weight:700}
 .fs-btn:hover{color:var(--text);border-color:var(--border-strong)}
 
-/* Reading Panels */
-.reader-grid{display:grid;grid-template-columns:1fr;gap:16px}
-.reader-grid.split{grid-template-columns:1.15fr 1fr;align-items:start}
-.reader-card{background:var(--surface);border:1px solid var(--border);border-radius:14px;padding:22px 26px;box-shadow:var(--shadow-sm)}
-.panel-label{font-size:11.5px;font-weight:700;letter-spacing:.7px;color:var(--muted);text-transform:uppercase;margin-bottom:12px}
+.reader-card{background:var(--surface);border:1px solid var(--border);border-radius:14px;padding:24px 28px;box-shadow:var(--shadow-sm)}
+.split-grid{display:grid;grid-template-columns:1fr 1fr;gap:16px;align-items:start}
+.split-col-head{font-size:12px;font-weight:700;color:var(--muted);text-transform:uppercase;letter-spacing:.5px;padding-bottom:12px;margin-bottom:14px;border-bottom:1px solid var(--border)}
 
-/* Rendered Rich Summary */
-.md-theme-box{background:var(--brand-soft);border-left:3.5px solid var(--brand);border-radius:0 10px 10px 0;padding:14px 18px;margin-bottom:20px}
-.md-theme-label{font-size:12px;font-weight:700;color:var(--brand-dark);letter-spacing:.4px;margin-bottom:5px}
-.md-theme-body{font-size:calc(var(--reader-fs) + .5px);line-height:1.75;color:var(--text);font-weight:500}
-.md-sec-title{font-size:calc(var(--reader-fs) + 1.5px);font-weight:800;color:var(--text);margin:18px 0 11px}
-.md-list{list-style:none;display:flex;flex-direction:column;gap:10px;margin-bottom:18px}
-.md-list li{display:flex;align-items:flex-start;gap:10px;font-size:var(--reader-fs);line-height:1.78;color:var(--soft)}
-.md-num{min-width:22px;height:22px;border-radius:50%;background:var(--surface-3);color:var(--brand-dark);font-size:11.5px;font-weight:700;display:inline-flex;align-items:center;justify-content:center;margin-top:2px;flex-shrink:0}
-.md-list strong,.md-p strong{color:var(--text);font-weight:650}
-.md-p{font-size:var(--reader-fs);line-height:1.82;color:var(--soft);margin-bottom:10px}
-.md-conclusion{background:var(--bg);border:1px solid var(--border);border-radius:10px;padding:14px 18px;margin-top:8px}
-.md-conclusion-label{font-size:12px;font-weight:700;color:var(--soft);margin-bottom:5px}
-.md-conclusion-body{font-size:var(--reader-fs);line-height:1.75;color:var(--soft)}
-.md-note{font-size:12px;color:var(--muted);margin-top:8px}
-.md-code{background:var(--surface-3);color:var(--brand-dark);padding:1px 6px;border-radius:4px;font-size:12.5px;font-family:Consolas,monospace}
+.md-theme-box{background:var(--brand-soft);border-left:3.5px solid var(--brand);border-radius:0 10px 10px 0;padding:13px 16px;margin-bottom:20px}
+.md-theme-label{font-size:11.5px;font-weight:700;color:var(--brand-dark);letter-spacing:.4px;margin-bottom:5px}
+.md-theme-body{font-size:var(--reader-fs,14.5px);line-height:1.75;color:var(--text);font-weight:500}
+.md-sec-title{font-size:14px;font-weight:800;color:var(--text);margin:20px 0 11px;display:flex;align-items:center;gap:7px}
+.md-list{list-style:none;display:flex;flex-direction:column;gap:9px;margin-bottom:18px}
+.md-list li{display:flex;align-items:flex-start;gap:10px;font-size:var(--reader-fs,14px);line-height:1.72;color:var(--text)}
+.md-num{flex-shrink:0;width:21px;height:21px;border-radius:50%;background:var(--surface-3);color:var(--brand-dark);font-size:11.5px;font-weight:700;display:inline-flex;align-items:center;justify-content:center;margin-top:2px}
+.md-conclusion{background:var(--bg);border:1px solid var(--border);border-radius:11px;padding:15px 18px;margin-top:18px}
+.md-conclusion-label{font-size:11.5px;font-weight:700;color:var(--soft);margin-bottom:6px;letter-spacing:.3px}
+.md-conclusion-body{font-size:var(--reader-fs,14px);line-height:1.78;color:var(--text)}
+.md-p{font-size:var(--reader-fs,14px);line-height:1.78;margin-bottom:10px;color:var(--text)}
+.md-note{font-size:12px;color:var(--muted);margin-top:10px;padding-top:10px;border-top:1px dashed var(--border)}
+.md-code{background:var(--surface-3);padding:1px 5px;border-radius:4px;font-family:Consolas,monospace;font-size:12.5px}
 
-/* Transcript Search Bar & Highlight */
-.tr-search-bar{display:flex;align-items:center;gap:8px;margin-bottom:12px;padding-bottom:12px;border-bottom:1px solid var(--border)}
-.tr-search-bar .ctrl{height:34px;font-size:12.5px;flex:1}
-.tr-match-count{font-size:12px;color:var(--muted);white-space:nowrap;font-variant-numeric:tabular-nums}
-.transcript-box{font-size:var(--reader-fs);line-height:1.88;color:var(--soft);white-space:pre-wrap;word-break:break-word;max-height:66vh;overflow-y:auto}
-.transcript-box mark{background:#FEF08A;color:#111827;padding:0 2px;border-radius:3px}
-.transcript-box mark.cur-match{background:#FB7299;color:#fff}
+.tr-toolbar{display:flex;align-items:center;gap:8px;margin-bottom:14px;padding-bottom:12px;border-bottom:1px solid var(--border);flex-wrap:wrap}
+.tr-toolbar .search-box{flex:1;min-width:200px}
+.tr-count{font-size:12px;color:var(--muted);font-variant-numeric:tabular-nums;white-space:nowrap}
+.transcript-box{white-space:pre-wrap;word-break:break-word;font-size:var(--reader-fs,13.5px);line-height:1.85;color:var(--soft);max-height:68vh;overflow-y:auto}
+.transcript-box mark{background:#FEF08A;color:#111827;border-radius:3px;padding:0 2px}
+.transcript-box mark.cur-match{background:var(--brand);color:#fff}
 
-/* Mindmap View */
 .mm-wrap{display:flex;flex-direction:column;gap:14px}
-.mm-root{background:var(--cta);color:var(--cta-text);padding:14px 18px;border-radius:12px;font-size:15px;font-weight:700;line-height:1.45}
+.mm-root{display:inline-flex;align-items:center;align-self:flex-start;background:var(--cta);color:var(--cta-text);padding:10px 16px;border-radius:11px;font-size:14.5px;font-weight:700;line-height:1.45;box-shadow:var(--shadow-sm)}
 .mm-branches{display:flex;flex-direction:column;gap:10px;padding-left:20px;border-left:2px solid var(--brand-border)}
 .mm-node{position:relative;background:var(--bg);border:1px solid var(--border);border-radius:11px;padding:12px 15px}
 .mm-node::before{content:'';position:absolute;left:-21px;top:20px;width:19px;height:2px;background:var(--brand-border)}
@@ -1710,8 +1841,7 @@ textarea.ctrl{height:auto;min-height:84px;padding:10px 12px;resize:vertical;line
 .mm-leaf{font-size:13px;line-height:1.65;color:var(--soft);padding:6px 10px;background:var(--surface);border:1px solid var(--border);border-radius:8px}
 .mm-leaf strong{color:var(--text)}
 
-/* AI Chat Panel */
-.chat-panel{display:flex;flex-direction:column;min-height:460px;max-height:68vh}
+.chat-panel{display:flex;flex-direction:column;min-height:420px;max-height:66vh}
 .chat-quick-row{display:flex;flex-wrap:wrap;gap:7px;margin-bottom:14px}
 .chat-chip{border:1px solid var(--border);background:var(--bg);color:var(--soft);padding:5px 11px;border-radius:999px;font-size:12px;font-weight:500;transition:all .15s}
 .chat-chip:hover{border-color:var(--brand);color:var(--brand-dark);background:var(--brand-soft)}
@@ -1719,13 +1849,10 @@ textarea.ctrl{height:auto;min-height:84px;padding:10px 12px;resize:vertical;line
 .chat-msg{max-width:86%;padding:11px 14px;border-radius:12px;font-size:13.5px;line-height:1.7;white-space:pre-wrap;word-break:break-word}
 .chat-msg.user{align-self:flex-end;background:var(--cta);color:var(--cta-text);border-bottom-right-radius:4px}
 .chat-msg.assistant{align-self:flex-start;background:var(--bg);border:1px solid var(--border);color:var(--text);border-bottom-left-radius:4px}
-.chat-msg.assistant strong{color:var(--text)}
 .chat-input-bar{display:flex;gap:8px;padding-top:12px;border-top:1px solid var(--border)}
 .chat-input-bar .ctrl{flex:1}
 
 .pending-banner{padding:28px 20px;text-align:center;color:var(--soft);font-size:14px}
-
-/* Failure Diagnostic Card */
 .diag-card{background:var(--err-soft);border:1px solid var(--err-border);border-radius:12px;padding:18px 20px}
 .diag-head{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:12px;flex-wrap:wrap}
 .diag-title{font-size:14.5px;font-weight:700;color:var(--err-text)}
@@ -1735,28 +1862,66 @@ textarea.ctrl{height:auto;min-height:84px;padding:10px 12px;resize:vertical;line
 .diag-key{color:var(--soft);font-weight:600}
 .diag-foot{margin-top:14px;padding-top:12px;border-top:1px dashed var(--err-border);display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap}
 
-/* UP Monitor Video Cover Grid & Skeleton */
-.mon-toolbar{display:flex;align-items:center;justify-content:space-between;gap:14px;flex-wrap:wrap;margin-bottom:18px;padding:14px 18px;background:var(--surface);border:1px solid var(--border);border-radius:14px;box-shadow:var(--shadow-sm)}
-.mon-tb-left h2{font-size:16.5px;font-weight:800;margin-bottom:3px}
-.mon-tb-left p{font-size:12.5px;color:var(--soft)}
-.mon-tb-actions{display:flex;gap:8px;flex-wrap:wrap}
+/* PAGE 2: MONITOR UP CREATORS (2-Pane Split inside Route View) */
+.monitor-split{display:flex;flex:1;min-height:0;width:100%;overflow:hidden}
+.mon-aside{
+  width:258px;min-width:258px;border-right:1px solid var(--border);background:var(--surface);
+  display:flex;flex-direction:column;padding:14px 12px;overflow:hidden;flex-shrink:0;
+}
+.mon-aside-scroll{flex:1;overflow-y:auto;display:flex;flex-direction:column;gap:6px;margin-top:10px;padding-right:2px}
+.mon-main{flex:1;min-width:0;overflow-y:auto;scrollbar-gutter:stable;padding:20px 24px 48px}
+.quick-add-box{background:var(--bg);border:1px solid var(--border);border-radius:10px;padding:9px;margin-top:10px;margin-bottom:10px}
+.quick-add-row{display:flex;gap:6px}
+.quick-add-row .ctrl{height:32px;padding:4px 9px;font-size:12.5px}
+.quick-add-row .btn{height:32px;padding:0 11px;font-size:12px}
+
+.up-side-card{padding:8px 10px;border:1px solid var(--border);border-radius:10px;background:var(--surface);cursor:pointer;transition:border-color .15s,background .15s;display:flex;align-items:center;gap:9px}
+.up-side-card:hover{background:var(--surface-hover);border-color:var(--border-strong)}
+.up-side-card.active{border-color:var(--brand);background:var(--brand-soft)}
+.up-ava{width:32px;height:32px;border-radius:50%;object-fit:cover;background:var(--surface-3);flex-shrink:0;border:1px solid var(--border)}
+.up-ava-fb{width:32px;height:32px;border-radius:50%;background:var(--surface-3);color:var(--soft);font-size:12.5px;font-weight:700;display:flex;align-items:center;justify-content:center;flex-shrink:0;border:1px solid var(--border)}
+.up-side-info{flex:1;min-width:0}
+.up-side-name{font-size:13px;font-weight:600;color:var(--text);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.up-side-uid{font-size:11px;color:var(--muted);font-family:Consolas,monospace}
+.up-side-acts{display:flex;align-items:center;gap:2px;flex-shrink:0}
+.up-act-ic{border:none;background:none;color:var(--muted);width:22px;height:22px;border-radius:6px;display:flex;align-items:center;justify-content:center;opacity:0;transition:all .15s}
+.up-side-card:hover .up-act-ic,.up-side-card.active .up-act-ic{opacity:1}
+.up-act-ic:hover{color:var(--brand-dark);background:var(--brand-soft)}
+.up-act-ic.del:hover{color:var(--err);background:var(--err-soft)}
+
+/* Shared Page Toolbar & Video Cover Grid */
+.page-toolbar{display:flex;align-items:center;justify-content:space-between;gap:14px;flex-wrap:wrap;margin-bottom:18px;padding:15px 18px;background:var(--surface);border:1px solid var(--border);border-radius:14px;box-shadow:var(--shadow-sm)}
+.pt-left h2{font-size:16.5px;font-weight:800;margin-bottom:2px;display:flex;align-items:center;gap:8px}
+.pt-left p{font-size:12.5px;color:var(--soft)}
+.pt-actions{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
 
 .video-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(256px,1fr));gap:22px 16px}
 .v-card{display:flex;flex-direction:column;min-width:0}
+.v-thumb-wrap{position:relative;width:100%}
 .v-thumb-link{position:relative;display:block;width:100%;aspect-ratio:16/9;border-radius:12px;overflow:hidden;background:var(--surface-3);border:1px solid var(--border);text-decoration:none}
 .v-thumb-link img{width:100%;height:100%;object-fit:cover;display:block;transition:transform .28s ease}
 .v-card:hover .v-thumb-link img{transform:scale(1.035)}
+.v-thumb-fallback{width:100%;height:100%;display:flex;align-items:center;justify-content:center;padding:16px;text-align:center;font-size:13px;font-weight:700;color:var(--soft);background:linear-gradient(135deg,var(--surface-3),var(--surface-2))}
 .v-dur{position:absolute;right:8px;bottom:8px;background:rgba(15,17,22,.82);color:#fff;font-size:11.5px;font-weight:600;padding:2px 6px;border-radius:5px;line-height:1.3;font-variant-numeric:tabular-nums}
 .v-sum-badge{position:absolute;left:8px;top:8px;background:rgba(16,185,129,.92);color:#fff;font-size:11px;font-weight:600;padding:2px 8px;border-radius:999px}
+.v-chk-wrap{position:absolute;left:8px;bottom:8px;z-index:4;background:rgba(15,17,22,.72);backdrop-filter:blur(4px);border-radius:6px;padding:3px 6px;display:flex;align-items:center;gap:5px;color:#fff;font-size:11px;font-weight:600}
+.v-chk-wrap input{accent-color:var(--brand);width:14px;height:14px;cursor:pointer}
+.v-quick-acts{position:absolute;top:8px;right:8px;display:flex;gap:5px;z-index:3;opacity:0;transition:opacity .16s ease}
+.v-card:hover .v-quick-acts,.v-quick-acts.has-active{opacity:1}
+.v-qbtn{width:28px;height:28px;border-radius:8px;border:1px solid rgba(255,255,255,.22);background:rgba(15,17,22,.72);backdrop-filter:blur(6px);color:#fff;display:inline-flex;align-items:center;justify-content:center;transition:transform .12s,background .15s}
+.v-qbtn:hover{background:rgba(15,17,22,.92);transform:scale(1.06)}
+.v-qbtn.wl-on{background:#2563EB;border-color:#60A5FA;color:#fff}
+.v-qbtn.fav-on{background:#D97706;border-color:#FCD34D;color:#fff}
+
 .v-body{display:flex;align-items:flex-start;gap:10px;padding-top:10px}
 .v-ava{width:34px;height:34px;border-radius:50%;object-fit:cover;background:var(--surface-3);border:1px solid var(--border);flex-shrink:0;margin-top:2px}
 .v-ava-fb{width:34px;height:34px;border-radius:50%;background:var(--surface-3);color:var(--soft);font-size:13px;font-weight:700;display:flex;align-items:center;justify-content:center;border:1px solid var(--border);flex-shrink:0;margin-top:2px}
 .v-meta-col{flex:1;min-width:0}
-.v-title{display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;font-size:14px;font-weight:700;line-height:1.42;color:var(--text);text-decoration:none;margin-bottom:5px;word-break:break-word}
+.v-title{display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;font-size:14px;font-weight:700;line-height:1.42;color:var(--text);text-decoration:none;margin-bottom:4px;word-break:break-word}
 .v-title:hover{color:var(--brand-dark)}
 .v-author{font-size:12.5px;color:var(--soft);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;margin-bottom:2px}
 .v-stats{font-size:12px;color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;margin-bottom:7px}
-.v-foot{display:flex;align-items:center;justify-content:space-between;gap:8px}
+.v-foot{display:flex;align-items:center;justify-content:space-between;gap:8px;flex-wrap:wrap}
 .v-time-pill{display:inline-block;background:var(--surface-3);color:var(--soft);font-size:11px;font-weight:500;padding:2px 8px;border-radius:999px;white-space:nowrap}
 .v-act-row{display:inline-flex;align-items:center;gap:6px}
 .v-act-btn{border:1px solid var(--border);background:var(--surface);color:var(--text);font-size:11.5px;font-weight:600;padding:3px 9px;border-radius:7px;white-space:nowrap;transition:all .15s}
@@ -1764,266 +1929,296 @@ textarea.ctrl{height:auto;min-height:84px;padding:10px 12px;resize:vertical;line
 .v-act-btn.primary{background:var(--cta);color:var(--cta-text);border-color:transparent}
 .v-act-btn.primary:hover{background:var(--cta-hover);color:var(--cta-text)}
 
+.feed-footer{margin-top:26px;display:flex;flex-direction:column;align-items:center;gap:10px;padding:12px 0 8px}
+.feed-load-btn{height:38px;padding:0 22px;border-radius:10px;border:1px solid var(--border);background:var(--surface);color:var(--text);font-size:13px;font-weight:600;display:inline-flex;align-items:center;gap:8px;box-shadow:var(--shadow-sm);transition:all .15s}
+.feed-load-btn:hover{border-color:var(--brand);color:var(--brand-dark);background:var(--brand-soft)}
+.feed-load-btn:disabled{opacity:.65;cursor:default}
+.feed-meta-note{font-size:12px;color:var(--muted)}
 .skel{background:linear-gradient(90deg,var(--surface-3) 25%,var(--surface-2) 50%,var(--surface-3) 75%);background-size:200% 100%;animation:shimmer 1.3s infinite linear;border-radius:8px}
 
-/* Modals */
-.modal-backdrop{position:fixed;inset:0;background:rgba(10,12,18,.52);backdrop-filter:blur(4px);z-index:200;display:flex;align-items:center;justify-content:center;padding:20px}
-.modal{background:var(--surface);border:1px solid var(--border);border-radius:16px;box-shadow:var(--shadow-lg);width:100%;max-width:440px;max-height:90vh;display:flex;flex-direction:column;overflow:hidden;animation:modalPop .2s cubic-bezier(.22,1,.36,1)}
+/* KPI Grid + Summary Archive Cards (History / Favorites / Folder Summaries) */
+.kpi-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin-bottom:18px}
+.kpi-card{background:var(--surface);border:1px solid var(--border);border-radius:13px;padding:15px 18px;box-shadow:var(--shadow-sm)}
+.kpi-label{font-size:12px;color:var(--muted);font-weight:600;margin-bottom:5px}
+.kpi-val{font-size:23px;font-weight:800;color:var(--text);font-variant-numeric:tabular-nums}
+.kpi-sub{font-size:11.5px;color:var(--soft);margin-top:3px}
+
+.filter-strip{display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;margin-bottom:14px}
+.archive-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(320px,1fr));gap:14px}
+.arch-card{
+  background:var(--surface);border:1px solid var(--border);border-radius:14px;padding:16px 18px;
+  cursor:pointer;display:flex;flex-direction:column;gap:9px;box-shadow:var(--shadow-sm);
+  transition:border-color .15s,box-shadow .15s,transform .15s;
+}
+.arch-card:hover{border-color:var(--brand);box-shadow:var(--shadow-md);transform:translateY(-1px)}
+.arch-top{display:flex;align-items:flex-start;justify-content:space-between;gap:10px}
+.arch-title{font-size:14.5px;font-weight:700;line-height:1.42;color:var(--text);display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
+.arch-meta{font-size:12px;color:var(--muted);display:flex;flex-wrap:wrap;gap:6px;align-items:center}
+.arch-excerpt{font-size:12.5px;line-height:1.62;color:var(--soft);display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
+.arch-foot{display:flex;align-items:center;justify-content:space-between;gap:8px;padding-top:8px;border-top:1px solid var(--border);margin-top:auto}
+.arch-acts{display:inline-flex;align-items:center;gap:5px}
+.arch-ic-btn{width:28px;height:28px;border-radius:7px;border:1px solid var(--border);background:var(--surface);color:var(--soft);display:inline-flex;align-items:center;justify-content:center;transition:all .15s}
+.arch-ic-btn:hover{border-color:var(--border-strong);color:var(--text);background:var(--surface-hover)}
+.arch-ic-btn.wl-on{border-color:var(--blue-border);background:var(--blue-soft);color:var(--blue)}
+.arch-ic-btn.fav-on{border-color:#FCD34D;background:var(--warn-soft);color:var(--warn-text)}
+.arch-ic-btn.del:hover{border-color:var(--err-border);background:var(--err-soft);color:var(--err)}
+
+/* Modals & Email Preview */
+.modal-backdrop{position:fixed;inset:0;background:rgba(10,12,18,.52);backdrop-filter:blur(4px);z-index:240;display:flex;align-items:center;justify-content:center;padding:20px}
+.modal{background:var(--surface);border:1px solid var(--border);border-radius:16px;box-shadow:var(--shadow-lg);width:100%;max-width:480px;max-height:90vh;display:flex;flex-direction:column;overflow:hidden;animation:modalPop .2s cubic-bezier(.22,1,.36,1)}
 .modal.wide{max-width:860px}
 .modal.reader{max-width:740px}
 .modal-head{display:flex;align-items:center;justify-content:space-between;padding:18px 22px;border-bottom:1px solid var(--border);gap:12px}
 .modal-head h2{font-size:16px;font-weight:800;line-height:1.4}
 .modal-body{padding:20px 22px;overflow-y:auto;flex:1}
 .modal-foot{padding:14px 22px;border-top:1px solid var(--border);display:flex;align-items:center;justify-content:space-between;gap:10px;background:var(--bg);flex-wrap:wrap}
-.btn{display:inline-flex;align-items:center;justify-content:center;gap:6px;height:36px;padding:0 14px;border-radius:9px;font-size:13px;font-weight:600;border:1px solid var(--border);background:var(--surface);color:var(--text);white-space:nowrap;text-decoration:none;transition:background .15s,border-color .15s}
-.btn:hover{background:var(--surface-hover);border-color:var(--border-strong)}
-.btn-sm{height:30px;padding:0 11px;font-size:12px;border-radius:7px}
-.btn-primary{background:var(--cta);color:var(--cta-text);border-color:transparent}
-.btn-primary:hover{background:var(--cta-hover);border-color:transparent}
-.btn-brand{background:var(--brand);color:#fff;border-color:transparent}
-.btn-brand:hover{opacity:.92;border-color:transparent}
-
-.m-tabs{position:relative;display:inline-flex;gap:4px;margin-bottom:18px;background:var(--surface-2);padding:3px;border-radius:9px;border:1px solid var(--border)}
-.m-tab{position:relative;z-index:1;border:none;background:transparent;padding:6px 14px;border-radius:7px;font-size:13px;font-weight:600;color:var(--soft);white-space:nowrap;transition:color .22s ease}
-.m-tab:hover{color:var(--text)}
-.m-tab.active{color:var(--text)}
-.form-row{display:grid;grid-template-columns:1fr 1fr;gap:14px}
-.form-section{background:var(--bg);border:1px solid var(--border);border-radius:12px;padding:16px;margin-bottom:14px}
-.sec-head{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:12px;flex-wrap:wrap}
-.sec-head h4{font-size:13.5px;font-weight:700;color:var(--text)}
-.chip-list{display:flex;flex-wrap:wrap;gap:8px;margin-top:10px}
-.chip{display:inline-flex;align-items:center;gap:6px;padding:5px 10px;background:var(--surface);border:1px solid var(--border);border-radius:8px;font-size:12.5px}
-.chip b{font-weight:600;color:var(--text)}
-.chip small{color:var(--muted);font-family:Consolas,monospace;font-size:11px}
-.chip button{border:none;background:none;color:var(--muted);font-size:14px;line-height:1;padding:0 2px}
+.m-section{background:var(--bg);border:1px solid var(--border);border-radius:12px;padding:16px;margin-bottom:14px}
+.m-sec-head{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:12px;flex-wrap:wrap}
+.m-sec-title{font-size:13.5px;font-weight:700;color:var(--text)}
+.m-sec-sub{font-size:12px;color:var(--muted);margin-top:2px}
+.form-grid{display:grid;grid-template-columns:1fr 1fr;gap:12px;align-items:end}
+.inline-add-row{display:grid;grid-template-columns:1fr auto;gap:8px;align-items:center}
+.chip-list{display:flex;flex-wrap:wrap;gap:7px;margin-top:10px}
+.chip{display:inline-flex;align-items:center;gap:6px;padding:5px 10px;border-radius:8px;background:var(--surface);border:1px solid var(--border);font-size:12.5px;color:var(--text)}
+.chip .chip-sub{font-size:11px;color:var(--muted);font-family:Consolas,monospace}
+.chip button{border:none;background:none;color:var(--muted);font-size:15px;line-height:1;padding:0 2px}
 .chip button:hover{color:var(--err)}
-.inline-add{display:flex;gap:8px;align-items:center}
-.inline-add .ctrl{flex:1;min-width:0}
-.switch-row{display:flex;align-items:center;justify-content:space-between;gap:12px}
-.cron-badge{font-family:Consolas,monospace;font-size:12px;padding:3px 9px;background:var(--surface);border:1px solid var(--border);border-radius:6px;color:var(--brand-dark);white-space:nowrap}
+.cron-badge{display:inline-flex;align-items:center;padding:3px 9px;border-radius:7px;background:var(--brand-soft);color:var(--brand-dark);font-family:Consolas,monospace;font-size:11.5px;font-weight:600;white-space:nowrap}
 
-/* Inline & Floating Toasts */
-.sb-toast{margin-top:8px;padding:8px 11px;border-radius:8px;font-size:12.5px;line-height:1.5;display:none}
-.sb-toast.show{display:block}
-.sb-toast.ok{background:var(--ok-soft);color:var(--ok-text)}
-.sb-toast.err{background:var(--err-soft);color:var(--err-text);border:1px solid var(--err-border)}
-.sb-toast.info{background:var(--surface-3);color:var(--soft)}
-
-.global-toast{position:fixed;right:24px;bottom:24px;z-index:400;padding:11px 16px;border-radius:11px;font-size:13px;font-weight:600;background:var(--cta);color:var(--cta-text);box-shadow:var(--shadow-lg);opacity:0;transform:translateY(14px);pointer-events:none;transition:opacity .22s ease,transform .24s cubic-bezier(.22,1,.36,1)}
-.global-toast.show{opacity:1;transform:translateY(0)}
-.global-toast.err{background:#DC2626;color:#fff}
-
-/* Email Style Selector */
-.style-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin-bottom:14px}
-.style-card{border:2px solid var(--border);border-radius:11px;padding:8px;background:var(--surface);cursor:pointer;transition:all .15s;text-align:left}
+.style-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin-bottom:16px}
+.style-card{border:1.5px solid var(--border);border-radius:11px;padding:11px;cursor:pointer;background:var(--surface);transition:all .15s}
 .style-card:hover{border-color:var(--border-strong)}
-.style-card.selected{border-color:var(--brand);box-shadow:0 0 0 3px var(--brand-soft)}
-.style-thumb{height:66px;border-radius:7px;overflow:hidden;border:1px solid var(--border);margin-bottom:7px;display:flex;flex-direction:column}
-.st-hd{height:19px;padding:4px 6px;display:flex;align-items:center;gap:4px}
-.st-bar{height:4px;border-radius:2px;width:45%}
-.st-bd{flex:1;padding:5px 6px;display:flex;flex-direction:column;gap:4px}
-.st-line{height:4px;border-radius:2px;background:#e5e7eb}
-.style-name{font-size:12.5px;font-weight:700;color:var(--text)}
-.style-desc{font-size:11px;color:var(--muted);margin-top:2px}
-.email-preview-frame{width:100%;height:370px;border:1px solid var(--border);border-radius:10px;background:#fff}
+.style-card.selected{border-color:var(--brand);background:var(--brand-soft)}
+.sc-thumb{height:44px;border-radius:6px;margin-bottom:8px;overflow:hidden;border:1px solid var(--border);display:flex;flex-direction:column}
+.sc-name{font-size:12.5px;font-weight:700;margin-bottom:2px}
+.sc-desc{font-size:11px;color:var(--muted);line-height:1.4}
+.preview-box{border:1px solid var(--border);border-radius:12px;overflow:hidden;background:#F3F4F6}
+.preview-bar{background:var(--surface);padding:9px 14px;border-bottom:1px solid var(--border);font-size:12px;color:var(--soft);display:flex;justify-content:space-between;align-items:center;gap:8px}
+.preview-stage{padding:16px;max-height:360px;overflow-y:auto}
 
-@media(max-width:1100px){
-  .app{grid-template-columns:300px 1px 1fr}
-  .topbar{padding:0 18px}
-  .content-scroll{padding:18px}
+.color-swatches{display:flex;gap:7px;flex-wrap:wrap;margin-top:8px}
+.color-sw{width:24px;height:24px;border-radius:50%;border:2px solid transparent;cursor:pointer;transition:transform .12s,box-shadow .12s}
+.color-sw:hover{transform:scale(1.1)}
+.color-sw.active{box-shadow:0 0 0 2px var(--surface),0 0 0 4px var(--text)}
+.folder-mgr-list{display:flex;flex-direction:column;gap:8px;margin-top:12px}
+.folder-mgr-row{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:10px 12px;border:1px solid var(--border);border-radius:10px;background:var(--bg)}
+.folder-mgr-left{display:flex;align-items:center;gap:9px;min-width:0}
+.folder-mgr-name{font-size:13.5px;font-weight:700;color:var(--text)}
+.folder-mgr-stat{font-size:11.5px;color:var(--muted)}
+
+.sb-toast{padding:8px 12px;border-radius:8px;font-size:12.5px;display:none;line-height:1.5;margin-top:8px}
+.sb-toast.show{display:block}
+.sb-toast.ok{background:var(--ok-soft);color:var(--ok-text);border:1px solid rgba(16,185,129,.25)}
+.sb-toast.err{background:var(--err-soft);color:var(--err-text);border:1px solid var(--err-border)}
+.global-toast{position:fixed;right:24px;bottom:24px;z-index:420;background:var(--cta);color:var(--cta-text);padding:10px 16px;border-radius:10px;font-size:13px;font-weight:600;box-shadow:var(--shadow-lg);opacity:0;transform:translateY(10px);pointer-events:none;transition:opacity .2s,transform .2s}
+.global-toast.show{opacity:1;transform:translateY(0)}
+.global-toast.err{background:var(--err);color:#fff}
+
+/* Responsive: Tablet & Mobile (<=768px leaves ONLY clickable Brand Logo top-left!) */
+@media(max-width:1024px){
   .kpi-grid{grid-template-columns:repeat(2,1fr)}
+  .split-grid{grid-template-columns:1fr}
+  .mon-aside{width:224px;min-width:224px}
 }
-@media(max-width:860px){
-  html,body{overflow:auto;height:auto}
-  .app{grid-template-columns:1fr;height:auto;min-height:100vh}
-  .sidebar{height:auto;overflow:visible;border-bottom:1px solid var(--border)}
-  .history-list{max-height:260px}
-  .divider{display:none}
-  .main{height:auto;overflow:visible}
-  .topbar{padding:10px 16px;height:auto}
-  .content-scroll{padding:16px}
-  .video-head{flex-direction:column}
-  .reader-grid.split,.recent-grid,.form-row{grid-template-columns:1fr}
-  .style-grid{grid-template-columns:repeat(2,1fr)}
-  .video-grid{grid-template-columns:repeat(auto-fill,minmax(220px,1fr))}
+@media(max-width:768px){
+  .nav-rail{
+    position:fixed;left:0;top:0;bottom:0;width:262px!important;min-width:262px!important;
+    transform:translateX(-104%);transition:transform .26s cubic-bezier(.22,1,.36,1);
+    box-shadow:var(--shadow-lg);padding:16px 14px 14px!important;
+  }
+  .app-shell.mobile-nav-open .nav-rail{transform:translateX(0)}
+  .app-shell.rail-collapsed .brand-text,
+  .app-shell.rail-collapsed .rail-label,
+  .app-shell.rail-collapsed .rail-badge,
+  .app-shell.rail-collapsed .rail-sec-title,
+  .app-shell.rail-collapsed .rail-user-meta{display:block!important}
+  .app-shell.rail-collapsed .rail-item{justify-content:flex-start;padding:0 10px;width:100%}
+  .app-shell.rail-collapsed .folder-nav-item{justify-content:flex-start;padding:0 10px;width:100%}
+  .app-shell.rail-collapsed .rail-cta{width:100%}
+  .app-shell.rail-collapsed .rail-head{justify-content:space-between}
+  .app-shell.rail-collapsed .rail-user-row{justify-content:flex-start;padding:6px 8px;width:100%}
+  .app-shell.rail-collapsed .rail-foot-acts{flex-direction:row}
+  .app-shell.rail-collapsed .rail-foot-btn{width:auto;flex:1}
+  .app-shell.rail-collapsed .tb-expand-btn{display:none!important}
+  .mobile-logo-btn{display:inline-flex!important}
+  .topbar{padding:0 14px}
+  .topbar-sub{display:none}
+  .route-view{padding:14px 14px 36px}
+  .monitor-split{flex-direction:column}
+  .mon-aside{width:100%;min-width:0;max-height:230px;border-right:none;border-bottom:1px solid var(--border);padding:10px 12px}
+  .mon-main{padding:14px 14px 36px}
+  .reader-card{padding:16px}
+  .form-grid,.style-grid{grid-template-columns:1fr 1fr}
+  .archive-grid{grid-template-columns:1fr}
 }
 </style>
 </head>
 <body>
-<div class="app" id="appRoot">
-  <!-- LEFT SIDEBAR -->
-  <aside class="sidebar">
-    <div class="brand">
-      <div class="brand-l">
+
+<!-- FULL-SCREEN AUTH GATE (Enforces Login + 90-Day Single-Device Persistence) -->
+<div class="auth-gate hidden" id="authGate">
+  <button class="icon-btn auth-gate-theme" id="gateThemeBtn" onclick="toggleTheme()" title="切换浅色 / 暗色主题"></button>
+  <div class="auth-card">
+    <div class="auth-brand">
+      <div class="brand-icon">
+        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="6" width="18" height="13" rx="3"/><path d="M8 3l3 3M16 3l-3 3"/><path d="M9 12v2M15 12v2"/></svg>
+      </div>
+      <div>
+        <h1>B站AI摘要</h1>
+        <p>个人视频知识库与 UP 主监控工作台</p>
+      </div>
+    </div>
+    <div class="field">
+      <label>账号</label>
+      <input class="ctrl" id="gateUser" type="text" value="shiran" autocomplete="username" onkeydown="if(event.key==='Enter')document.getElementById('gatePass').focus()">
+    </div>
+    <div class="field">
+      <label>密码</label>
+      <input class="ctrl" id="gatePass" type="password" placeholder="请输入管理员密码" autocomplete="current-password" onkeydown="if(event.key==='Enter')doGateLogin()">
+    </div>
+    <div style="display:flex;align-items:center;justify-content:space-between;margin:14px 0 18px;gap:10px">
+      <div>
+        <div style="font-size:13px;font-weight:600;color:var(--text)">本机持久化登录</div>
+        <div style="font-size:11.5px;color:var(--muted)">90 天免重登，活跃期间自动续期</div>
+      </div>
+      <label class="tog-switch"><input type="checkbox" id="gateRemember" checked><span class="tog-track"></span></label>
+    </div>
+    <button class="btn btn-primary" style="width:100%;height:40px;font-size:14px" id="gateLoginBtn" onclick="doGateLogin()">登录进入工作台</button>
+    <div class="sb-toast" id="gateToast"></div>
+    <div class="auth-note">已启用 HttpOnly 安全会话与单机持久登录保护</div>
+  </div>
+</div>
+
+<!-- MAIN APP SHELL (Plan A Expanded + Plan B Collapsed Rail + Mobile Drawer) -->
+<div class="app-shell hidden" id="appShell">
+  <div class="mobile-backdrop" id="mobileBackdrop" onclick="toggleMobileNav(false)"></div>
+
+  <aside class="nav-rail" id="navRail">
+    <div class="rail-head">
+      <button class="brand-link" onclick="onBrandClick()" data-tip="展开侧边栏">
         <div class="brand-icon">
-          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round">
-            <path d="M8 3l3 3M16 3l-3 3"/>
-            <rect x="3" y="6" width="18" height="14" rx="4"/>
-            <path d="M9 12v2M15 12v2"/>
-          </svg>
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="6" width="18" height="13" rx="3"/><path d="M8 3l3 3M16 3l-3 3"/><path d="M9 12v2M15 12v2"/></svg>
         </div>
-        <div>
+        <div class="brand-text">
           <div class="brand-title">B站AI摘要</div>
-          <div class="brand-sub">视频语音转录 · 知识工作台</div>
+          <div class="brand-sub">视频知识工作台</div>
         </div>
-      </div>
-      <button class="brand-home-btn" onclick="showDashboard()" title="查看知识库概览">概览</button>
+      </button>
+      <button class="rail-collapse-btn" onclick="toggleRailCollapsed()" title="收起侧边栏">
+        <svg class="ic" viewBox="0 0 24 24"><rect x="3" y="3" width="18" height="18" rx="2"/><line x1="9" y1="3" x2="9" y2="21"/><polyline points="15 9 12 12 15 15"/></svg>
+      </button>
     </div>
 
-    <!-- Top-Left Sidebar Switcher -->
-    <div class="side-switcher" id="sideSwitcher">
-      <span class="seg-slider"></span>
-      <button class="side-sw-btn active" data-page="workspace" onclick="switchPage('workspace')">单条摘要</button>
-      <button class="side-sw-btn" data-page="monitor" onclick="switchPage('monitor')">UP主监控</button>
-    </div>
+    <button class="rail-cta" onclick="openSubmitModal('single')" data-tip="新建摘要 (Ctrl+K)">
+      <svg class="ic" viewBox="0 0 24 24"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
+      <span class="rail-label">新建摘要</span>
+      <span class="rail-cta-kbd">Ctrl K</span>
+    </button>
 
-    <!-- SIDEBAR A: SINGLE VIDEO WORKSPACE -->
-    <div class="side-pane" id="sidebarWorkspace">
-      <div class="input-shell">
-        <input id="videoUrl" type="text" placeholder="输入B站视频链接或 BV 号..." autocomplete="off" onkeydown="if(event.key==='Enter')submitVideo()">
-        <button class="btn-submit" id="submitBtn" onclick="submitVideo()">开始总结</button>
-      </div>
-
-      <div class="sub-actions">
-        <button class="adv-toggle" id="advToggleBtn" type="button" onclick="toggleAdv()">
-          <span>高级配置</span>
-          <svg class="ic caret" viewBox="0 0 24 24"><path d="M6 9l6 6 6-6"/></svg>
+    <div class="rail-scroll">
+      <nav class="rail-nav" id="railNav">
+        <span class="nav-slider" id="railNavSlider"></span>
+        <button class="rail-item active" data-route="summary" data-tip="摘要工作台" onclick="navigate('summary')">
+          <svg class="ic-lg" viewBox="0 0 24 24"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/></svg>
+          <span class="rail-label">摘要工作台</span>
         </button>
-        <button class="adv-toggle" type="button" onclick="openModal('batchModal')">
-          <span>批量提交</span>
+        <button class="rail-item" data-route="monitor" data-tip="监控 UP 主" onclick="navigate('monitor')">
+          <svg class="ic-lg" viewBox="0 0 24 24"><rect x="2" y="7" width="20" height="15" rx="2"/><polyline points="17 2 12 7 7 2"/></svg>
+          <span class="rail-label">监控 UP 主</span>
+          <span class="rail-badge" id="navCntMonitor">0</span>
+        </button>
+        <button class="rail-item" data-route="watch-later" data-tip="稍后再看" onclick="navigate('watch-later')">
+          <svg class="ic-lg" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><polyline points="12 7 12 12 15 15"/></svg>
+          <span class="rail-label">稍后再看</span>
+          <span class="rail-badge" id="navCntWl">0</span>
+        </button>
+        <button class="rail-item" data-route="favorites" data-tip="我的收藏" onclick="navigate('favorites')">
+          <svg class="ic-lg" viewBox="0 0 24 24"><polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2"/></svg>
+          <span class="rail-label">我的收藏</span>
+          <span class="rail-badge" id="navCntFav">0</span>
+        </button>
+        <button class="rail-item" data-route="history" data-tip="历史记录" onclick="navigate('history')">
+          <svg class="ic-lg" viewBox="0 0 24 24"><polyline points="1 4 1 10 7 10"/><path d="M3.51 15a9 9 0 1 0 2.13-9.36L1 10"/></svg>
+          <span class="rail-label">历史记录</span>
+          <span class="rail-badge" id="navCntHist">0</span>
+        </button>
+      </nav>
+
+      <div class="rail-sep"></div>
+      <div class="rail-sec-head">
+        <span class="rail-sec-title">标签文件夹</span>
+        <button class="rail-sec-add" onclick="openTagManagerModal()" data-tip="管理标签文件夹" title="管理标签文件夹">
+          <svg class="ic" viewBox="0 0 24 24"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
         </button>
       </div>
-
-      <div class="adv-box hidden" id="advBox">
-        <div class="field">
-          <label>总结模板</label>
-          <select class="ctrl" id="tplPreset" onchange="onTplPreset()">
-            <option value="">默认精炼日报模板</option>
-            <option value="notes">深度结构化笔记</option>
-            <option value="quotes">金句与核心观点提取</option>
-            <option value="custom">自定义提示词模板</option>
-          </select>
-        </div>
-        <div class="field hidden" id="customTplWrap">
-          <label>自定义模板（含 {content} 占位符）</label>
-          <textarea class="ctrl" id="customTpl" placeholder="请根据以下视频内容提取核心干货：\n{content}"></textarea>
-        </div>
-        <div class="field">
-          <label>单条结果接收邮箱（可选）</label>
-          <input class="ctrl" id="customEmail" type="email" placeholder="留空则发至默认邮箱">
-        </div>
-        <div class="field">
-          <label>单条邮件样式</label>
-          <select class="ctrl" id="singleEmailStyle">
-            <option value="editorial">编辑部日报（深色报头 · 默认）</option>
-            <option value="minimal">极简纸刊（纯白 Notion 风）</option>
-            <option value="bilibili">B站元气粉（樱花粉渐变）</option>
-            <option value="compact">极速速览（高密度紧凑）</option>
-          </select>
-        </div>
-      </div>
-
-      <div class="history-wrap">
-        <div class="search-box">
-          <span class="s-ic">
-            <svg class="ic" viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4.3-4.3"/></svg>
-          </span>
-          <input class="ctrl" id="searchInput" type="text" placeholder="搜索标题、UP主或 BV 号..." oninput="renderList()">
-        </div>
-
-        <div class="h-filter-tabs" id="historyFilterTabs">
-          <span class="seg-slider"></span>
-          <button class="h-ftab active" data-hf="all" onclick="setHistoryFilter('all')">全部</button>
-          <button class="h-ftab" data-hf="starred" onclick="setHistoryFilter('starred')">收藏</button>
-          <button class="h-ftab" data-hf="watchlater" onclick="setHistoryFilter('watchlater')">稍后再看</button>
-          <button class="h-ftab" data-hf="failed" onclick="setHistoryFilter('failed')">失败</button>
-        </div>
-
-        <div class="folder-bar" id="wsFolderBar"></div>
-
-        <div class="history-head">
-          <h3>历史记录 <span class="count-pill" id="countPill">0</span></h3>
-          <button class="text-btn" id="batchToggleBtn" onclick="toggleBatchMode()">管理</button>
-        </div>
-        <div class="batch-bar hidden" id="batchBar">
-          <button class="text-btn" onclick="selectAllJobs()">全选</button>
-          <button class="text-btn" onclick="invertSelectJobs()">反选</button>
-          <button class="text-btn danger" style="margin-left:auto" onclick="deleteSelectedJobs()">删除已选</button>
-        </div>
-        <div class="history-list" id="historyList"></div>
-      </div>
+      <div class="rail-folders" id="railFolderList"></div>
     </div>
 
-    <!-- SIDEBAR B: MONITORED UP CREATORS -->
-    <div class="side-pane hidden" id="sidebarMonitor">
-      <div class="search-box">
-        <span class="s-ic">
-          <svg class="ic" viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4.3-4.3"/></svg>
-        </span>
-        <input class="ctrl" id="upSearchInput" type="text" placeholder="搜索已监控 UP 主（昵称或 UID）..." oninput="renderUpSidebar()">
-      </div>
-
-      <div class="quick-add-box">
-        <span class="quick-add-label">添加监控 UP 主</span>
-        <div class="quick-add-row">
-          <input class="ctrl" id="sideAddUpInput" type="text" placeholder="输入 UID 或主页链接..." onkeydown="if(event.key==='Enter')quickAddMonitorUp()">
-          <button class="btn btn-primary" type="button" id="sideAddUpBtn" onclick="quickAddMonitorUp()">添加</button>
+    <div class="rail-foot">
+      <div class="rail-user-row" onclick="openMonitorModal()" data-tip="监控与日报配置" title="点击打开定时监控与日报样式配置">
+        <div class="rail-user-ava" id="railUserAva">S</div>
+        <div class="rail-user-meta">
+          <div class="rail-user-name" id="railUserName">shiran</div>
+          <div class="rail-user-sub">本机持久已登录</div>
         </div>
-        <div class="sb-toast" id="sideUpToast"></div>
       </div>
-
-      <div class="folder-bar" id="monFolderBar"></div>
-
-      <div class="history-head">
-        <h3>已监控 UP 主 <span class="count-pill" id="upSideCount">0</span></h3>
-        <button class="text-btn" onclick="openMonitorModal()">完整配置</button>
+      <div class="rail-foot-acts">
+        <button class="rail-foot-btn" onclick="openSettingsModal()" data-tip="偏好设置">
+          <svg class="ic" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
+          <span class="rail-label">设置</span>
+        </button>
+        <button class="rail-foot-btn" id="railThemeBtn" onclick="toggleTheme()" data-tip="切换主题"></button>
+        <button class="rail-foot-btn" onclick="doLogout()" data-tip="退出登录" title="退出当前设备登录">
+          <svg class="ic" viewBox="0 0 24 24"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><polyline points="16 17 21 12 16 7"/><line x1="21" y1="12" x2="9" y2="12"/></svg>
+        </button>
       </div>
-      <div class="history-list" id="upSideList"></div>
     </div>
   </aside>
 
-  <div class="divider" id="divider"></div>
-
-  <!-- RIGHT MAIN PANEL -->
-  <main class="main">
+  <main class="main-col">
     <header class="topbar">
-      <div style="min-width:0;display:flex;align-items:baseline">
-        <span class="topbar-title" id="topbarTitle">单条视频摘要</span>
+      <div class="tb-left">
+        <!-- Mobile ONLY: top-left clickable Brand Logo toggles navigation drawer -->
+        <button class="mobile-logo-btn" onclick="toggleMobileNav()" aria-label="展开或收起菜单">
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="6" width="18" height="13" rx="3"/><path d="M8 3l3 3M16 3l-3 3"/><path d="M9 12v2M15 12v2"/></svg>
+        </button>
+        <!-- Desktop Plan B Collapsed: expand button -->
+        <button class="tb-expand-btn" onclick="toggleRailCollapsed()" title="展开侧边栏">
+          <svg class="ic" viewBox="0 0 24 24"><rect x="3" y="3" width="18" height="18" rx="2"/><line x1="9" y1="3" x2="9" y2="21"/><polyline points="13 9 16 12 13 15"/></svg>
+        </button>
+        <span class="topbar-title" id="topbarTitle">摘要工作台</span>
         <span class="topbar-sub" id="topbarSub"></span>
       </div>
-
       <div class="topbar-actions">
-        <button class="pill-btn" id="settingsBtn" onclick="openSettingsModal()">
-          <svg class="ic" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
-          <span>设置</span>
+        <button class="pill-btn brand" onclick="openMonitorModal()">
+          <svg class="ic" viewBox="0 0 24 24"><line x1="4" y1="21" x2="4" y2="14"/><line x1="4" y1="10" x2="4" y2="3"/><line x1="12" y1="21" x2="12" y2="12"/><line x1="12" y1="8" x2="12" y2="3"/><line x1="20" y1="21" x2="20" y2="16"/><line x1="20" y1="12" x2="20" y2="3"/><line x1="1" y1="14" x2="7" y2="14"/><line x1="9" y1="8" x2="15" y2="8"/><line x1="17" y1="16" x2="23" y2="16"/></svg>
+          <span>定时与样式</span>
         </button>
-        <button class="pill-btn" id="monitorBtn" onclick="openMonitorEntry()">
-          <span id="monitorBtnIcon"></span>
-          <span id="monitorBtnText">登录管理</span>
+        <button class="pill-btn" onclick="openSubmitModal('single')">
+          <svg class="ic" viewBox="0 0 24 24"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
+          <span>新建摘要</span>
         </button>
-        <button class="icon-btn" id="themeBtn" onclick="toggleTheme()" title="切换浅色 / 暗色主题"></button>
       </div>
     </header>
 
-    <div class="content-scroll" id="contentScroll">
-      <div class="content-inner" id="contentInner">
-        <!-- PAGE 1: WORKSPACE -->
-        <div id="pageWorkspace">
-          <div class="stepper hidden" id="stepperBar"></div>
+    <div class="route-host">
+      <!-- ROUTE 1: SUMMARY WORKSPACE -->
+      <section class="route-view" id="view-summary">
+        <div class="page-inner">
+          <div class="recent-strip" id="recentStrip"></div>
 
-          <!-- DASHBOARD OVERVIEW STATE -->
-          <div id="dashboardView">
-            <div class="dash-hero">
-              <h2>B站视频 AI 知识工作台</h2>
-              <p>粘贴 B 站链接即可完成免费语音转录与结构化提炼；支持秒速切换多风格重总结、可视化思维导图、全文关键词检索、围绕视频多轮 AI 追问以及导出分享长图。</p>
+          <div class="empty-ws-card" id="summaryEmptyState">
+            <h2>开始你的视频 AI 精读</h2>
+            <p>粘贴 B 站视频链接或 BV 号，自动完成免费语音转录与结构化摘要；支持秒速切换风格、可视化思维导图、全文检索与围绕视频多轮 AI 追问。</p>
+            <div class="quick-inline-bar">
+              <input class="ctrl" id="inlineVideoUrl" type="text" placeholder="粘贴 B 站视频链接或 BV 号，按 Enter 开始总结..." onkeydown="if(event.key==='Enter')submitInlineVideo()">
+              <button class="btn btn-primary" onclick="submitInlineVideo()">开始总结</button>
             </div>
-            <div class="kpi-grid" id="kpiGrid"></div>
-            <div style="font-size:13px;font-weight:700;color:var(--soft);margin-bottom:10px">最近完成的视频摘要</div>
-            <div class="recent-grid" id="recentGrid"></div>
           </div>
 
-          <!-- VIDEO DETAIL WORKSPACE -->
           <div id="detailView" class="hidden">
+            <div class="stepper hidden" id="stepperBar"></div>
+
             <section class="video-head">
               <div class="vh-left">
                 <h1 class="vh-title"><a id="dTitleLink" href="#" target="_blank" rel="noopener">—</a></h1>
@@ -2065,103 +2260,311 @@ textarea.ctrl{height:auto;min-height:84px;padding:10px 12px;resize:vertical;line
                   <span>导出 MD</span>
                 </button>
                 <button class="act-btn" onclick="exportFile('txt')"><span>导出 TXT</span></button>
-                <button class="act-btn" onclick="exportPosterPng()"><span>分享长图</span></button>
+                <button class="act-btn" onclick="exportPosterPng()">
+                  <svg class="ic" viewBox="0 0 24 24"><rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="8.5" cy="8.5" r="1.5"/><polyline points="21 15 16 10 5 21"/></svg>
+                  <span>分享长图</span>
+                </button>
               </div>
             </div>
 
-            <div class="reader-grid" id="readerGrid">
-              <!-- SUMMARY PANEL -->
-              <article class="reader-card" id="summaryPanel">
-                <div class="style-switch-bar" id="styleSwitchBar">
-                  <div class="style-pills">
-                    <span style="font-size:12px;color:var(--muted);font-weight:600;margin-right:2px">秒速重总结：</span>
-                    <button class="style-pill" data-rs="daily" onclick="resummarizeCurrent('daily')">精炼日报</button>
-                    <button class="style-pill" data-rs="notes" onclick="resummarizeCurrent('notes')">深度笔记</button>
-                    <button class="style-pill" data-rs="quotes" onclick="resummarizeCurrent('quotes')">金句观点</button>
-                    <button class="style-pill" data-rs="flashcards" onclick="resummarizeCurrent('flashcards')">学习闪卡</button>
-                  </div>
-                  <div class="fs-group">
-                    <button class="fs-btn" onclick="adjustReaderFont(-1)" title="缩小字号">A-</button>
-                    <button class="fs-btn" onclick="adjustReaderFont(1)" title="放大字号">A+</button>
-                  </div>
+            <article class="reader-card" id="summaryCard">
+              <div class="style-switch-bar" id="styleSwitchBar">
+                <div class="style-pills">
+                  <span style="font-size:12px;color:var(--muted);font-weight:600;margin-right:2px">秒速重总结：</span>
+                  <button class="style-pill active" data-rs="daily" onclick="resummarizeCurrent('daily')">精炼日报</button>
+                  <button class="style-pill" data-rs="notes" onclick="resummarizeCurrent('notes')">深度笔记</button>
+                  <button class="style-pill" data-rs="quotes" onclick="resummarizeCurrent('quotes')">金句观点</button>
+                  <button class="style-pill" data-rs="flashcards" onclick="resummarizeCurrent('flashcards')">学习闪卡</button>
                 </div>
-                <div class="panel-label hidden" id="summaryPanelLabel">AI 总结</div>
-                <div id="summaryContent"></div>
-              </article>
-
-              <!-- MINDMAP PANEL -->
-              <article class="reader-card hidden" id="mindmapPanel">
-                <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:14px">
-                  <div class="panel-label" style="margin:0">结构化思维导图（点击节点可折叠）</div>
-                  <button class="btn btn-sm" onclick="copyMindmapOutline()">复制导图大纲</button>
+                <div class="fs-group">
+                  <button class="fs-btn" onclick="adjustFontSize(-1)" title="减小字号">A-</button>
+                  <button class="fs-btn" onclick="adjustFontSize(1)" title="增大字号">A+</button>
                 </div>
-                <div id="mindmapContent"></div>
-              </article>
+              </div>
+              <div id="summaryContent"></div>
+            </article>
 
-              <!-- TRANSCRIPT PANEL -->
-              <article class="reader-card hidden" id="transcriptPanel">
-                <div class="panel-label">完整语音转录</div>
-                <div class="tr-search-bar">
+            <article class="reader-card hidden" id="mindmapCard">
+              <div style="display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:16px;padding-bottom:12px;border-bottom:1px solid var(--border)">
+                <div style="font-size:13px;color:var(--soft)">点击任意节点可折叠或展开细节</div>
+                <button class="btn btn-sm" onclick="copyMindmapOutline()">复制导图大纲</button>
+              </div>
+              <div id="mindmapContent"></div>
+            </article>
+
+            <article class="reader-card hidden" id="transcriptCard">
+              <div class="tr-toolbar">
+                <div class="search-box">
+                  <span class="s-ic"><svg class="ic" viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4.3-4.3"/></svg></span>
                   <input class="ctrl" id="trSearchInput" type="text" placeholder="在转录文本中搜索关键词..." oninput="highlightTranscript()">
-                  <span class="tr-match-count" id="trMatchCount"></span>
-                  <button class="btn btn-sm" onclick="jumpTrMatch(-1)">上一处</button>
-                  <button class="btn btn-sm" onclick="jumpTrMatch(1)">下一处</button>
                 </div>
-                <div class="transcript-box" id="transcriptContent"></div>
-              </article>
+                <span class="tr-count" id="trMatchCount"></span>
+                <button class="btn btn-sm" onclick="jumpTrMatch(-1)">上一处</button>
+                <button class="btn btn-sm" onclick="jumpTrMatch(1)">下一处</button>
+              </div>
+              <div class="transcript-box" id="transcriptContent"></div>
+            </article>
 
-              <!-- AI CHAT PANEL -->
-              <article class="reader-card hidden" id="chatPanel">
-                <div class="chat-panel">
-                  <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:10px">
-                    <div class="panel-label" style="margin:0">基于本视频内容的 AI 多轮追问（100% 免费模型 · 秒级响应）</div>
-                    <button class="text-btn" onclick="clearVideoChat()">清空对话</button>
-                  </div>
-                  <div class="chat-quick-row">
-                    <button class="chat-chip" onclick="sendVideoChat('请提取视频中提到的所有工具、网站、书籍或核心概念清单')">提取工具与概念清单</button>
-                    <button class="chat-chip" onclick="sendVideoChat('请用通俗易懂的大白话，给完全零基础的新手重新讲解一遍这个视频的核心内容')">用大白话给新手讲一遍</button>
-                    <button class="chat-chip" onclick="sendVideoChat('视频中有哪些核心论点、潜在争议或需要注意的前提条件？')">梳理核心论点与争议</button>
-                    <button class="chat-chip" onclick="sendVideoChat('请帮我把视频干货改写成一篇适合发小红书或朋友圈的精炼笔记（300字以内）')">改写为社媒精华笔记</button>
-                  </div>
-                  <div class="chat-messages" id="chatMessages"></div>
-                  <div class="chat-input-bar">
-                    <input class="ctrl" id="chatInput" type="text" placeholder="围绕这个视频继续提问，按 Enter 发送..." onkeydown="if(event.key==='Enter')sendVideoChat()">
-                    <button class="btn btn-primary" id="chatSendBtn" onclick="sendVideoChat()">发送</button>
-                  </div>
-                </div>
+            <div class="split-grid hidden" id="splitView">
+              <article class="reader-card">
+                <div class="split-col-head">AI 总结</div>
+                <div id="splitSummary"></div>
+              </article>
+              <article class="reader-card">
+                <div class="split-col-head">完整语音转录</div>
+                <div class="transcript-box" id="splitTranscript"></div>
               </article>
             </div>
-          </div>
-        </div>
 
-        <!-- PAGE 2: UP MONITOR COVER GRID -->
-        <div id="pageMonitor" class="hidden">
-          <div class="mon-toolbar">
-            <div class="mon-tb-left">
-              <h2 id="monFeedHeading">全部监控 UP 主动态</h2>
-              <p id="monSummaryLine">正在加载监控配置...</p>
+            <article class="reader-card hidden" id="chatCard">
+              <div class="chat-panel">
+                <div class="chat-quick-row">
+                  <button class="chat-chip" onclick="sendVideoChat('请提炼视频中提到的所有工具、模型、方法或专有名词清单')">提取工具与概念清单</button>
+                  <button class="chat-chip" onclick="sendVideoChat('用通俗易懂的大白话，向完全不懂的新手重新解释一遍这个视频的核心内容')">用大白话给新手讲一遍</button>
+                  <button class="chat-chip" onclick="sendVideoChat('视频中有哪些核心论点、前提假设或值得商榷的地方？')">梳理核心论点与争议</button>
+                  <button class="chat-chip" onclick="sendVideoChat('请把这个视频改写成一段适合发朋友圈/小红书的精华分享文案（200字以内）')">改写为社媒精华笔记</button>
+                  <button class="btn btn-sm" style="margin-left:auto" onclick="clearVideoChat()">清空对话</button>
+                </div>
+                <div class="chat-messages" id="chatMessages"></div>
+                <div class="chat-input-bar">
+                  <input class="ctrl" id="chatInput" type="text" placeholder="围绕这个视频继续提问，按 Enter 发送..." onkeydown="if(event.key==='Enter'&&!event.shiftKey){event.preventDefault();sendVideoChat();}">
+                  <button class="btn btn-primary" id="chatSendBtn" onclick="sendVideoChat()">发送</button>
+                </div>
+              </div>
+            </article>
+          </div>
+        </div>
+      </section>
+
+      <!-- ROUTE 2: MONITOR UP CREATORS (2-Pane Keep-Alive) -->
+      <section class="route-view no-pad hidden" id="view-monitor">
+        <div class="monitor-split">
+          <div class="mon-aside">
+            <div class="search-box">
+              <span class="s-ic"><svg class="ic" viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4.3-4.3"/></svg></span>
+              <input class="ctrl" id="upSearchInput" type="text" placeholder="搜索已监控 UP 主..." oninput="renderUpSidebar()">
             </div>
-            <div class="mon-tb-actions">
-              <button class="btn" id="refreshFeedBtn" onclick="fetchUpFeed(selectedUpMid, true)">刷新动态</button>
-              <button class="btn" onclick="openMonitorModal()">定时与样式设置</button>
-              <button class="btn btn-primary" onclick="triggerMonitorNow('feedToast')">立即巡检</button>
+            <div class="quick-add-box">
+              <div class="quick-add-row">
+                <input class="ctrl" id="sideAddUpInput" type="text" placeholder="添加 UP 主 UID 或主页链接..." onkeydown="if(event.key==='Enter')quickAddMonitorUp()">
+                <button class="btn btn-primary" type="button" id="sideAddUpBtn" onclick="quickAddMonitorUp()">添加</button>
+              </div>
+              <div class="sb-toast" id="sideUpToast"></div>
+            </div>
+            <div class="folder-bar" id="monFolderBar" style="margin-bottom:4px"></div>
+            <div class="mon-aside-scroll" id="upSideList"></div>
+          </div>
+
+          <div class="mon-main" id="monScrollArea">
+            <div class="page-toolbar">
+              <div class="pt-left">
+                <h2 id="monFeedHeading">全部监控 UP 主动态</h2>
+                <p id="monSummaryLine">正在加载监控配置...</p>
+              </div>
+              <div class="pt-actions">
+                <button class="btn" id="refreshFeedBtn" onclick="fetchUpFeed(selectedUpMid, true)">刷新动态</button>
+                <button class="btn" onclick="openMonitorModal()">定时与样式</button>
+                <button class="btn btn-primary" onclick="triggerMonitorNow('feedToast')">立即巡检</button>
+              </div>
+            </div>
+            <div class="sb-toast" id="feedToast" style="margin-bottom:14px"></div>
+            <div class="video-grid" id="upFeedGrid"></div>
+            <div class="feed-footer" id="feedFooter"></div>
+            <div id="feedSentinel" style="height:2px"></div>
+          </div>
+        </div>
+      </section>
+
+      <!-- ROUTE 3: WATCH LATER QUEUE -->
+      <section class="route-view hidden" id="view-watch-later">
+        <div class="page-inner full">
+          <div class="page-toolbar">
+            <div class="pt-left">
+              <h2>稍后再看队列</h2>
+              <p id="wlPageSub">收藏待看视频，支持勾选一键批量 AI 总结</p>
+            </div>
+            <div class="pt-actions">
+              <div class="seg-tabs" id="wlFilterTabs">
+                <span class="seg-slider"></span>
+                <button class="seg-tab active" data-wlf="all" onclick="setWlFilter('all')">全部</button>
+                <button class="seg-tab" data-wlf="todo" onclick="setWlFilter('todo')">待总结</button>
+                <button class="seg-tab" data-wlf="done" onclick="setWlFilter('done')">已有摘要</button>
+              </div>
+              <button class="btn" id="wlSelectAllBtn" onclick="toggleWlSelectAll()">全选待总结</button>
+              <button class="btn btn-primary" id="wlBatchSumBtn" onclick="batchSummarizeWatchLater()">批量 AI 总结</button>
+              <button class="btn" onclick="clearDoneWatchLater()">清理已总结</button>
             </div>
           </div>
-          <div class="sb-toast" id="feedToast" style="margin-bottom:14px"></div>
-          <div class="video-grid" id="upFeedGrid"></div>
-          <div class="feed-footer" id="feedFooter"></div>
-          <div id="feedSentinel" style="height:2px"></div>
+          <div class="video-grid" id="wlGrid"></div>
         </div>
-      </div>
+      </section>
+
+      <!-- ROUTE 4: FAVORITES COLLECTION -->
+      <section class="route-view hidden" id="view-favorites">
+        <div class="page-inner full">
+          <div class="page-toolbar">
+            <div class="pt-left">
+              <h2>我的收藏</h2>
+              <p id="favPageSub">跨页面统一管理已收藏的精华摘要与 B 站原视频</p>
+            </div>
+            <div class="pt-actions">
+              <div class="search-box" style="width:230px">
+                <span class="s-ic"><svg class="ic" viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4.3-4.3"/></svg></span>
+                <input class="ctrl" id="favSearchInput" type="text" placeholder="搜索收藏内容..." oninput="renderFavoritesPage()">
+              </div>
+              <div class="seg-tabs" id="favTypeTabs">
+                <span class="seg-slider"></span>
+                <button class="seg-tab active" data-ft="all" onclick="setFavType('all')">全部</button>
+                <button class="seg-tab" data-ft="summary" onclick="setFavType('summary')">已归档摘要</button>
+                <button class="seg-tab" data-ft="video" onclick="setFavType('video')">收藏视频</button>
+              </div>
+            </div>
+          </div>
+          <div class="folder-bar" id="favFolderBar" style="margin-bottom:16px"></div>
+          <div class="video-grid" id="favGrid"></div>
+        </div>
+      </section>
+
+      <!-- ROUTE 5: HISTORY ARCHIVE + KPI STATS -->
+      <section class="route-view hidden" id="view-history">
+        <div class="page-inner full">
+          <div class="kpi-grid" id="kpiGrid"></div>
+
+          <div class="page-toolbar">
+            <div class="pt-left">
+              <h2>历史归档记录</h2>
+              <p id="histPageSub">检索、打标、重算与批量管理全部视频摘要任务</p>
+            </div>
+            <div class="pt-actions">
+              <div class="search-box" style="width:230px">
+                <span class="s-ic"><svg class="ic" viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4.3-4.3"/></svg></span>
+                <input class="ctrl" id="histSearchInput" type="text" placeholder="搜索标题、UP主或 BV 号..." oninput="renderHistoryPage()">
+              </div>
+              <div class="seg-tabs" id="histStatusTabs">
+                <span class="seg-slider"></span>
+                <button class="seg-tab active" data-hf="all" onclick="setHistStatus('all')">全部</button>
+                <button class="seg-tab" data-hf="completed" onclick="setHistStatus('completed')">已完成</button>
+                <button class="seg-tab" data-hf="pending" onclick="setHistStatus('pending')">处理中</button>
+                <button class="seg-tab" data-hf="failed" onclick="setHistStatus('failed')">失败</button>
+              </div>
+              <button class="btn" id="histBatchBtn" onclick="toggleHistBatchMode()">批量管理</button>
+            </div>
+          </div>
+
+          <div class="filter-strip">
+            <div class="folder-bar" id="histFolderBar"></div>
+            <div class="hidden" id="histBatchActions" style="display:flex;gap:8px;align-items:center">
+              <button class="btn btn-sm" onclick="histSelectAll()">全选</button>
+              <button class="btn btn-sm" onclick="histInvertSelect()">反选</button>
+              <button class="btn btn-sm" style="color:var(--err);border-color:var(--err-border)" onclick="histDeleteSelected()">删除已选</button>
+            </div>
+          </div>
+
+          <div class="archive-grid" id="histArchiveGrid"></div>
+        </div>
+      </section>
+
+      <!-- ROUTE 6: GLOBAL TAG FOLDER AGGREGATION PAGE -->
+      <section class="route-view hidden" id="view-folder">
+        <div class="page-inner full">
+          <div class="page-toolbar">
+            <div class="pt-left">
+              <h2 id="folderPageTitle"><span class="folder-dot" id="folderPageDot" style="width:11px;height:11px"></span><span id="folderPageName">标签文件夹</span></h2>
+              <p id="folderPageSub">聚合该分类下的 AI 摘要与 UP 主最新动态</p>
+            </div>
+            <div class="pt-actions">
+              <div class="seg-tabs" id="folderViewTabs">
+                <span class="seg-slider"></span>
+                <button class="seg-tab active" data-fvt="summaries" onclick="setFolderViewTab('summaries')">相关摘要</button>
+                <button class="seg-tab" data-fvt="ups" onclick="setFolderViewTab('ups')">该分类 UP 主动态</button>
+              </div>
+              <button class="btn" onclick="openTagManagerModal()">管理文件夹</button>
+            </div>
+          </div>
+
+          <div id="folderSummariesPane">
+            <div class="archive-grid" id="folderSummariesGrid"></div>
+          </div>
+
+          <div id="folderUpsPane" class="hidden">
+            <div class="video-grid" id="folderUpsGrid"></div>
+            <div class="feed-footer" id="folderFeedFooter"></div>
+            <div id="folderFeedSentinel" style="height:2px"></div>
+          </div>
+        </div>
+      </section>
     </div>
   </main>
 </div>
 
-<!-- GLOBAL FLOATING TOAST -->
+<!-- GLOBAL FLOATING TOAST & TAG POPOVER -->
 <div class="global-toast" id="globalToast"></div>
-
-<!-- TAG PICKER POPOVER -->
 <div class="tag-popover hidden" id="tagPopover"></div>
+
+<!-- NEW SUMMARY / BATCH SUBMIT MODAL (Ctrl+K) -->
+<div class="modal-backdrop hidden" id="submitModal" onclick="if(event.target===this)closeModal('submitModal')">
+  <div class="modal">
+    <div class="modal-head">
+      <h2>新建视频 AI 摘要</h2>
+      <button class="icon-btn" onclick="closeModal('submitModal')" aria-label="关闭">
+        <svg class="ic" viewBox="0 0 24 24"><path d="M18 6L6 18M6 6l12 12"/></svg>
+      </button>
+    </div>
+    <div class="modal-body">
+      <div class="seg-tabs" id="submitModeTabs" style="margin-bottom:16px">
+        <span class="seg-slider"></span>
+        <button class="seg-tab active" data-sm="single" onclick="switchSubmitTab('single')">单条视频总结</button>
+        <button class="seg-tab" data-sm="batch" onclick="switchSubmitTab('batch')">批量提交（最多 5 条）</button>
+      </div>
+
+      <div id="submitSinglePane">
+        <div class="field">
+          <label>B 站视频链接或 BV / AV 号</label>
+          <input class="ctrl" id="modalVideoUrl" type="text" placeholder="https://www.bilibili.com/video/BV..." onkeydown="if(event.key==='Enter')submitModalSingle()">
+        </div>
+        <div class="field">
+          <label>总结模板</label>
+          <select class="ctrl" id="tplPreset" onchange="onTplPreset()">
+            <option value="">默认精炼日报模板</option>
+            <option value="notes">深度结构化笔记</option>
+            <option value="quotes">金句与核心观点提取</option>
+            <option value="custom">自定义提示词模板</option>
+          </select>
+        </div>
+        <div class="field hidden" id="customTplWrap">
+          <label>自定义模板（含 {content} 占位符）</label>
+          <textarea class="ctrl" id="customTpl" placeholder="请根据以下视频内容提取核心干货：\n{content}"></textarea>
+        </div>
+        <div class="form-grid" style="margin-top:12px">
+          <div class="field">
+            <label>单条结果接收邮箱（可选）</label>
+            <input class="ctrl" id="customEmail" type="email" placeholder="留空发至默认邮箱">
+          </div>
+          <div class="field">
+            <label>单条邮件样式</label>
+            <select class="ctrl" id="singleEmailStyle">
+              <option value="editorial">编辑部日报（深色报头）</option>
+              <option value="minimal">极简纸刊（纯白 Notion）</option>
+              <option value="bilibili">B站元气粉（渐变）</option>
+              <option value="compact">极速速览（紧凑）</option>
+            </select>
+          </div>
+        </div>
+      </div>
+
+      <div id="submitBatchPane" class="hidden">
+        <div class="field">
+          <label>每行粘贴一个 B 站视频链接或 BV 号（单次最多 5 条）</label>
+          <textarea class="ctrl" id="batchUrlsInput" style="min-height:140px" placeholder="https://www.bilibili.com/video/BV149ypz6Ehs&#10;BV1ZssS6iEB9"></textarea>
+        </div>
+      </div>
+    </div>
+    <div class="modal-foot">
+      <button class="btn" onclick="closeModal('submitModal')">取消</button>
+      <button class="btn btn-primary" id="modalSubmitBtn" onclick="handleModalSubmit()">开始总结</button>
+    </div>
+  </div>
+</div>
 
 <!-- TAG FOLDER MANAGER MODAL -->
 <div class="modal-backdrop hidden" id="tagManagerModal" onclick="if(event.target===this)closeModal('tagManagerModal')">
@@ -2169,7 +2572,7 @@ textarea.ctrl{height:auto;min-height:84px;padding:10px 12px;resize:vertical;line
     <div class="modal-head">
       <div>
         <h2>标签文件夹管理</h2>
-        <div style="font-size:12px;color:var(--muted);margin-top:2px">同时适用于单条摘要分类与 UP 主分组，登录后自动同步至云端</div>
+        <div style="font-size:12px;color:var(--muted);margin-top:2px">全局同步至 Cloudflare R2，同时用于摘要归档与 UP 主分组</div>
       </div>
       <button class="icon-btn" onclick="closeModal('tagManagerModal')" aria-label="关闭">
         <svg class="ic" viewBox="0 0 24 24"><path d="M18 6L6 18M6 6l12 12"/></svg>
@@ -2188,30 +2591,8 @@ textarea.ctrl{height:auto;min-height:84px;padding:10px 12px;resize:vertical;line
       <div class="folder-mgr-list" id="folderMgrList"></div>
     </div>
     <div class="modal-foot">
-      <span style="font-size:12px;color:var(--muted)" id="librarySyncHint">本地已保存</span>
+      <span style="font-size:12px;color:var(--muted)" id="librarySyncHint">已同步至云端 R2</span>
       <button class="btn btn-primary" onclick="closeModal('tagManagerModal')">完成</button>
-    </div>
-  </div>
-</div>
-
-<!-- BATCH SUBMIT MODAL -->
-<div class="modal-backdrop hidden" id="batchModal" onclick="if(event.target===this)closeModal('batchModal')">
-  <div class="modal">
-    <div class="modal-head">
-      <h2>批量提交视频链接</h2>
-      <button class="icon-btn" onclick="closeModal('batchModal')" aria-label="关闭">
-        <svg class="ic" viewBox="0 0 24 24"><path d="M18 6L6 18M6 6l12 12"/></svg>
-      </button>
-    </div>
-    <div class="modal-body">
-      <div class="field">
-        <label>每行粘贴一个 B 站视频链接或 BV 号（单次最多 5 条）</label>
-        <textarea class="ctrl" id="batchUrlsInput" style="min-height:130px" placeholder="https://www.bilibili.com/video/BV149ypz6Ehs&#10;BV1ZssS6iEB9"></textarea>
-      </div>
-    </div>
-    <div class="modal-foot">
-      <button class="btn" onclick="closeModal('batchModal')">取消</button>
-      <button class="btn btn-primary" id="batchSubmitBtn" onclick="submitBatchVideos()">加入处理队列</button>
     </div>
   </div>
 </div>
@@ -2229,126 +2610,82 @@ textarea.ctrl{height:auto;min-height:84px;padding:10px 12px;resize:vertical;line
     <div class="modal-foot">
       <a class="btn" id="smWatchLink" href="#" target="_blank" rel="noopener">在B站观看 ↗</a>
       <div style="display:flex;gap:8px">
-        <button class="btn" id="smCopyBtn" onclick="copyModalSummary()">复制摘要</button>
+        <button class="btn" onclick="copyModalSummary()">复制摘要</button>
         <button class="btn btn-primary" onclick="closeModal('summaryModal')">关闭</button>
       </div>
     </div>
   </div>
 </div>
 
-<!-- SETTINGS MODAL -->
+<!-- USER PREFERENCES & SETTINGS MODAL -->
 <div class="modal-backdrop hidden" id="settingsModal" onclick="if(event.target===this)closeModal('settingsModal')">
-  <div class="modal reader">
+  <div class="modal">
     <div class="modal-head">
       <div>
         <h2>偏好与系统设置</h2>
-        <div style="font-size:12px;color:var(--muted);margin-top:2px">配置保存在当前浏览器，即时生效于后续单条视频摘要任务</div>
+        <div style="font-size:12px;color:var(--muted);margin-top:2px">单条摘要默认邮件策略与工作台偏好</div>
       </div>
       <button class="icon-btn" onclick="closeModal('settingsModal')" aria-label="关闭">
         <svg class="ic" viewBox="0 0 24 24"><path d="M18 6L6 18M6 6l12 12"/></svg>
       </button>
     </div>
     <div class="modal-body">
-      <div class="form-section">
-        <div class="sec-head"><h4>单条摘要邮件通知</h4></div>
-        <div class="switch-row" style="margin-bottom:14px">
+      <div class="m-section">
+        <div class="m-sec-head" style="margin-bottom:0">
           <div>
-            <div style="font-size:13.5px;font-weight:700">单条视频总结完成后发送邮件</div>
-            <div style="font-size:12px;color:var(--muted);margin-top:2px">关闭后，网页端手动提交的单条视频总结仅保存在页面与 R2，不再发邮件</div>
+            <div class="m-sec-title">单条摘要完成后发送邮件</div>
+            <div class="m-sec-sub">关闭后仅保存网页端与 R2，不发送单条邮件（不影响定时日报）</div>
           </div>
-          <label class="tog-switch">
-            <input type="checkbox" id="prefSendEmail">
-            <span class="tog-track"></span>
-            <span class="tog-thumb"></span>
-          </label>
-        </div>
-        <div class="form-row">
-          <div class="field">
-            <label>默认单条邮件样式</label>
-            <select class="ctrl" id="prefEmailStyle">
-              <option value="editorial">编辑部日报（深色报头 · 默认）</option>
-              <option value="minimal">极简纸刊（纯白 Notion 风）</option>
-              <option value="bilibili">B站元气粉（樱花粉渐变）</option>
-              <option value="compact">极速速览（高密度紧凑）</option>
-            </select>
-          </div>
-          <div class="field">
-            <label>默认单条接收邮箱（可选）</label>
-            <input class="ctrl" id="prefDefaultEmail" type="email" placeholder="留空则使用服务端默认邮箱">
-          </div>
+          <label class="tog-switch"><input type="checkbox" id="prefSendEmail" checked><span class="tog-track"></span></label>
         </div>
       </div>
 
-      <div class="form-section">
-        <div class="sec-head"><h4>摘要与阅读偏好</h4></div>
-        <div class="form-row">
-          <div class="field">
-            <label>默认总结模板</label>
-            <select class="ctrl" id="prefDefaultTpl">
-              <option value="">默认精炼日报模板</option>
-              <option value="notes">深度结构化笔记</option>
-              <option value="quotes">金句与核心观点提取</option>
-            </select>
-          </div>
-          <div class="field">
-            <label>默认阅读视图</label>
-            <select class="ctrl" id="prefDefaultView">
-              <option value="summary">AI 总结</option>
-              <option value="mindmap">思维导图</option>
-              <option value="transcript">完整转录</option>
-              <option value="split">分栏对照</option>
-            </select>
-          </div>
+      <div class="m-section">
+        <div class="m-sec-title" style="margin-bottom:12px">单条摘要默认配置</div>
+        <div class="field">
+          <label>默认接收邮箱（留空发至系统默认邮箱）</label>
+          <input class="ctrl" id="prefDefaultEmail" type="email" placeholder="example@qq.com">
+        </div>
+        <div class="field">
+          <label>默认单条邮件样式</label>
+          <select class="ctrl" id="prefEmailStyle">
+            <option value="editorial">编辑部日报（深色报头 · 默认）</option>
+            <option value="minimal">极简纸刊（纯白 Notion 风）</option>
+            <option value="bilibili">B站元气粉（樱花粉渐变）</option>
+            <option value="compact">极速速览（高密度紧凑）</option>
+          </select>
+        </div>
+        <div class="field">
+          <label>默认总结模板</label>
+          <select class="ctrl" id="prefDefaultTpl">
+            <option value="">默认精炼日报模板</option>
+            <option value="notes">深度结构化笔记</option>
+            <option value="quotes">金句与核心观点提取</option>
+          </select>
         </div>
       </div>
 
-      <div class="form-section" style="margin-bottom:0">
-        <div class="sec-head">
-          <h4>缓存与运行状态</h4>
-          <span class="cron-badge" id="sysStatsBadge">读取中...</span>
+      <div class="m-section" style="margin-bottom:0">
+        <div class="m-sec-title" style="margin-bottom:12px">阅读工作台偏好</div>
+        <div class="field">
+          <label>打开摘要默认显示视图</label>
+          <select class="ctrl" id="prefDefaultView">
+            <option value="summary">AI 总结</option>
+            <option value="mindmap">思维导图</option>
+            <option value="transcript">完整转录</option>
+            <option value="split">分栏对照</option>
+            <option value="chat">AI 追问</option>
+          </select>
         </div>
-        <div style="display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap">
-          <span style="font-size:12.5px;color:var(--soft)">如发现 UP 主动态未及时更新，可清空本地动态缓存重新拉取</span>
-          <button class="btn btn-sm" type="button" onclick="clearAllFeedCacheFromSettings()">清空 UP 主动态缓存</button>
+        <div style="display:flex;align-items:center;justify-content:space-between;margin-top:12px;padding-top:12px;border-top:1px solid var(--border);gap:10px;flex-wrap:wrap">
+          <div style="font-size:12px;color:var(--soft)" id="sysStatsBadge">读取系统状态中...</div>
+          <button class="btn btn-sm" type="button" onclick="clearLocalCaches()">清空动态封面缓存</button>
         </div>
       </div>
     </div>
     <div class="modal-foot">
-      <button class="btn" type="button" onclick="resetUserPrefs()">恢复默认</button>
-      <div style="display:flex;gap:8px">
-        <button class="btn" type="button" onclick="closeModal('settingsModal')">取消</button>
-        <button class="btn btn-brand" type="button" onclick="saveUserPrefs()">保存设置</button>
-      </div>
-    </div>
-  </div>
-</div>
-
-<!-- LOGIN MODAL -->
-<div class="modal-backdrop hidden" id="loginModal" onclick="if(event.target===this)closeModal('loginModal')">
-  <div class="modal">
-    <div class="modal-head">
-      <h2>管理员登录</h2>
-      <button class="icon-btn" onclick="closeModal('loginModal')" aria-label="关闭">
-        <svg class="ic" viewBox="0 0 24 24"><path d="M18 6L6 18M6 6l12 12"/></svg>
-      </button>
-    </div>
-    <div class="modal-body">
-      <p style="font-size:13px;color:var(--soft);margin-bottom:14px;line-height:1.65">
-        登录后可切换「UP主监控」浏览订阅封面动态流，并在线配置监控名单、Shy Cron 定时策略与日报邮件样式。
-      </p>
-      <div class="field" style="margin-bottom:12px">
-        <label>账号</label>
-        <input class="ctrl" id="loginUser" type="text" placeholder="请输入管理员账号" value="shiran">
-      </div>
-      <div class="field">
-        <label>密码</label>
-        <input class="ctrl" id="loginPass" type="password" placeholder="请输入管理员密码" onkeydown="if(event.key==='Enter')doLogin()">
-      </div>
-      <div class="sb-toast" id="loginToast"></div>
-    </div>
-    <div class="modal-foot">
-      <button class="btn" onclick="closeModal('loginModal')">取消</button>
-      <button class="btn btn-primary" id="loginSubmitBtn" onclick="doLogin()">登录</button>
+      <button class="btn" onclick="closeModal('settingsModal')">取消</button>
+      <button class="btn btn-brand" onclick="saveUserPrefs()">保存设置</button>
     </div>
   </div>
 </div>
@@ -2366,34 +2703,29 @@ textarea.ctrl{height:auto;min-height:84px;padding:10px 12px;resize:vertical;line
       </button>
     </div>
     <div class="modal-body">
-      <div class="m-tabs" id="monitorTabs">
+      <div class="seg-tabs" id="monitorTabs" style="margin-bottom:18px">
         <span class="seg-slider"></span>
-        <button class="m-tab active" data-mtab="schedule" onclick="switchMonitorTab('schedule')">定时与 UP 主监控</button>
-        <button class="m-tab" data-mtab="email" onclick="switchMonitorTab('email')">邮件样式与实时预览</button>
+        <button class="seg-tab active" data-mtab="schedule" onclick="switchMonitorTab('schedule')">定时与 UP 主监控</button>
+        <button class="seg-tab" data-mtab="email" onclick="switchMonitorTab('email')">邮件样式与实时预览</button>
       </div>
 
-      <!-- TAB 1 -->
       <div id="mTabSchedule">
-        <div class="form-section">
-          <div class="switch-row">
+        <div class="m-section">
+          <div class="m-sec-head" style="margin-bottom:0">
             <div>
-              <div style="font-size:13.5px;font-weight:700">启用自动定时监控</div>
-              <div style="font-size:12px;color:var(--muted);margin-top:2px">开启后通过 Shy Cron 按设定时间自动触发 GitHub Actions 抓取新视频</div>
+              <div class="m-sec-title">启用自动定时监控</div>
+              <div class="m-sec-sub">开启后将通过 Shy Cron 按设定时间自动触发 GitHub Actions 抓取新视频</div>
             </div>
-            <label class="tog-switch">
-              <input type="checkbox" id="cfgEnabled" checked>
-              <span class="tog-track"></span>
-              <span class="tog-thumb"></span>
-            </label>
+            <label class="tog-switch"><input type="checkbox" id="cfgEnabled" checked><span class="tog-track"></span></label>
           </div>
         </div>
 
-        <div class="form-section">
-          <div class="sec-head">
-            <h4>定时运行计划（北京时间 UTC+8）</h4>
-            <span class="cron-badge" id="cronUtcPreview">UTC Cron: 0 0,12 * * *</span>
+        <div class="m-section">
+          <div class="m-sec-head">
+            <div class="m-sec-title">定时运行计划（北京时间 UTC+8）</div>
+            <span class="cron-badge" id="cronPreviewBadge">UTC Cron: 0 0,12 * * *</span>
           </div>
-          <div class="form-row">
+          <div class="form-grid">
             <div class="field">
               <label>调度模式</label>
               <select class="ctrl" id="cfgScheduleMode" onchange="onScheduleModeChange()">
@@ -2403,41 +2735,43 @@ textarea.ctrl{height:auto;min-height:84px;padding:10px 12px;resize:vertical;line
                 <option value="custom">自定义 5 位 UTC Cron 表达式</option>
               </select>
             </div>
-            <div class="field" id="customCronWrap" style="display:none">
-              <label>UTC Cron 表达式（5位）</label>
-              <input class="ctrl" id="cfgCustomCron" type="text" placeholder="0 0,12 * * *" oninput="updateCronPreview()">
-            </div>
-            <div class="field" id="timeAddWrap">
+            <div class="field" id="timesInputWrap">
               <label>添加每日运行时间点</label>
-              <div class="inline-add">
+              <div class="inline-add-row">
                 <input class="ctrl" id="newTimeInput" type="time" value="08:00">
                 <button class="btn" type="button" onclick="addTimeSlot()">+ 添加</button>
               </div>
             </div>
+            <div class="field hidden" id="customCronWrap">
+              <label>UTC Cron（分 时 日 月 周）</label>
+              <input class="ctrl" id="cfgCustomCron" type="text" placeholder="0 0,12 * * *" oninput="updateCronBadge()">
+            </div>
           </div>
-          <div class="chip-list" id="timeChips"></div>
-          <div id="cronSyncStatus" style="margin-top:10px;font-size:12px;color:var(--muted)"></div>
+          <div class="chip-list" id="timeChipList"></div>
+          <div id="cronSyncNote" style="font-size:12px;color:var(--muted);margin-top:10px"></div>
         </div>
 
-        <div class="form-section">
-          <div class="sec-head">
-            <h4>监控 UP 主列表（<span id="upCountLabel">0</span> 位）</h4>
+        <div class="m-section">
+          <div class="m-sec-head">
+            <div class="m-sec-title">监控 UP 主列表（<span id="upCountSpan">0</span> 位）</div>
           </div>
-          <div class="inline-add">
-            <input class="ctrl" id="newUpInput" type="text" placeholder="输入 UP 主 UID 或主页链接（如 346563107 或 https://space.bilibili.com/346563107）" onkeydown="if(event.key==='Enter')addUpCreator()">
-            <button class="btn btn-primary" type="button" id="addUpBtn" onclick="addUpCreator()">解析并添加</button>
+          <div class="inline-add-row">
+            <input class="ctrl" id="upAddInput" type="text" placeholder="输入 UP 主 UID 或主页链接（如 346563107 或 https://space.bilibili.com/346563107）" onkeydown="if(event.key==='Enter')addUpCreator()">
+            <button class="btn btn-primary" type="button" id="upAddBtn" onclick="addUpCreator()">解析并添加</button>
           </div>
-          <div class="chip-list" id="upChips"></div>
+          <div class="chip-list" id="upChipList"></div>
         </div>
 
-        <div class="form-section" style="margin-bottom:0">
-          <div class="sec-head"><h4>扫描策略</h4></div>
-          <div class="form-row">
+        <div class="m-section" style="margin-bottom:0">
+          <div class="m-sec-head">
+            <div class="m-sec-title">扫描策略</div>
+          </div>
+          <div class="form-grid">
             <div class="field">
               <label>扫描时间窗口</label>
               <select class="ctrl" id="cfgWindowHours">
-                <option value="24">最近 24 小时</option>
-                <option value="48">最近 48 小时</option>
+                <option value="24">最近 24 小时（1天）</option>
+                <option value="48">最近 48 小时（2天）</option>
                 <option value="72">最近 72 小时（3天）</option>
                 <option value="168">最近 7 天</option>
               </select>
@@ -2445,6 +2779,7 @@ textarea.ctrl{height:auto;min-height:84px;padding:10px 12px;resize:vertical;line
             <div class="field">
               <label>单次每位 UP 主最多处理条数</label>
               <select class="ctrl" id="cfgMaxVideos">
+                <option value="2">最多 2 支</option>
                 <option value="3">最多 3 支</option>
                 <option value="5">最多 5 支</option>
                 <option value="10">最多 10 支</option>
@@ -2454,70 +2789,70 @@ textarea.ctrl{height:auto;min-height:84px;padding:10px 12px;resize:vertical;line
         </div>
       </div>
 
-      <!-- TAB 2 -->
       <div id="mTabEmail" class="hidden">
-        <div class="form-section">
-          <div class="sec-head"><h4>选择日报邮件样式（点击切换实时预览）</h4></div>
-          <div class="style-grid" id="styleGrid">
-            <button type="button" class="style-card" data-style="editorial" onclick="selectEmailStyle('editorial')">
-              <div class="style-thumb" style="background:#f8fafc">
-                <div class="st-hd" style="background:#111827;border-top:3px solid #fb7299"><div class="st-bar" style="background:#fff"></div></div>
-                <div class="st-bd"><div style="height:12px;background:#fff5f7;border-left:2px solid #fb7299;border-radius:2px"></div><div class="st-line" style="width:85%"></div><div class="st-line" style="width:65%"></div></div>
-              </div>
-              <div class="style-name">编辑部日报</div>
-              <div class="style-desc">深炭灰报头 · 珊瑚粉饰条</div>
-            </button>
-            <button type="button" class="style-card" data-style="minimal" onclick="selectEmailStyle('minimal')">
-              <div class="style-thumb" style="background:#ffffff">
-                <div class="st-hd" style="background:#ffffff;border-top:3px solid #111827;border-bottom:1px solid #e5e7eb"><div class="st-bar" style="background:#111827"></div></div>
-                <div class="st-bd"><div style="height:12px;background:#f9fafb;border-left:2px solid #111827;border-radius:2px"></div><div class="st-line" style="width:80%"></div><div class="st-line" style="width:60%"></div></div>
-              </div>
-              <div class="style-name">极简纸刊</div>
-              <div class="style-desc">纯白留白 · Notion 质感</div>
-            </button>
-            <button type="button" class="style-card" data-style="bilibili" onclick="selectEmailStyle('bilibili')">
-              <div class="style-thumb" style="background:#fffbfc">
-                <div class="st-hd" style="background:linear-gradient(135deg,#fb7299,#ff8fab)"><div class="st-bar" style="background:#fff"></div></div>
-                <div class="st-bd"><div style="height:12px;background:#fff1f5;border-left:2px solid #fb7299;border-radius:2px"></div><div class="st-line" style="width:82%;background:#fbcfe8"></div><div class="st-line" style="width:62%;background:#fce7f3"></div></div>
-              </div>
-              <div class="style-name">B站元气粉</div>
-              <div class="style-desc">樱花粉渐变 · 社区轻快</div>
-            </button>
-            <button type="button" class="style-card" data-style="compact" onclick="selectEmailStyle('compact')">
-              <div class="style-thumb" style="background:#ffffff">
-                <div class="st-hd" style="background:#0f172a;border-top:3px solid #38bdf8"><div class="st-bar" style="background:#7dd3fc"></div></div>
-                <div class="st-bd" style="gap:3px"><div style="height:9px;background:#f0f9ff;border-left:2px solid #0284c7"></div><div class="st-line" style="width:90%"></div><div class="st-line" style="width:75%"></div><div class="st-line" style="width:68%"></div></div>
-              </div>
-              <div class="style-name">极速速览</div>
-              <div class="style-desc">高密度紧凑 · 多UP扫读</div>
-            </button>
+        <div class="m-section">
+          <div class="m-sec-head" style="margin-bottom:10px">
+            <div>
+              <div class="m-sec-title">选择日报邮件视觉样式（开源 4 套主题）</div>
+              <div class="m-sec-sub">所有目录条目与卡片标题均直接超链接跳转至 B 站原视频页</div>
+            </div>
           </div>
-          <div class="form-row">
-            <div class="switch-row" style="height:38px;padding:0 12px;background:var(--surface);border:1px solid var(--border);border-radius:9px">
-              <span style="font-size:12.5px;font-weight:600">多 UP 主合并为同一封日报</span>
-              <label class="tog-switch">
-                <input type="checkbox" id="cfgMergeEmails" checked onchange="renderEmailPreview()">
-                <span class="tog-track"></span>
-                <span class="tog-thumb"></span>
-              </label>
+          <div class="style-grid" id="emailStyleGrid">
+            <div class="style-card" data-style="editorial" onclick="selectEmailStyle('editorial')">
+              <div class="sc-thumb"><div style="height:20px;background:linear-gradient(135deg,#0f172a,#1e293b)"></div><div style="flex:1;background:#f8fafc;padding:4px 6px"><div style="height:4px;width:65%;background:#fb7299;border-radius:2px;margin-bottom:3px"></div><div style="height:3px;width:90%;background:#cbd5e1;border-radius:2px"></div></div></div>
+              <div class="sc-name">编辑部日报</div>
+              <div class="sc-desc">深色报头 · 卡片式目录与重点高亮</div>
+            </div>
+            <div class="style-card" data-style="minimal" onclick="selectEmailStyle('minimal')">
+              <div class="sc-thumb"><div style="height:16px;background:#fff;border-bottom:2px solid #18181b"></div><div style="flex:1;background:#fff;padding:4px 6px"><div style="height:4px;width:55%;background:#18181b;border-radius:2px;margin-bottom:3px"></div><div style="height:3px;width:85%;background:#d4d4d8;border-radius:2px"></div></div></div>
+              <div class="sc-name">极简纸刊</div>
+              <div class="sc-desc">Notion 纯白排版 · 克制黑白高级感</div>
+            </div>
+            <div class="style-card" data-style="bilibili" onclick="selectEmailStyle('bilibili')">
+              <div class="sc-thumb"><div style="height:20px;background:linear-gradient(135deg,#fb7299,#ff85a7)"></div><div style="flex:1;background:#fff5f7;padding:4px 6px"><div style="height:4px;width:70%;background:#fb7299;border-radius:2px;margin-bottom:3px"></div><div style="height:3px;width:85%;background:#fecdd3;border-radius:2px"></div></div></div>
+              <div class="sc-name">B站元气粉</div>
+              <div class="sc-desc">樱花粉渐变报头 · 轻快明朗</div>
+            </div>
+            <div class="style-card" data-style="compact" onclick="selectEmailStyle('compact')">
+              <div class="sc-thumb"><div style="height:16px;background:#2563eb"></div><div style="flex:1;background:#f8fafc;padding:4px 6px"><div style="height:3px;width:95%;background:#94a3b8;margin-bottom:3px"></div><div style="height:3px;width:85%;background:#94a3b8;margin-bottom:3px"></div><div style="height:3px;width:70%;background:#94a3b8"></div></div></div>
+              <div class="sc-name">极速速览</div>
+              <div class="sc-desc">高密度列表 · 30 秒扫完所有更新</div>
+            </div>
+          </div>
+
+          <div class="preview-box">
+            <div class="preview-bar">
+              <span>实时邮件效果预览（点击目录或标题可测试原视频超链接）</span>
+              <span id="previewStyleName" style="font-weight:700;color:var(--brand-dark)">编辑部日报</span>
+            </div>
+            <div class="preview-stage" id="emailPreviewStage"></div>
+          </div>
+        </div>
+
+        <div class="m-section" style="margin-bottom:0">
+          <div class="form-grid">
+            <div class="field">
+              <label>合并发送策略</label>
+              <div style="display:flex;align-items:center;justify-content:space-between;height:38px;padding:0 12px;border:1px solid var(--border);border-radius:9px;background:var(--surface)">
+                <span style="font-size:13px">多位 UP 主合并为一封日报</span>
+                <label class="tog-switch"><input type="checkbox" id="cfgMergeEmails" checked><span class="tog-track"></span></label>
+              </div>
             </div>
             <div class="field">
-              <input class="ctrl" id="cfgSmtpTo" type="email" placeholder="自定义收件邮箱（留空用默认 Secret）">
+              <label>自定义日报接收邮箱（可选）</label>
+              <input class="ctrl" id="cfgSmtpTo" type="email" placeholder="留空则发往系统默认邮箱">
             </div>
           </div>
         </div>
-        <div style="font-size:12px;font-weight:700;color:var(--soft);margin-bottom:8px">实时仿真日报预览（标题均可直接跳转 B 站原视频页）</div>
-        <iframe id="emailPreviewFrame" class="email-preview-frame" title="邮件样式预览"></iframe>
       </div>
 
       <div class="sb-toast" id="monitorToast"></div>
     </div>
     <div class="modal-foot">
-      <div style="display:flex;gap:8px;align-items:center">
-        <button class="btn" type="button" onclick="doLogout()">退出登录</button>
-        <button class="btn" type="button" id="runNowBtn" onclick="triggerMonitorNow('monitorToast')">立即运行一次监控</button>
+      <div style="display:flex;gap:8px;flex-wrap:wrap">
+        <button class="btn" type="button" onclick="triggerMonitorNow()">立即巡检</button>
       </div>
-      <div style="display:flex;gap:8px">
+      <div style="display:flex;gap:8px;flex-wrap:wrap">
         <button class="btn" type="button" onclick="closeModal('monitorModal')">关闭</button>
         <button class="btn btn-brand" type="button" id="saveMonitorBtn" onclick="saveMonitorConfig()">保存并同步定时任务</button>
       </div>
@@ -2526,6 +2861,7 @@ textarea.ctrl{height:auto;min-height:84px;padding:10px 12px;resize:vertical;line
 </div>
 
 <script>
+// ── Storage Keys & Constants ──
 const LS_JOBS = 'bilisum_jobs_v3';
 const LS_THEME = 'bilisum_theme_v3';
 const LS_AUTH = 'bilisum_auth_token';
@@ -2533,6 +2869,9 @@ const LS_USER = 'bilisum_auth_user';
 const LS_PREFS = 'bilisum_prefs_v1';
 const LS_CHATS = 'bilisum_chats_v1';
 const LS_LIBRARY = 'bilisum_library_v1';
+const LS_RAIL_COLLAPSED = 'bilisum_rail_collapsed_v1';
+const SS_FEED_CACHE = 'bilisum_up_feed_cache_v2';
+const FEED_CACHE_TTL_MS = 10 * 60 * 1000;
 
 const FOLDER_COLORS = ['#2563EB', '#D97706', '#7C3AED', '#059669', '#E11D48', '#0891B2', '#4F46E5', '#64748B'];
 const DEFAULT_FOLDERS = [
@@ -2541,32 +2880,434 @@ const DEFAULT_FOLDERS = [
   { id: 'game', name: '游戏', color: '#7C3AED' },
   { id: 'software', name: '软件', color: '#059669' },
 ];
+const DEFAULT_PREFS = {
+  send_email_on_single: true,
+  default_email_style: 'editorial',
+  default_email: '',
+  default_tpl: '',
+  default_view: 'summary',
+};
+const TPL_PRESETS = {
+  notes: '请将以下视频内容整理为结构化深度笔记，包含核心论点、论据案例、关键数据与行动建议：\n{content}',
+  quotes: '请提取以下视频中的核心观点与高价值原话金句（5-8条），并附简要背景解读：\n{content}',
+};
 
-let currentPage = 'workspace';
+const SVG_SUN = '<svg class="ic" viewBox="0 0 24 24"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M6.34 17.66l-1.41 1.41M19.07 4.93l-1.41 1.41"/></svg>';
+const SVG_MOON = '<svg class="ic" viewBox="0 0 24 24"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg>';
+const SVG_CLOSE_SM = '<svg class="ic" viewBox="0 0 24 24"><path d="M18 6L6 18M6 6l12 12"/></svg>';
+const SVG_CHEV = '<svg class="ic c-select-chev" viewBox="0 0 24 24"><path d="M6 9l6 6 6-6"/></svg>';
+const SVG_CHK = '<svg class="ic c-select-chk" viewBox="0 0 24 24"><polyline points="20 6 9 17 4 12"/></svg>';
+const SVG_CLOCK_SM = '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><polyline points="12 7 12 12 15 15"/></svg>';
+const SVG_STAR_LINE = '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2"/></svg>';
+const SVG_TAG_SM = '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M20.59 13.41l-7.17 7.17a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82z"/><line x1="7" y1="7" x2="7.01" y2="7"/></svg>';
+const SVG_TRASH_SM = '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/><path d="M10 11v6M14 11v6"/></svg>';
+
+// ── Global App State ──
+let authUser = '';
+let currentRoute = 'summary'; // summary | monitor | watch-later | favorites | history | folder
+let activeFolderId = '';
+let folderViewTab = 'summaries';
 let selectedJobId = null;
 let selectedUpMid = 'all';
-let selectedWsFolder = '';
 let selectedMonFolder = '';
-let currentFeedVideos = [];
-let modalSummaryRaw = '';
+let wlFilter = 'all';
+let wlSelectedBvids = new Set();
+let favType = 'all';
+let favFolderFilter = '';
+let histStatus = 'all';
+let histFolderFilter = '';
+let histBatchMode = false;
+let histSelectedIds = new Set();
+let submitModalTab = 'single';
 let viewMode = 'summary';
-let historyFilter = 'all';
 let readerFontPx = 14;
 let trMatchIndex = -1;
-let batchMode = false;
-let selectedIds = [];
+let modalSummaryRaw = '';
 let pollTimers = {};
-let authUser = '';
 let toastTimer = null;
 let selectedNewFolderColor = FOLDER_COLORS[0];
 let librarySyncTimer = null;
-let pageScrollPos = { workspace: 0, monitor: 0 };
+let routeScrollPos = {};
 let monitorPageBooted = false;
 let lastRenderedFeedKey = '';
 let lastRenderedFeedSig = '';
+let currentFeedVideos = [];
+let folderFeedVideos = [];
+let feedPagination = { key: 'all', pn: 1, hasMore: false, loading: false, total: 0 };
+let folderPagination = { key: '', pn: 1, hasMore: false, loading: false, total: 0 };
+let feedObserver = null;
+let folderObserver = null;
+let prefetchDone = false;
+const feedMemCache = new Map();
+
+let monitorConfig = {
+  enabled: true, schedule_mode: 'times', times_cst: ['08:00', '20:00'],
+  cron_utc: '0 0,12 * * *', up_list: [], email_style: 'editorial',
+  merge_emails: true, smtp_to: '', check_window_hours: 72, max_videos_per_run: 5,
+};
 
 let libraryState = loadLocalLibrary();
 
+// ── Utility Functions ──
+function esc(s) { return String(s || '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }
+function normStatus(st) {
+  if (st === 'done' || st === 'success' || st === 'completed') return 'completed';
+  if (st === 'failed' || st === 'error') return 'failed';
+  return 'pending';
+}
+function toast(msg, isErr) {
+  const el = document.getElementById('globalToast');
+  el.textContent = msg;
+  el.className = 'global-toast show' + (isErr ? ' err' : '');
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => { el.classList.remove('show'); }, 3200);
+}
+function showToast(elId, msg, kind) {
+  const el = document.getElementById(elId);
+  if (!el) { toast(msg, kind === 'err'); return; }
+  el.textContent = msg;
+  el.className = 'sb-toast show ' + (kind || 'info');
+  if (kind === 'ok' || kind === 'info') setTimeout(() => { el.classList.remove('show'); }, 4000);
+}
+function parseDurationSec(dur) {
+  if (!dur) return 0;
+  const parts = String(dur).split(':').map(Number);
+  if (parts.some(isNaN)) return 0;
+  if (parts.length === 3) return parts[0]*3600 + parts[1]*60 + parts[2];
+  if (parts.length === 2) return parts[0]*60 + parts[1];
+  return parts[0] || 0;
+}
+function fmtCount(n) {
+  const num = Number(n) || 0;
+  if (num >= 100000000) return (num / 100000000).toFixed(1).replace(/\.0$/, '') + ' 亿次';
+  if (num >= 10000) return (num / 10000).toFixed(1).replace(/\.0$/, '') + ' 万次';
+  return num + ' 次';
+}
+function fmtDanmaku(n) {
+  const num = Number(n) || 0;
+  if (num >= 10000) return (num / 10000).toFixed(1).replace(/\.0$/, '') + ' 万弹幕';
+  return num + ' 弹幕';
+}
+function fmtRelativeTime(unixSec) {
+  if (!unixSec) return '';
+  const diff = Math.max(0, Math.floor(Date.now() / 1000) - Number(unixSec));
+  if (diff < 3600) return Math.max(1, Math.floor(diff / 60)) + '分钟前';
+  if (diff < 86400) return Math.floor(diff / 3600) + '小时前';
+  const days = Math.floor(diff / 86400);
+  if (days < 7) return days + '天前';
+  if (days < 30) return Math.floor(days / 7) + '周前';
+  if (days < 365) return Math.floor(days / 30) + '个月前';
+  return Math.floor(days / 365) + '年前';
+}
+function fmtShortDate(iso) {
+  if (!iso) return '';
+  const d = new Date(iso);
+  if (isNaN(d.getTime())) return '';
+  const p = n => String(n).padStart(2, '0');
+  return d.getFullYear() + '/' + p(d.getMonth()+1) + '/' + p(d.getDate()) + ' ' + p(d.getHours()) + ':' + p(d.getMinutes());
+}
+
+// ── Unified Authenticated Fetch (Cookie + Bearer Dual Persistence) ──
+function getAuthToken() { return localStorage.getItem(LS_AUTH) || ''; }
+
+async function apiFetch(url, options) {
+  const opts = { credentials: 'same-origin', ...(options || {}) };
+  const headers = { ...(opts.headers || {}) };
+  const tok = getAuthToken();
+  if (tok && !headers['Authorization']) headers['Authorization'] = 'Bearer ' + tok;
+  opts.headers = headers;
+  const resp = await fetch(url, opts);
+  if (resp.status === 401 && !url.startsWith('/api/auth/')) {
+    handleAuthExpired();
+  }
+  return resp;
+}
+
+function handleAuthExpired() {
+  localStorage.removeItem(LS_AUTH);
+  localStorage.removeItem(LS_USER);
+  authUser = '';
+  monitorPageBooted = false;
+  document.getElementById('appShell').classList.add('hidden');
+  document.getElementById('authGate').classList.remove('hidden');
+}
+
+async function doGateLogin() {
+  const username = document.getElementById('gateUser').value.trim();
+  const password = document.getElementById('gatePass').value;
+  const remember = document.getElementById('gateRemember').checked;
+  const btn = document.getElementById('gateLoginBtn');
+  if (!username || !password) { showToast('gateToast', '请输入账号与密码', 'err'); return; }
+  btn.disabled = true; btn.textContent = '登录验证中...';
+  try {
+    const r = await fetch('/api/auth/login', {
+      method: 'POST',
+      credentials: 'same-origin',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username, password, remember }),
+    });
+    const d = await r.json();
+    if (!r.ok) { showToast('gateToast', d.error || '账号或密码错误', 'err'); return; }
+    if (d.token) localStorage.setItem(LS_AUTH, d.token);
+    localStorage.setItem(LS_USER, d.username || username);
+    document.getElementById('gatePass').value = '';
+    enterAuthenticatedApp(d.username || username);
+    toast(remember ? '登录成功（本机已开启 90 天持久免重登）' : '登录成功');
+  } catch (e) {
+    showToast('gateToast', '网络错误：' + e.message, 'err');
+  } finally {
+    btn.disabled = false; btn.textContent = '登录进入工作台';
+  }
+}
+
+async function doLogout() {
+  try { await fetch('/api/auth/logout', { method: 'POST', credentials: 'same-origin' }); } catch {}
+  localStorage.removeItem(LS_AUTH);
+  localStorage.removeItem(LS_USER);
+  authUser = '';
+  monitorPageBooted = false;
+  lastRenderedFeedKey = '';
+  lastRenderedFeedSig = '';
+  feedMemCache.clear();
+  try { sessionStorage.removeItem(SS_FEED_CACHE); } catch {}
+  toggleMobileNav(false);
+  document.getElementById('appShell').classList.add('hidden');
+  document.getElementById('authGate').classList.remove('hidden');
+  toast('已安全退出当前设备');
+}
+
+function enterAuthenticatedApp(username) {
+  authUser = username || 'shiran';
+  document.getElementById('railUserName').textContent = authUser;
+  document.getElementById('railUserAva').textContent = authUser.slice(0, 1).toUpperCase();
+  document.getElementById('authGate').classList.add('hidden');
+  document.getElementById('appShell').classList.remove('hidden');
+
+  applyRailCollapsedState();
+  renderRailFolders();
+  updateNavBadges();
+  syncFromR2();
+  syncLibraryFromR2();
+  loadMonitorConfigQuietly();
+  handleHashRoute(true);
+  requestAnimationFrame(() => {
+    updateAllSliders(true);
+    moveRailNavSlider(true);
+  });
+}
+
+async function bootstrapAuth() {
+  const cachedUser = localStorage.getItem(LS_USER) || '';
+  const cachedTok = getAuthToken();
+  if (cachedUser && cachedTok) {
+    // Optimistic zero-flicker enter on trusted device, verified/renewed silently right away
+    enterAuthenticatedApp(cachedUser);
+  }
+  try {
+    const r = await apiFetch('/api/auth/me');
+    const d = await r.json();
+    if (d && d.authenticated) {
+      if (d.token) localStorage.setItem(LS_AUTH, d.token);
+      localStorage.setItem(LS_USER, d.username || 'shiran');
+      if (!authUser) enterAuthenticatedApp(d.username || 'shiran');
+    } else {
+      handleAuthExpired();
+      setTimeout(() => { const p = document.getElementById('gatePass'); if (p) p.focus(); }, 60);
+    }
+  } catch {
+    if (!authUser) document.getElementById('authGate').classList.remove('hidden');
+  }
+}
+
+// ── Theme & Plan A/B Rail Collapse + Mobile Drawer ──
+function initTheme() {
+  const saved = localStorage.getItem(LS_THEME) || 'light';
+  document.documentElement.setAttribute('data-theme', saved);
+  updateThemeButtons();
+}
+function toggleTheme() {
+  const cur = document.documentElement.getAttribute('data-theme') || 'light';
+  const next = cur === 'dark' ? 'light' : 'dark';
+  document.documentElement.setAttribute('data-theme', next);
+  localStorage.setItem(LS_THEME, next);
+  updateThemeButtons();
+}
+function updateThemeButtons() {
+  const isDark = document.documentElement.getAttribute('data-theme') === 'dark';
+  const icon = isDark ? SVG_SUN : SVG_MOON;
+  const gBtn = document.getElementById('gateThemeBtn');
+  if (gBtn) gBtn.innerHTML = icon;
+  const rBtn = document.getElementById('railThemeBtn');
+  if (rBtn) rBtn.innerHTML = icon + '<span class="rail-label">' + (isDark ? '浅色' : '暗色') + '</span>';
+}
+
+function applyRailCollapsedState() {
+  const collapsed = localStorage.getItem(LS_RAIL_COLLAPSED) === '1';
+  document.getElementById('appShell').classList.toggle('rail-collapsed', collapsed);
+}
+function toggleRailCollapsed() {
+  const shell = document.getElementById('appShell');
+  const next = !shell.classList.contains('rail-collapsed');
+  shell.classList.toggle('rail-collapsed', next);
+  localStorage.setItem(LS_RAIL_COLLAPSED, next ? '1' : '0');
+  setTimeout(() => { updateAllSliders(true); moveRailNavSlider(true); }, 260);
+}
+function onBrandClick() {
+  const shell = document.getElementById('appShell');
+  if (window.innerWidth <= 768) { toggleMobileNav(false); return; }
+  if (shell.classList.contains('rail-collapsed')) toggleRailCollapsed();
+  else navigate('summary');
+}
+function toggleMobileNav(forceState) {
+  const shell = document.getElementById('appShell');
+  const bd = document.getElementById('mobileBackdrop');
+  const next = typeof forceState === 'boolean' ? forceState : !shell.classList.contains('mobile-nav-open');
+  shell.classList.toggle('mobile-nav-open', next);
+  bd.classList.toggle('show', next);
+}
+
+// ── Spring Sliding Pill Engine (Horizontal + Vertical Rail) ──
+const SLIDER_IDS = ['segTabs', 'wlFilterTabs', 'favTypeTabs', 'histStatusTabs', 'folderViewTabs', 'submitModeTabs', 'monitorTabs'];
+
+function moveSlider(containerId, instant) {
+  const box = document.getElementById(containerId);
+  if (!box) return;
+  const slider = box.querySelector('.seg-slider');
+  const active = box.querySelector('.active');
+  if (!slider || !active) return;
+  const boxRect = box.getBoundingClientRect();
+  const actRect = active.getBoundingClientRect();
+  if (actRect.width === 0 || boxRect.width === 0) return;
+  const borderLeft = parseFloat(getComputedStyle(box).borderLeftWidth) || 0;
+  const x = Math.round((actRect.left - boxRect.left - borderLeft) * 10) / 10;
+  const w = Math.round(actRect.width * 10) / 10;
+  if (instant || !slider.dataset.ready) {
+    slider.style.transition = 'none';
+    slider.style.width = w + 'px';
+    slider.style.transform = 'translateX(' + x + 'px)';
+    void slider.offsetWidth;
+    slider.style.transition = '';
+    slider.dataset.ready = '1';
+  } else {
+    box._lastAnimAt = Date.now();
+    slider.style.width = w + 'px';
+    slider.style.transform = 'translateX(' + x + 'px)';
+  }
+}
+
+function moveRailNavSlider(instant) {
+  const nav = document.getElementById('railNav');
+  const slider = document.getElementById('railNavSlider');
+  if (!nav || !slider) return;
+  const active = nav.querySelector('.rail-item.active');
+  if (!active) { slider.classList.add('off'); return; }
+  slider.classList.remove('off');
+  const navRect = nav.getBoundingClientRect();
+  const actRect = active.getBoundingClientRect();
+  if (actRect.height === 0) return;
+  const y = Math.round((actRect.top - navRect.top) * 10) / 10;
+  const h = Math.round(actRect.height * 10) / 10;
+  if (instant || !slider.dataset.ready) {
+    slider.style.transition = 'none';
+    slider.style.height = h + 'px';
+    slider.style.transform = 'translateY(' + y + 'px)';
+    void slider.offsetWidth;
+    slider.style.transition = '';
+    slider.dataset.ready = '1';
+  } else {
+    slider.style.height = h + 'px';
+    slider.style.transform = 'translateY(' + y + 'px)';
+  }
+}
+
+function updateAllSliders(instant) { SLIDER_IDS.forEach(id => moveSlider(id, instant)); }
+
+function initSliderObservers() {
+  if (typeof ResizeObserver === 'undefined') return;
+  const ro = new ResizeObserver(entries => {
+    entries.forEach(e => {
+      const box = e.target;
+      if (!box || !box.id) return;
+      const slider = box.querySelector('.seg-slider');
+      const nowW = Math.round(e.contentRect ? e.contentRect.width : box.getBoundingClientRect().width);
+      if (slider && slider.dataset.ready && Date.now() - (box._lastAnimAt || 0) < 420) return;
+      if (slider && slider.dataset.ready && box._lastBoxW === nowW) return;
+      box._lastBoxW = nowW;
+      moveSlider(box.id, true);
+    });
+  });
+  SLIDER_IDS.forEach(id => { const el = document.getElementById(id); if (el) ro.observe(el); });
+}
+
+// ── Custom Card-Style Select ──
+function closeAllCustomSelects(exceptWrap) {
+  document.querySelectorAll('.c-select.open').forEach(w => { if (w !== exceptWrap) w.classList.remove('open', 'drop-up'); });
+}
+function syncCustomSelect(sel) {
+  if (typeof sel === 'string') sel = document.getElementById(sel);
+  if (!sel || !sel._csWrap) return;
+  const wrap = sel._csWrap;
+  const opt = sel.options[sel.selectedIndex] || sel.options[0];
+  wrap.querySelector('.c-select-label').textContent = opt ? opt.textContent : '';
+  wrap.querySelectorAll('.c-select-opt').forEach(btn => btn.classList.toggle('selected', btn.dataset.val === sel.value));
+}
+function syncAllCustomSelects() { document.querySelectorAll('select.c-select-native').forEach(syncCustomSelect); }
+function initCustomSelects() {
+  document.querySelectorAll('select.ctrl').forEach(sel => {
+    if (sel._csWrap) return;
+    const wrap = document.createElement('div');
+    wrap.className = 'c-select';
+    sel.parentNode.insertBefore(wrap, sel);
+    sel.classList.add('c-select-native');
+    wrap.appendChild(sel);
+    const btn = document.createElement('button');
+    btn.type = 'button'; btn.className = 'c-select-btn';
+    btn.innerHTML = '<span class="c-select-label"></span>' + SVG_CHEV;
+    const menu = document.createElement('div');
+    menu.className = 'c-select-menu';
+    Array.from(sel.options).forEach(opt => {
+      const item = document.createElement('button');
+      item.type = 'button'; item.className = 'c-select-opt'; item.dataset.val = opt.value;
+      item.innerHTML = '<span>' + esc(opt.textContent) + '</span>' + SVG_CHK;
+      item.addEventListener('click', (e) => {
+        e.stopPropagation(); sel.value = opt.value; syncCustomSelect(sel);
+        wrap.classList.remove('open', 'drop-up');
+        sel.dispatchEvent(new Event('change', { bubbles: true }));
+      });
+      menu.appendChild(item);
+    });
+    btn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      const willOpen = !wrap.classList.contains('open');
+      closeAllCustomSelects(wrap);
+      if (willOpen) {
+        const rect = btn.getBoundingClientRect();
+        wrap.classList.toggle('drop-up', (window.innerHeight - rect.bottom) < 220 && rect.top > 220);
+        wrap.classList.add('open');
+      } else wrap.classList.remove('open', 'drop-up');
+    });
+    wrap.appendChild(btn); wrap.appendChild(menu);
+    sel._csWrap = wrap;
+    syncCustomSelect(sel);
+  });
+}
+document.addEventListener('click', () => closeAllCustomSelects());
+
+function openModal(id) { document.getElementById(id).classList.remove('hidden'); }
+function closeModal(id) { document.getElementById(id).classList.add('hidden'); }
+
+// Global Ctrl+K / Cmd+K & Escape shortcut
+document.addEventListener('keydown', (e) => {
+  if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'k' && authUser) {
+    e.preventDefault(); openSubmitModal('single');
+  } else if (e.key === 'Escape') {
+    closeTagPopover();
+    ['submitModal', 'tagManagerModal', 'summaryModal', 'settingsModal', 'monitorModal'].forEach(closeModal);
+    toggleMobileNav(false);
+  }
+});
+
+// ── Library State (Tag Folders + Watch Later + Favorites) ──
 function loadLocalLibrary() {
   try {
     const raw = JSON.parse(localStorage.getItem(LS_LIBRARY) || 'null');
@@ -2580,48 +3321,37 @@ function loadLocalLibrary() {
       };
     }
   } catch {}
-  return {
-    folders: DEFAULT_FOLDERS.map(f => ({ ...f })),
-    job_tags: {},
-    up_tags: {},
-    watch_later: [],
-    favorites: [],
-  };
+  return { folders: DEFAULT_FOLDERS.map(f => ({ ...f })), job_tags: {}, up_tags: {}, watch_later: [], favorites: [] };
 }
 
 function saveLibraryLocalAndCloud() {
   try { localStorage.setItem(LS_LIBRARY, JSON.stringify(libraryState)); } catch {}
+  updateNavBadges();
+  renderRailFolders();
   const hint = document.getElementById('librarySyncHint');
-  if (!authUser) {
-    if (hint) hint.textContent = '已保存在本地浏览器（登录管理员后可云端同步）';
-    return;
-  }
   if (hint) hint.textContent = '正在同步至云端 R2...';
   clearTimeout(librarySyncTimer);
   librarySyncTimer = setTimeout(async () => {
     try {
-      const r = await fetch('/api/library', {
+      const r = await apiFetch('/api/library', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + getAuthToken() },
+        headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ library: libraryState }),
       });
-      if (hint) hint.textContent = r.ok ? '已同步至 Cloudflare R2' : '本地已保存（云端同步稍后重试）';
-    } catch {
-      if (hint) hint.textContent = '本地已保存（网络离线）';
-    }
+      if (hint) hint.textContent = r.ok ? '已同步至 Cloudflare R2' : '本地已保存（云端稍后重试）';
+    } catch { if (hint) hint.textContent = '本地已保存'; }
   }, 450);
 }
 
 async function syncLibraryFromR2() {
   try {
-    const r = await fetch('/api/library');
+    const r = await apiFetch('/api/library');
     if (!r.ok) return;
     const d = await r.json();
     if (!d || !d.library) return;
     const remote = d.library;
-    // Merge remote folders & maps if local hasn't been customized or merge union
-    const localHasCustom = Boolean(localStorage.getItem(LS_LIBRARY));
-    if (!localHasCustom) {
+    const localHas = Boolean(localStorage.getItem(LS_LIBRARY));
+    if (!localHas) {
       libraryState = {
         folders: remote.folders && remote.folders.length ? remote.folders : DEFAULT_FOLDERS.map(f => ({ ...f })),
         job_tags: remote.job_tags || {},
@@ -2646,22 +3376,11 @@ async function syncLibraryFromR2() {
       libraryState.favorites = mergeVids(remote.favorites, libraryState.favorites);
     }
     try { localStorage.setItem(LS_LIBRARY, JSON.stringify(libraryState)); } catch {}
-    renderWorkspaceFolderBar();
-    renderList();
-    if (selectedJobId) {
-      const job = getJobs().find(j => j.id === selectedJobId);
-      if (job) renderDetailTagBar(job);
-    }
-    if (currentPage === 'monitor') {
-      renderMonitorFolderBar();
-      renderUpSidebar();
-    }
+    refreshAllLibraryViews();
   } catch {}
 }
 
-function getFolderById(id) {
-  return (libraryState.folders || []).find(f => f.id === id) || null;
-}
+function getFolderById(id) { return (libraryState.folders || []).find(f => f.id === id) || null; }
 function jobTagKey(job) { return String((job && (job.bvid || job.id)) || ''); }
 function getJobTagIds(job) {
   const k = jobTagKey(job);
@@ -2675,312 +3394,200 @@ function getUpTagIds(mid) {
   const valid = new Set((libraryState.folders || []).map(f => f.id));
   return (libraryState.up_tags[k] || []).filter(id => valid.has(id));
 }
-function isWatchLater(bvid) {
-  return Boolean(bvid && (libraryState.watch_later || []).some(v => v.bvid === bvid));
-}
-function isFavBvid(bvid) {
-  return Boolean(bvid && (libraryState.favorites || []).some(v => v.bvid === bvid));
-}
-function isJobFavorited(job) {
-  if (!job) return false;
-  return Boolean(job.starred || isFavBvid(job.bvid));
-}
+function isWatchLater(bvid) { return Boolean(bvid && (libraryState.watch_later || []).some(v => v.bvid === bvid)); }
+function isFavBvid(bvid) { return Boolean(bvid && (libraryState.favorites || []).some(v => v.bvid === bvid)); }
+function isJobFavorited(job) { return Boolean(job && (job.starred || isFavBvid(job.bvid))); }
 
-let monitorConfig = {
-  enabled: true, schedule_mode: 'times', times_cst: ['08:00', '20:00'],
-  cron_utc: '0 0,12 * * *', up_list: [], email_style: 'editorial',
-  merge_emails: true, smtp_to: '', check_window_hours: 72, max_videos_per_run: 5,
-};
-
-const DEFAULT_PREFS = {
-  send_email_on_single: true,
-  default_email_style: 'editorial',
-  default_email: '',
-  default_tpl: '',
-  default_view: 'summary',
-};
-
-const TPL_PRESETS = {
-  notes: '请将以下视频内容整理为结构化深度笔记，包含核心论点、论据案例、关键数据与行动建议：\n{content}',
-  quotes: '请提取以下视频中的核心观点与高价值原话金句（5-8条），并附简要背景解读：\n{content}',
-};
-
-const SVG_LOCK = '<svg class="ic" viewBox="0 0 24 24"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>';
-const SVG_SLIDERS = '<svg class="ic" viewBox="0 0 24 24"><line x1="4" y1="21" x2="4" y2="14"/><line x1="4" y1="10" x2="4" y2="3"/><line x1="12" y1="21" x2="12" y2="12"/><line x1="12" y1="8" x2="12" y2="3"/><line x1="20" y1="21" x2="20" y2="16"/><line x1="20" y1="12" x2="20" y2="3"/><line x1="1" y1="14" x2="7" y2="14"/><line x1="9" y1="8" x2="15" y2="8"/><line x1="17" y1="16" x2="23" y2="16"/></svg>';
-const SVG_SUN = '<svg class="ic" viewBox="0 0 24 24"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M6.34 17.66l-1.41 1.41M19.07 4.93l-1.41 1.41"/></svg>';
-const SVG_MOON = '<svg class="ic" viewBox="0 0 24 24"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg>';
-const SVG_CLOSE_SM = '<svg class="ic" viewBox="0 0 24 24"><path d="M18 6L6 18M6 6l12 12"/></svg>';
-const SVG_CHEV = '<svg class="ic c-select-chev" viewBox="0 0 24 24"><path d="M6 9l6 6 6-6"/></svg>';
-const SVG_CHK = '<svg class="ic c-select-chk" viewBox="0 0 24 24"><polyline points="20 6 9 17 4 12"/></svg>';
-const SVG_STAR_SM = '<svg width="11" height="11" viewBox="0 0 24 24" fill="currentColor" stroke="none"><polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2"/></svg>';
-const SVG_CLOCK_SM = '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><polyline points="12 7 12 12 15 15"/></svg>';
-const SVG_STAR_LINE = '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2"/></svg>';
-const SVG_TAG_SM = '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M20.59 13.41l-7.17 7.17a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82z"/><line x1="7" y1="7" x2="7.01" y2="7"/></svg>';
-
-function esc(s) { return String(s || '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }
-function normStatus(st) {
-  if (st === 'done' || st === 'success' || st === 'completed') return 'completed';
-  if (st === 'failed' || st === 'error') return 'failed';
-  return 'pending';
+function refreshAllLibraryViews() {
+  updateNavBadges();
+  renderRailFolders();
+  if (selectedJobId) {
+    const cur = getJobs().find(j => j.id === selectedJobId);
+    if (cur) { updateStarBtn(cur); updateWatchLaterBtn(cur); renderDetailTagBar(cur); }
+  }
+  if (currentRoute === 'monitor') { renderMonitorFolderBar(); renderUpSidebar(); }
+  if (currentRoute === 'watch-later') renderWatchLaterPage();
+  if (currentRoute === 'favorites') renderFavoritesPage();
+  if (currentRoute === 'history') renderHistoryPage();
+  if (currentRoute === 'folder' && activeFolderId) renderFolderPage(activeFolderId, false);
 }
 
-function toast(msg, isErr) {
-  const el = document.getElementById('globalToast');
-  el.textContent = msg;
-  el.className = 'global-toast show' + (isErr ? ' err' : '');
-  clearTimeout(toastTimer);
-  toastTimer = setTimeout(() => { el.classList.remove('show'); }, 3200);
+// ── Jobs Storage & R2 Sync ──
+function getJobs() {
+  try { return JSON.parse(localStorage.getItem(LS_JOBS) || '[]').map(j => ({ ...j, status: normStatus(j.status) })); }
+  catch { return []; }
 }
-
-function showToast(elId, msg, kind) {
-  const el = document.getElementById(elId);
-  if (!el) { toast(msg, kind === 'err'); return; }
-  el.textContent = msg;
-  el.className = 'sb-toast show ' + (kind || 'info');
-  if (kind === 'ok' || kind === 'info') setTimeout(() => { el.classList.remove('show'); }, 4000);
-}
-
-function parseDurationSec(dur) {
-  if (!dur) return 0;
-  const parts = String(dur).split(':').map(Number);
-  if (parts.some(isNaN)) return 0;
-  if (parts.length === 3) return parts[0]*3600 + parts[1]*60 + parts[2];
-  if (parts.length === 2) return parts[0]*60 + parts[1];
-  return parts[0] || 0;
-}
-
-function fmtCount(n) {
-  const num = Number(n) || 0;
-  if (num >= 100000000) return (num / 100000000).toFixed(1).replace(/\.0$/, '') + ' 亿次';
-  if (num >= 10000) return (num / 10000).toFixed(1).replace(/\.0$/, '') + ' 万次';
-  return num + ' 次';
-}
-function fmtDanmaku(n) {
-  const num = Number(n) || 0;
-  if (num >= 10000) return (num / 10000).toFixed(1).replace(/\.0$/, '') + ' 万弹幕';
-  return num + ' 弹幕';
-}
-function fmtRelativeTime(unixSec) {
-  if (!unixSec) return '';
-  const diff = Math.max(0, Math.floor(Date.now() / 1000) - Number(unixSec));
-  if (diff < 3600) return Math.max(1, Math.floor(diff / 60)) + '分钟前';
-  if (diff < 86400) return Math.floor(diff / 3600) + '小时前';
-  const days = Math.floor(diff / 86400);
-  if (days < 7) return days + '天前';
-  if (days < 30) return Math.floor(days / 7) + '个星期前';
-  if (days < 365) return Math.floor(days / 30) + '个月前';
-  return Math.floor(days / 365) + '年前';
-}
-function fmtShortDate(iso) {
-  if (!iso) return '';
-  const d = new Date(iso);
-  if (isNaN(d.getTime())) return '';
-  const p = n => String(n).padStart(2, '0');
-  return d.getFullYear() + '/' + p(d.getMonth()+1) + '/' + p(d.getDate()) + ' ' + p(d.getHours()) + ':' + p(d.getMinutes());
-}
-
-// ── Rock-Solid Spring Sliding Pill Engine (ResizeObserver + getBoundingClientRect) ──
-const SLIDER_IDS = ['sideSwitcher', 'historyFilterTabs', 'segTabs', 'monitorTabs'];
-
-function moveSlider(containerId, instant) {
-  const box = document.getElementById(containerId);
-  if (!box) return;
-  const slider = box.querySelector('.seg-slider');
-  const active = box.querySelector('.active');
-  if (!slider || !active) return;
-  const boxRect = box.getBoundingClientRect();
-  const actRect = active.getBoundingClientRect();
-  if (actRect.width === 0 || boxRect.width === 0) return;
-
-  const borderLeft = parseFloat(getComputedStyle(box).borderLeftWidth) || 0;
-  const x = Math.round((actRect.left - boxRect.left - borderLeft) * 10) / 10;
-  const w = Math.round(actRect.width * 10) / 10;
-
-  if (instant || !slider.dataset.ready) {
-    slider.style.transition = 'none';
-    slider.style.width = w + 'px';
-    slider.style.transform = 'translateX(' + x + 'px)';
-    void slider.offsetWidth;
-    slider.style.transition = '';
-    slider.dataset.ready = '1';
-  } else {
-    box._lastAnimAt = Date.now();
-    slider.style.width = w + 'px';
-    slider.style.transform = 'translateX(' + x + 'px)';
+function saveJobs(jobs, skipSync) {
+  localStorage.setItem(LS_JOBS, JSON.stringify(jobs));
+  updateNavBadges();
+  renderRailFolders();
+  renderRecentStrip();
+  if (currentRoute === 'history') renderHistoryPage();
+  if (currentRoute === 'favorites') renderFavoritesPage();
+  if (currentRoute === 'watch-later') renderWatchLaterPage();
+  if (currentRoute === 'folder' && activeFolderId) renderFolderSummaries(activeFolderId);
+  if (!skipSync && authUser) {
+    apiFetch('/api/history', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ jobs: jobs.slice(0, 100) }) }).catch(() => {});
   }
 }
 
-function updateAllSliders(instant) {
-  SLIDER_IDS.forEach(id => moveSlider(id, instant));
+async function syncFromR2() {
+  try {
+    const r = await apiFetch('/api/history');
+    if (!r.ok) return;
+    const remote = await r.json();
+    if (!Array.isArray(remote)) return;
+    const local = getJobs();
+    const map = new Map();
+    for (const j of remote) if (j && j.id) map.set(j.id, { ...j, status: normStatus(j.status) });
+    for (const j of local) {
+      if (!j || !j.id) continue;
+      const ex = map.get(j.id);
+      if (!ex) map.set(j.id, j);
+      else map.set(j.id, { ...ex, ...j, summary: ex.summary || j.summary, transcript: ex.transcript || j.transcript, starred: Boolean(j.starred || ex.starred) });
+    }
+    const merged = Array.from(map.values()).sort((a, b) => new Date(b.created_at || 0) - new Date(a.created_at || 0));
+    saveJobs(merged, true);
+    if (!selectedJobId && merged.length > 0) selectJob(merged[0].id, false);
+    else if (selectedJobId) {
+      const cur = merged.find(j => j.id === selectedJobId);
+      if (cur) renderDetail(cur);
+    }
+    merged.forEach(j => { if (normStatus(j.status) === 'pending') startPolling(j.id); });
+  } catch {}
 }
 
-function initSliderObservers() {
-  if (typeof ResizeObserver === 'undefined') return;
-  const ro = new ResizeObserver(entries => {
-    entries.forEach(e => {
-      const box = e.target;
-      if (!box || !box.id) return;
-      const slider = box.querySelector('.seg-slider');
-      const nowW = Math.round(e.contentRect ? e.contentRect.width : box.getBoundingClientRect().width);
-      if (slider && slider.dataset.ready && Date.now() - (box._lastAnimAt || 0) < 420) return;
-      if (slider && slider.dataset.ready && box._lastBoxW === nowW) return;
-      box._lastBoxW = nowW;
-      moveSlider(box.id, true);
-    });
-  });
-  SLIDER_IDS.forEach(id => {
-    const el = document.getElementById(id);
-    if (el) ro.observe(el);
-  });
-}
+// ── Navigation & Keep-Alive Hash Router (Zero Flicker) ──
+const ROUTE_TITLES = {
+  'summary': '摘要工作台',
+  'monitor': '监控 UP 主',
+  'watch-later': '稍后再看',
+  'favorites': '我的收藏',
+  'history': '历史记录',
+  'folder': '标签文件夹',
+};
 
-function playAnim(el) {
-  if (!el) return;
-  el.classList.remove('anim-in');
-  void el.offsetWidth;
-  el.classList.add('anim-in');
-}
-
-// ── Custom Card-Style Select ──
-function closeAllCustomSelects(exceptWrap) {
-  document.querySelectorAll('.c-select.open').forEach(w => { if (w !== exceptWrap) w.classList.remove('open', 'drop-up'); });
-}
-function syncCustomSelect(sel) {
-  if (typeof sel === 'string') sel = document.getElementById(sel);
-  if (!sel || !sel._csWrap) return;
-  const wrap = sel._csWrap;
-  const opt = sel.options[sel.selectedIndex] || sel.options[0];
-  wrap.querySelector('.c-select-label').textContent = opt ? opt.textContent : '';
-  wrap.querySelectorAll('.c-select-opt').forEach(btn => btn.classList.toggle('selected', btn.dataset.val === sel.value));
-}
-function syncAllCustomSelects() { document.querySelectorAll('select.c-select-native').forEach(syncCustomSelect); }
-function initCustomSelects() {
-  document.querySelectorAll('select.ctrl').forEach(sel => {
-    if (sel._csWrap) return;
-    const wrap = document.createElement('div');
-    wrap.className = 'c-select';
-    sel.parentNode.insertBefore(wrap, sel);
-    sel.classList.add('c-select-native');
-    wrap.appendChild(sel);
-
-    const btn = document.createElement('button');
-    btn.type = 'button';
-    btn.className = 'c-select-btn';
-    btn.innerHTML = '<span class="c-select-label"></span>' + SVG_CHEV;
-
-    const menu = document.createElement('div');
-    menu.className = 'c-select-menu';
-    Array.from(sel.options).forEach(o => {
-      const item = document.createElement('button');
-      item.type = 'button';
-      item.className = 'c-select-opt';
-      item.dataset.val = o.value;
-      item.innerHTML = '<span>' + esc(o.textContent) + '</span>' + SVG_CHK;
-      item.addEventListener('click', (e) => {
-        e.stopPropagation();
-        sel.value = o.value;
-        syncCustomSelect(sel);
-        wrap.classList.remove('open', 'drop-up');
-        sel.dispatchEvent(new Event('change', { bubbles: true }));
-      });
-      menu.appendChild(item);
-    });
-    btn.addEventListener('click', (e) => {
-      e.stopPropagation();
-      const willOpen = !wrap.classList.contains('open');
-      closeAllCustomSelects(wrap);
-      if (willOpen) {
-        const spaceBelow = window.innerHeight - btn.getBoundingClientRect().bottom;
-        wrap.classList.toggle('drop-up', spaceBelow < 210);
-        wrap.classList.add('open');
-      } else wrap.classList.remove('open', 'drop-up');
-    });
-    wrap.appendChild(btn);
-    wrap.appendChild(menu);
-    sel._csWrap = wrap;
-    syncCustomSelect(sel);
-  });
-}
-document.addEventListener('click', () => closeAllCustomSelects(null));
-document.addEventListener('keydown', (e) => { if (e.key === 'Escape') closeAllCustomSelects(null); });
-
-// ── Theme & Font Size ──
-function initTheme() {
-  const saved = localStorage.getItem(LS_THEME) || 'light';
-  document.documentElement.setAttribute('data-theme', saved);
-  document.getElementById('themeBtn').innerHTML = saved === 'dark' ? SVG_SUN : SVG_MOON;
-}
-function toggleTheme() {
-  const next = (document.documentElement.getAttribute('data-theme') || 'light') === 'dark' ? 'light' : 'dark';
-  document.documentElement.setAttribute('data-theme', next);
-  localStorage.setItem(LS_THEME, next);
-  document.getElementById('themeBtn').innerHTML = next === 'dark' ? SVG_SUN : SVG_MOON;
-}
-function adjustReaderFont(delta) {
-  readerFontPx = Math.max(12, Math.min(18, readerFontPx + delta));
-  document.documentElement.style.setProperty('--reader-fs', readerFontPx + 'px');
-}
-
-// ── Divider Drag ──
-(function initDivider() {
-  const div = document.getElementById('divider');
-  let dragging = false;
-  div.addEventListener('mousedown', () => { dragging = true; div.classList.add('dragging'); document.body.style.userSelect = 'none'; });
-  window.addEventListener('mousemove', (e) => {
-    if (!dragging) return;
-    document.getElementById('appRoot').style.setProperty('--sidebar-w', Math.max(268, Math.min(480, e.clientX)) + 'px');
-  });
-  window.addEventListener('mouseup', () => {
-    if (!dragging) return;
-    dragging = false; div.classList.remove('dragging'); document.body.style.userSelect = '';
-  });
-})();
-
-function toggleAdv() {
-  const box = document.getElementById('advBox');
-  const hidden = box.classList.toggle('hidden');
-  document.getElementById('advToggleBtn').classList.toggle('open', !hidden);
-}
-function onTplPreset() {
-  document.getElementById('customTplWrap').classList.toggle('hidden', document.getElementById('tplPreset').value !== 'custom');
-}
-
-// ── Zero-Flicker Page Switcher ──
-async function switchPage(page) {
-  if (page === 'monitor' && !authUser) {
-    openModal('loginModal');
-    setTimeout(() => document.getElementById('loginPass').focus(), 60);
-    return;
-  }
-  if (page === currentPage) return;
+function navigate(route, param) {
   closeTagPopover();
-  const scrollEl = document.getElementById('contentScroll');
-  if (scrollEl) pageScrollPos[currentPage] = scrollEl.scrollTop;
-
-  currentPage = page;
-  document.querySelectorAll('#sideSwitcher .side-sw-btn').forEach(b => b.classList.toggle('active', b.dataset.page === page));
-  moveSlider('sideSwitcher');
-
-  const sbWs = document.getElementById('sidebarWorkspace');
-  const sbMon = document.getElementById('sidebarMonitor');
-  const pgWs = document.getElementById('pageWorkspace');
-  const pgMon = document.getElementById('pageMonitor');
-  sbWs.classList.toggle('hidden', page !== 'workspace');
-  sbMon.classList.toggle('hidden', page !== 'monitor');
-  pgWs.classList.toggle('hidden', page !== 'workspace');
-  pgMon.classList.toggle('hidden', page !== 'monitor');
-  document.getElementById('contentInner').classList.toggle('wide-feed', page === 'monitor');
-
-  if (scrollEl) scrollEl.scrollTop = pageScrollPos[page] || 0;
-
-  if (page === 'workspace') {
-    document.getElementById('topbarTitle').textContent = selectedJobId ? '单条视频摘要' : '视频知识库概览';
-    document.getElementById('topbarSub').textContent = '';
-    requestAnimationFrame(() => { moveSlider('segTabs', true); moveSlider('historyFilterTabs', true); });
+  toggleMobileNav(false);
+  const newHash = param ? ('#/' + route + '/' + encodeURIComponent(param)) : ('#/' + route);
+  if (window.location.hash !== newHash) {
+    window.location.hash = newHash;
   } else {
-    document.getElementById('topbarTitle').textContent = 'UP主监控动态';
-    await loadMonitorPage();
+    activateRoute(route, param);
   }
+}
+
+function handleHashRoute(isInit) {
+  const raw = (window.location.hash || '').replace(/^#\/?/, '');
+  if (!raw) { activateRoute('summary', selectedJobId || '', isInit); return; }
+  const parts = raw.split('/');
+  const r = parts[0];
+  const param = parts[1] ? decodeURIComponent(parts[1]) : '';
+  if (['summary', 'monitor', 'watch-later', 'favorites', 'history', 'folder'].includes(r)) {
+    activateRoute(r, param, isInit);
+  } else {
+    activateRoute('summary', '', isInit);
+  }
+}
+window.addEventListener('hashchange', () => { if (authUser) handleHashRoute(false); });
+
+function getRouteScrollEl(route) {
+  if (route === 'monitor') return document.getElementById('monScrollArea');
+  return document.getElementById('view-' + route);
+}
+
+async function activateRoute(route, param, isInit) {
+  const prevEl = getRouteScrollEl(currentRoute);
+  if (prevEl) routeScrollPos[currentRoute] = prevEl.scrollTop;
+
+  currentRoute = route;
+  if (route === 'folder') activeFolderId = param || ((libraryState.folders[0] && libraryState.folders[0].id) || '');
+
+  // Keep-Alive DOM visibility toggle (ZERO DOM rebuild, ZERO opacity flash!)
+  ['summary', 'monitor', 'watch-later', 'favorites', 'history', 'folder'].forEach(r => {
+    const el = document.getElementById('view-' + r);
+    if (el) el.classList.toggle('hidden', r !== route);
+  });
+
+  // Update Rail active states + vertical spring slider
+  document.querySelectorAll('#railNav .rail-item').forEach(b => b.classList.toggle('active', b.dataset.route === route));
+  document.querySelectorAll('#railFolderList .folder-nav-item').forEach(b => b.classList.toggle('active', route === 'folder' && b.dataset.fid === activeFolderId));
+  moveRailNavSlider(Boolean(isInit));
+
+  document.getElementById('topbarTitle').textContent = ROUTE_TITLES[route] || '摘要工作台';
+  document.getElementById('topbarSub').textContent = '';
+
+  const nextEl = getRouteScrollEl(route);
+  if (nextEl && routeScrollPos[route] !== undefined) nextEl.scrollTop = routeScrollPos[route];
+
+  if (route === 'summary') {
+    if (param) {
+      const found = getJobs().find(j => j.id === param || j.bvid === param);
+      if (found) selectedJobId = found.id;
+    } else if (!selectedJobId) {
+      const jobs = getJobs();
+      if (jobs.length) selectedJobId = jobs[0].id;
+    }
+    renderRecentStrip();
+    const curJob = getJobs().find(j => j.id === selectedJobId);
+    if (curJob) {
+      document.getElementById('summaryEmptyState').classList.add('hidden');
+      document.getElementById('detailView').classList.remove('hidden');
+      renderDetail(curJob);
+    } else {
+      document.getElementById('summaryEmptyState').classList.remove('hidden');
+      document.getElementById('detailView').classList.add('hidden');
+    }
+    requestAnimationFrame(() => moveSlider('segTabs', true));
+  } else if (route === 'monitor') {
+    await loadMonitorPage();
+  } else if (route === 'watch-later') {
+    renderWatchLaterPage();
+    requestAnimationFrame(() => moveSlider('wlFilterTabs', true));
+  } else if (route === 'favorites') {
+    renderFavoritesPage();
+    requestAnimationFrame(() => moveSlider('favTypeTabs', true));
+  } else if (route === 'history') {
+    renderHistoryPage();
+    requestAnimationFrame(() => moveSlider('histStatusTabs', true));
+  } else if (route === 'folder') {
+    renderFolderPage(activeFolderId, true);
+    requestAnimationFrame(() => moveSlider('folderViewTabs', true));
+  }
+}
+
+function updateNavBadges() {
+  const jobs = getJobs();
+  const ups = monitorConfig.up_list || [];
+  const wlCnt = (libraryState.watch_later || []).length;
+  const favBvids = new Set((libraryState.favorites || []).map(v => v.bvid));
+  jobs.forEach(j => { if (j.starred && j.bvid) favBvids.add(j.bvid); });
+
+  const setText = (id, n) => { const el = document.getElementById(id); if (el) el.textContent = String(n); };
+  setText('navCntMonitor', ups.length);
+  setText('navCntWl', wlCnt);
+  setText('navCntFav', favBvids.size);
+  setText('navCntHist', jobs.length);
+}
+
+function renderRailFolders() {
+  const box = document.getElementById('railFolderList');
+  if (!box) return;
+  const jobs = getJobs();
+  const ups = monitorConfig.up_list || [];
+  const folders = libraryState.folders || [];
+  box.innerHTML = folders.map(f => {
+    const jCnt = jobs.filter(j => getJobTagIds(j).includes(f.id)).length;
+    const uCnt = ups.filter(u => getUpTagIds(u.mid).includes(f.id)).length;
+    const total = jCnt + uCnt;
+    const active = currentRoute === 'folder' && activeFolderId === f.id ? ' active' : '';
+    return '<button class="folder-nav-item' + active + '" data-fid="' + esc(f.id) + '" data-tip="' + esc(f.name) + (total ? (' (' + total + ')') : '') + '" onclick="navigate(\'folder\',\'' + esc(f.id) + '\')">' +
+      '<span class="folder-dot" style="background:' + esc(f.color) + '"></span>' +
+      '<span class="rail-label">' + esc(f.name) + '</span>' +
+      (total ? '<span class="rail-badge">' + total + '</span>' : '') +
+    '</button>';
+  }).join('');
 }
 
 // ── User Preferences ──
@@ -3028,106 +3635,53 @@ function saveUserPrefs() {
   localStorage.setItem(LS_PREFS, JSON.stringify(prefs));
   applyUserPrefsToUi();
   applyViewMode();
-  moveSlider('segTabs');
   closeModal('settingsModal');
   toast('偏好设置已保存');
 }
-function resetUserPrefs() {
-  localStorage.removeItem(LS_PREFS);
-  applyUserPrefsToUi();
-  openSettingsModal();
-  toast('已恢复默认设置');
-}
-function clearAllFeedCacheFromSettings() {
-  clearFeedCache(null);
-  prefetchDone = false;
-  toast('已清空 UP 主动态本地缓存');
-}
+function clearLocalCaches() { clearFeedCache(); toast('已清空 UP 主动态封面缓存'); }
 
-// ── Jobs Storage & Dashboard ──
-function getJobs() {
-  try {
-    const raw = JSON.parse(localStorage.getItem(LS_JOBS) || localStorage.getItem('b2t_jobs_v2') || '[]');
-    return Array.isArray(raw) ? raw.map(j => ({ ...j, status: normStatus(j.status) })) : [];
-  } catch { return []; }
+// ── Submit Modal (Single & Batch, Ctrl+K) ──
+function openSubmitModal(tab) {
+  openModal('submitModal');
+  switchSubmitTab(tab || 'single', true);
+  setTimeout(() => {
+    const el = document.getElementById(submitModalTab === 'batch' ? 'batchUrlsInput' : 'modalVideoUrl');
+    if (el) el.focus();
+  }, 60);
 }
-function saveJobs(jobs, syncR2 = true) {
-  const normalized = jobs.map(j => ({ ...j, status: normStatus(j.status) }));
-  localStorage.setItem(LS_JOBS, JSON.stringify(normalized));
-  renderList();
-  renderDashboard();
-  if (syncR2) {
-    fetch('/api/history', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ jobs: normalized.slice(0, 100) }),
-    }).catch(() => {});
-  }
+function switchSubmitTab(tab, instant) {
+  submitModalTab = tab;
+  document.querySelectorAll('#submitModeTabs .seg-tab').forEach(b => b.classList.toggle('active', b.dataset.sm === tab));
+  requestAnimationFrame(() => moveSlider('submitModeTabs', Boolean(instant)));
+  document.getElementById('submitSinglePane').classList.toggle('hidden', tab !== 'single');
+  document.getElementById('submitBatchPane').classList.toggle('hidden', tab !== 'batch');
+  document.getElementById('modalSubmitBtn').textContent = tab === 'batch' ? '加入处理队列' : '开始总结';
 }
-
-async function syncFromR2() {
-  try {
-    const r = await fetch('/api/history');
-    if (!r.ok) return;
-    const remote = await r.json();
-    if (!Array.isArray(remote) || remote.length === 0) return;
-    const local = getJobs();
-    const map = new Map();
-    remote.forEach(j => { if (j && j.id) map.set(j.id, { ...j, status: normStatus(j.status) }); });
-    local.forEach(j => {
-      if (j && j.id) {
-        const prev = map.get(j.id);
-        if (!prev || (j.status === 'completed' && prev.status !== 'completed')) map.set(j.id, j);
-        else if (prev && j.starred) prev.starred = true;
-      }
-    });
-    const merged = Array.from(map.values()).sort((a, b) => new Date(b.created_at || 0) - new Date(a.created_at || 0));
-    localStorage.setItem(LS_JOBS, JSON.stringify(merged));
-    renderList();
-    renderDashboard();
-    if (!selectedJobId && merged.length > 0) selectJob(merged[0].id);
-  } catch {}
+function onTplPreset() {
+  document.getElementById('customTplWrap').classList.toggle('hidden', document.getElementById('tplPreset').value !== 'custom');
 }
-
-function showDashboard() {
-  if (currentPage !== 'workspace') switchPage('workspace');
-  selectedJobId = null;
-  document.getElementById('topbarTitle').textContent = '视频知识库概览';
-  document.getElementById('detailView').classList.add('hidden');
-  document.getElementById('stepperBar').classList.add('hidden');
-  document.getElementById('dashboardView').classList.remove('hidden');
-  playAnim(document.getElementById('dashboardView'));
-  renderList();
-  renderDashboard();
+function handleModalSubmit() {
+  if (submitModalTab === 'batch') submitBatchVideos();
+  else submitModalSingle();
 }
-
-function renderDashboard() {
-  const jobs = getJobs();
-  const completed = jobs.filter(j => normStatus(j.status) === 'completed');
-  const starred = jobs.filter(j => j.starred);
-  let totalSec = 0;
-  completed.forEach(j => { totalSec += parseDurationSec(j.duration) || 480; });
-  const savedMin = Math.max(0, Math.round(totalSec / 60 * 0.85));
-  const totalChars = completed.reduce((acc, j) => acc + (j.transcript || '').length, 0);
-
-  document.getElementById('kpiGrid').innerHTML =
-    '<div class="kpi-card"><div class="kpi-label">已归档摘要</div><div class="kpi-val">' + completed.length + '</div><div class="kpi-sub">全部记录 ' + jobs.length + ' 条</div></div>' +
-    '<div class="kpi-card"><div class="kpi-label">累计节省时长</div><div class="kpi-val">' + savedMin + ' 分钟</div><div class="kpi-sub">约 ' + (savedMin / 60).toFixed(1) + ' 小时精读</div></div>' +
-    '<div class="kpi-card"><div class="kpi-label">已收藏精华</div><div class="kpi-val">' + starred.length + '</div><div class="kpi-sub">一键回看重点视频</div></div>' +
-    '<div class="kpi-card"><div class="kpi-label">累计免费转录</div><div class="kpi-val">' + (totalChars >= 10000 ? (totalChars / 10000).toFixed(1) + ' 万字' : totalChars + ' 字') + '</div><div class="kpi-sub">100% 免费模型驱动</div></div>';
-
-  const recent = completed.slice(0, 4);
-  document.getElementById('recentGrid').innerHTML = recent.length
-    ? recent.map(j => '<div class="recent-card" onclick="selectJob(\'' + esc(j.id) + '\')"><h4>' + esc(j.title || j.bvid) + '</h4><p>' + esc([j.owner, j.duration, j.bvid].filter(Boolean).join(' · ')) + '</p></div>').join('')
-    : '<div class="reader-card" style="grid-column:1/-1;text-align:center;color:var(--muted)">在左侧粘贴任意 B 站视频链接，开启你的第一篇 AI 摘要</div>';
-}
-
-// ── Submit Single & Batch ──
-async function submitVideo(overrideUrl, meta) {
-  const input = document.getElementById('videoUrl');
-  const raw = (overrideUrl !== undefined ? String(overrideUrl) : input.value).trim();
+async function submitModalSingle() {
+  const inp = document.getElementById('modalVideoUrl');
+  const raw = inp.value.trim();
   if (!raw) { toast('请输入 B 站视频链接或 BV 号', true); return; }
+  const res = await submitVideo(raw);
+  if (res) { inp.value = ''; closeModal('submitModal'); }
+}
+async function submitInlineVideo() {
+  const inp = document.getElementById('inlineVideoUrl');
+  const raw = inp.value.trim();
+  if (!raw) { toast('请输入 B 站视频链接或 BV 号', true); return; }
+  const res = await submitVideo(raw);
+  if (res) inp.value = '';
+}
 
+async function submitVideo(overrideUrl, meta, stayOnPage) {
+  const raw = String(overrideUrl || '').trim();
+  if (!raw) { toast('请输入 B 站视频链接或 BV 号', true); return null; }
   const prefs = getUserPrefs();
   const preset = document.getElementById('tplPreset').value;
   let tpl = '';
@@ -3138,9 +3692,8 @@ async function submitVideo(overrideUrl, meta) {
   const email_style = document.getElementById('singleEmailStyle').value || prefs.default_email_style || 'editorial';
   const send_email = prefs.send_email_on_single !== false;
 
-  const btn = document.getElementById('submitBtn');
-  btn.disabled = true;
-  btn.textContent = '解析中...';
+  const btn = document.getElementById('modalSubmitBtn');
+  if (btn) { btn.disabled = true; btn.textContent = '解析中...'; }
 
   try {
     const reqBody = { url: raw, summary_template: tpl, email, email_style, send_email };
@@ -3148,7 +3701,7 @@ async function submitVideo(overrideUrl, meta) {
     if (meta && meta.owner) reqBody.owner = meta.owner;
     if (meta && meta.duration) reqBody.duration = meta.duration;
 
-    const resp = await fetch('/api/submit', {
+    const resp = await apiFetch('/api/submit', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(reqBody),
@@ -3167,43 +3720,33 @@ async function submitVideo(overrideUrl, meta) {
     };
     const jobs = [newJob, ...getJobs().filter(j => j.id !== newJob.id)];
     saveJobs(jobs);
-    if (overrideUrl === undefined) input.value = '';
-    toast(send_email ? '已加入队列（完成后同步发邮件）' : '已加入队列（已关闭单条邮件通知）');
-    if (currentPage !== 'workspace') await switchPage('workspace');
-    selectJob(newJob.id);
+    if (!stayOnPage) {
+      toast(send_email ? '已加入队列（完成后同步发邮件）' : '已加入队列（已关闭单条邮件通知）');
+      selectJob(newJob.id, true);
+    }
     startPolling(newJob.id);
     return newJob;
   } catch (e) {
     toast('网络错误: ' + e.message, true);
     return null;
   } finally {
-    btn.disabled = false;
-    btn.textContent = '开始总结';
+    if (btn) { btn.disabled = false; btn.textContent = submitModalTab === 'batch' ? '加入处理队列' : '开始总结'; }
   }
-}
-
-function submitVideoFromFeed(idx) {
-  const v = currentFeedVideos[idx];
-  if (!v) return;
-  submitVideo(v.bvid, { title: v.title || '', owner: v.author || '', duration: v.duration || '' });
 }
 
 async function submitBatchVideos() {
   const lines = (document.getElementById('batchUrlsInput').value || '').split(/\r?\n/).map(s => s.trim()).filter(Boolean).slice(0, 5);
   if (!lines.length) { toast('请至少输入一条视频链接或 BV 号', true); return; }
-  const btn = document.getElementById('batchSubmitBtn');
-  btn.disabled = true;
-  btn.textContent = '提交中...';
   let okCount = 0;
+  let lastJob = null;
   for (const line of lines) {
-    const res = await submitVideo(line);
-    if (res) okCount++;
+    const res = await submitVideo(line, null, true);
+    if (res) { okCount++; lastJob = res; }
   }
-  btn.disabled = false;
-  btn.textContent = '加入处理队列';
   document.getElementById('batchUrlsInput').value = '';
-  closeModal('batchModal');
+  closeModal('submitModal');
   toast('已成功提交 ' + okCount + ' 条视频至后台队列');
+  if (lastJob) selectJob(lastJob.id, true);
 }
 
 function startPolling(jobId) {
@@ -3213,7 +3756,7 @@ function startPolling(jobId) {
     ticks++;
     if (ticks > 90) { clearInterval(pollTimers[jobId]); delete pollTimers[jobId]; return; }
     try {
-      const r = await fetch('/api/jobs/' + encodeURIComponent(jobId));
+      const r = await apiFetch('/api/jobs/' + encodeURIComponent(jobId));
       if (!r.ok) return;
       const data = await r.json();
       data.status = normStatus(data.status);
@@ -3224,81 +3767,26 @@ function startPolling(jobId) {
         jobs[idx] = { ...jobs[idx], ...data, starred: keepStar };
         const finished = data.status === 'completed' || data.status === 'failed';
         saveJobs(jobs, finished);
-        if (selectedJobId === jobId) renderDetail(jobs[idx]);
+        if (selectedJobId === jobId && currentRoute === 'summary') renderDetail(jobs[idx]);
         if (finished) { clearInterval(pollTimers[jobId]); delete pollTimers[jobId]; }
       }
     } catch {}
   }, 4000);
 }
 
-// ── Tag Folders, Watch Later & Favorites Logic ──
-function setWsFolder(fid) {
-  selectedWsFolder = selectedWsFolder === fid ? '' : fid;
-  renderWorkspaceFolderBar();
-  renderList();
-}
-
-function renderWorkspaceFolderBar() {
-  const bar = document.getElementById('wsFolderBar');
-  if (!bar) return;
-  const jobs = getJobs();
-  const folders = libraryState.folders || [];
-  let html = '<button class="folder-chip' + (!selectedWsFolder ? ' active' : '') + '" onclick="setWsFolder(\'\')">全部标签</button>';
-  folders.forEach(f => {
-    const cnt = jobs.filter(j => getJobTagIds(j).includes(f.id)).length;
-    const act = selectedWsFolder === f.id ? ' active' : '';
-    html += '<button class="folder-chip' + act + '" onclick="setWsFolder(\'' + esc(f.id) + '\')">' +
-      '<span class="folder-dot" style="background:' + esc(f.color) + '"></span>' +
-      '<span>' + esc(f.name) + '</span>' +
-      (cnt ? '<span class="folder-cnt">' + cnt + '</span>' : '') +
-    '</button>';
-  });
-  html += '<button class="folder-add-btn" onclick="openTagManagerModal()" title="管理标签文件夹">+ 标签</button>';
-  bar.innerHTML = html;
-}
-
-function renderDetailTagBar(job) {
-  const row = document.getElementById('dTagRow');
-  if (!row || !job) return;
-  const key = jobTagKey(job);
-  const tagIds = getJobTagIds(job);
-  let html = tagIds.map(id => {
-    const f = getFolderById(id);
-    if (!f) return '';
-    return '<span class="tag-pill"><span class="folder-dot" style="background:' + esc(f.color) + '"></span><span>' + esc(f.name) + '</span><button type="button" title="移除标签" onclick="toggleJobTag(\'' + esc(key) + '\',\'' + esc(f.id) + '\')">&times;</button></span>';
-  }).join('');
-  html += '<button type="button" class="tag-add-btn" onclick="openTagPopover(this,\'job\',\'' + esc(key) + '\')">' + SVG_TAG_SM + '<span>添加标签</span></button>';
-  row.innerHTML = html;
-}
-
-function updateWatchLaterBtn(job) {
-  const btn = document.getElementById('wlBtn');
-  const txt = document.getElementById('wlBtnText');
-  if (!btn || !txt) return;
-  const on = Boolean(job && isWatchLater(job.bvid));
-  btn.classList.toggle('active', on);
-  txt.textContent = on ? '已加稍后再看' : '稍后再看';
-}
-
+// ── Tag Folders, Watch Later & Favorites Mutations ──
 function toggleWatchLaterVideo(videoObj) {
   if (!videoObj || !videoObj.bvid) return false;
   const list = libraryState.watch_later || [];
   const idx = list.findIndex(v => v.bvid === videoObj.bvid);
   let added = false;
-  if (idx >= 0) {
-    list.splice(idx, 1);
-  } else {
+  if (idx >= 0) list.splice(idx, 1);
+  else {
     list.unshift({
-      bvid: videoObj.bvid,
-      job_id: videoObj.job_id || '',
-      mid: Number(videoObj.mid) || 0,
-      title: videoObj.title || videoObj.bvid,
-      author: videoObj.author || videoObj.owner || '',
-      face: videoObj.face || '',
-      pic: videoObj.pic || '',
-      duration: videoObj.duration || '',
-      play: Number(videoObj.play) || 0,
-      danmaku: Number(videoObj.danmaku) || 0,
+      bvid: videoObj.bvid, job_id: videoObj.job_id || '', mid: Number(videoObj.mid) || 0,
+      title: videoObj.title || videoObj.bvid, author: videoObj.author || videoObj.owner || '',
+      face: videoObj.face || '', pic: videoObj.pic || '', duration: videoObj.duration || '',
+      play: Number(videoObj.play) || 0, danmaku: Number(videoObj.danmaku) || 0,
       created: Number(videoObj.created) || 0,
       url: videoObj.url || ('https://www.bilibili.com/video/' + videoObj.bvid),
       added_at: new Date().toISOString(),
@@ -3307,16 +3795,8 @@ function toggleWatchLaterVideo(videoObj) {
   }
   libraryState.watch_later = list;
   saveLibraryLocalAndCloud();
-  renderList();
-  if (selectedJobId) {
-    const cur = getJobs().find(j => j.id === selectedJobId);
-    if (cur && cur.bvid === videoObj.bvid) updateWatchLaterBtn(cur);
-  }
-  if (currentPage === 'monitor') {
-    renderMonitorFolderBar();
-    if (selectedUpMid === '__watchlater') renderSavedGrid('watchlater');
-    else syncFeedCardQuickStates(videoObj.bvid);
-  }
+  syncFeedCardQuickStates(videoObj.bvid);
+  refreshAllLibraryViews();
   toast(added ? '已加入「稍后再看」' : '已移出「稍后再看」');
   return added;
 }
@@ -3335,16 +3815,11 @@ function toggleFavoriteVideo(videoObj) {
     if (jobIdx >= 0) { jobs[jobIdx].starred = false; saveJobs(jobs); }
   } else {
     list.unshift({
-      bvid: videoObj.bvid,
-      job_id: (jobIdx >= 0 ? jobs[jobIdx].id : '') || videoObj.job_id || '',
-      mid: Number(videoObj.mid) || 0,
-      title: videoObj.title || videoObj.bvid,
-      author: videoObj.author || videoObj.owner || '',
-      face: videoObj.face || '',
-      pic: videoObj.pic || '',
-      duration: videoObj.duration || '',
-      play: Number(videoObj.play) || 0,
-      danmaku: Number(videoObj.danmaku) || 0,
+      bvid: videoObj.bvid, job_id: (jobIdx >= 0 ? jobs[jobIdx].id : '') || videoObj.job_id || '',
+      mid: Number(videoObj.mid) || 0, title: videoObj.title || videoObj.bvid,
+      author: videoObj.author || videoObj.owner || '', face: videoObj.face || '',
+      pic: videoObj.pic || '', duration: videoObj.duration || '',
+      play: Number(videoObj.play) || 0, danmaku: Number(videoObj.danmaku) || 0,
       created: Number(videoObj.created) || 0,
       url: videoObj.url || ('https://www.bilibili.com/video/' + videoObj.bvid),
       added_at: new Date().toISOString(),
@@ -3354,25 +3829,31 @@ function toggleFavoriteVideo(videoObj) {
   }
   libraryState.favorites = list;
   saveLibraryLocalAndCloud();
-  renderList();
-  renderDashboard();
-  if (selectedJobId) {
-    const cur = getJobs().find(j => j.id === selectedJobId);
-    if (cur && cur.bvid === videoObj.bvid) updateStarBtn(cur);
-  }
-  if (currentPage === 'monitor') {
-    renderMonitorFolderBar();
-    if (selectedUpMid === '__favorites') renderSavedGrid('favorites');
-    else syncFeedCardQuickStates(videoObj.bvid);
-  }
-  toast(added ? '已加入「收藏」' : '已取消收藏');
+  syncFeedCardQuickStates(videoObj.bvid);
+  refreshAllLibraryViews();
+  toast(added ? '已加入「我的收藏」' : '已取消收藏');
   return added;
 }
 
 function toggleWatchLaterCurrent() {
   const job = getJobs().find(j => j.id === selectedJobId);
-  if (!job) return;
-  toggleWatchLaterVideo({ bvid: job.bvid, job_id: job.id, title: job.title, author: job.owner, duration: job.duration, url: job.video_url });
+  if (job) toggleWatchLaterVideo({ bvid: job.bvid, job_id: job.id, title: job.title, author: job.owner, duration: job.duration, url: job.video_url });
+}
+function toggleStarCurrent() {
+  const job = getJobs().find(j => j.id === selectedJobId);
+  if (job) toggleFavoriteVideo({ bvid: job.bvid, job_id: job.id, title: job.title, author: job.owner, duration: job.duration, url: job.video_url });
+}
+function updateStarBtn(job) {
+  const btn = document.getElementById('starBtn'), txt = document.getElementById('starBtnText');
+  const on = isJobFavorited(job);
+  if (btn) btn.classList.toggle('starred', on);
+  if (txt) txt.textContent = on ? '已收藏' : '收藏';
+}
+function updateWatchLaterBtn(job) {
+  const btn = document.getElementById('wlBtn'), txt = document.getElementById('wlBtnText');
+  const on = Boolean(job && isWatchLater(job.bvid));
+  if (btn) btn.classList.toggle('active', on);
+  if (txt) txt.textContent = on ? '已加稍后再看' : '稍后再看';
 }
 
 function toggleJobTag(jobKey, folderId) {
@@ -3382,13 +3863,9 @@ function toggleJobTag(jobKey, folderId) {
   if (cur.size) libraryState.job_tags[jobKey] = Array.from(cur);
   else delete libraryState.job_tags[jobKey];
   saveLibraryLocalAndCloud();
-  renderWorkspaceFolderBar();
-  renderList();
-  const job = getJobs().find(j => j.id === selectedJobId);
-  if (job && jobTagKey(job) === jobKey) renderDetailTagBar(job);
+  refreshAllLibraryViews();
   refreshOpenTagPopover();
 }
-
 function toggleUpTag(mid, folderId) {
   const k = String(mid || '');
   if (!k || !folderId) return;
@@ -3397,66 +3874,49 @@ function toggleUpTag(mid, folderId) {
   if (cur.size) libraryState.up_tags[k] = Array.from(cur);
   else delete libraryState.up_tags[k];
   saveLibraryLocalAndCloud();
-  renderMonitorFolderBar();
-  renderUpSidebar();
+  refreshAllLibraryViews();
   refreshOpenTagPopover();
 }
 
 let activeTagPopoverCtx = null;
-
 function closeTagPopover() {
   const pop = document.getElementById('tagPopover');
   if (pop) pop.classList.add('hidden');
   activeTagPopoverCtx = null;
 }
-
 function refreshOpenTagPopover() {
-  if (!activeTagPopoverCtx) return;
-  const { targetType, targetKey } = activeTagPopoverCtx;
-  renderTagPopoverBody(targetType, targetKey);
+  if (activeTagPopoverCtx) renderTagPopoverBody(activeTagPopoverCtx.targetType, activeTagPopoverCtx.targetKey);
 }
-
 function renderTagPopoverBody(targetType, targetKey) {
   const pop = document.getElementById('tagPopover');
   if (!pop) return;
   const folders = libraryState.folders || [];
   const chosen = new Set(targetType === 'up' ? getUpTagIds(targetKey) : (libraryState.job_tags[targetKey] || []));
   const fnName = targetType === 'up' ? 'toggleUpTag' : 'toggleJobTag';
-  let html = '<div class="tag-pop-head"><span>选择标签文件夹</span></div>';
+  let html = '<div class="tag-pop-head">选择标签文件夹</div>';
   html += folders.map(f => {
     const sel = chosen.has(f.id);
     return '<button type="button" class="tag-pop-item' + (sel ? ' selected' : '') + '" onclick="' + fnName + '(\'' + esc(targetKey) + '\',\'' + esc(f.id) + '\')">' +
       '<span class="tag-pop-left"><span class="folder-dot" style="background:' + esc(f.color) + '"></span><span>' + esc(f.name) + '</span></span>' +
-      (sel ? SVG_CHK : '') +
-    '</button>';
+      (sel ? SVG_CHK : '') + '</button>';
   }).join('');
-  html += '<div class="tag-pop-sep"></div>' +
-    '<button type="button" class="tag-pop-item" onclick="closeTagPopover();openTagManagerModal()">' +
-      '<span class="tag-pop-left" style="color:var(--brand-dark);font-weight:600">+ 新建或管理文件夹</span>' +
-    '</button>';
+  html += '<div class="tag-pop-sep"></div><button type="button" class="tag-pop-item" onclick="closeTagPopover();openTagManagerModal()"><span class="tag-pop-left" style="color:var(--brand-dark);font-weight:600">+ 新建或管理文件夹</span></button>';
   pop.innerHTML = html;
 }
-
 function openTagPopover(anchorEl, targetType, targetKey) {
   const pop = document.getElementById('tagPopover');
   if (!pop) return;
-  if (activeTagPopoverCtx && activeTagPopoverCtx.anchorEl === anchorEl && !pop.classList.contains('hidden')) {
-    closeTagPopover();
-    return;
-  }
+  if (activeTagPopoverCtx && activeTagPopoverCtx.anchorEl === anchorEl && !pop.classList.contains('hidden')) { closeTagPopover(); return; }
   activeTagPopoverCtx = { anchorEl, targetType, targetKey };
   renderTagPopoverBody(targetType, targetKey);
   pop.classList.remove('hidden');
   const rect = anchorEl.getBoundingClientRect();
   const popRect = pop.getBoundingClientRect();
-  let top = rect.bottom + 6;
-  let left = rect.left;
+  let top = rect.bottom + 6, left = rect.left;
   if (top + popRect.height > window.innerHeight - 12) top = Math.max(12, rect.top - popRect.height - 6);
   if (left + popRect.width > window.innerWidth - 12) left = Math.max(12, window.innerWidth - popRect.width - 12);
-  pop.style.top = top + 'px';
-  pop.style.left = left + 'px';
+  pop.style.top = top + 'px'; pop.style.left = left + 'px';
 }
-
 document.addEventListener('click', (e) => {
   const pop = document.getElementById('tagPopover');
   if (!pop || pop.classList.contains('hidden')) return;
@@ -3471,61 +3931,35 @@ function openTagManagerModal() {
   renderFolderManagerList();
   openModal('tagManagerModal');
 }
-
 function renderFolderColorSwatches() {
   const box = document.getElementById('folderColorSwatches');
   if (!box) return;
-  box.innerHTML = FOLDER_COLORS.map(c =>
-    '<button type="button" class="color-sw' + (selectedNewFolderColor === c ? ' active' : '') + '" style="background:' + c + '" onclick="pickFolderColor(\'' + c + '\')" aria-label="' + c + '"></button>'
-  ).join('');
+  box.innerHTML = FOLDER_COLORS.map(c => '<button type="button" class="color-sw' + (selectedNewFolderColor === c ? ' active' : '') + '" style="background:' + c + '" onclick="selectedNewFolderColor=\'' + c + '\';renderFolderColorSwatches()"></button>').join('');
 }
-
-function pickFolderColor(c) {
-  selectedNewFolderColor = c;
-  renderFolderColorSwatches();
-}
-
 function renderFolderManagerList() {
   const box = document.getElementById('folderMgrList');
   if (!box) return;
-  const jobs = getJobs();
-  const ups = monitorConfig.up_list || [];
-  const folders = libraryState.folders || [];
-  if (!folders.length) {
-    box.innerHTML = '<div style="text-align:center;color:var(--muted);padding:16px;font-size:12.5px">暂无标签文件夹，在上方新建一个吧</div>';
-    return;
-  }
+  const jobs = getJobs(), ups = monitorConfig.up_list || [], folders = libraryState.folders || [];
+  if (!folders.length) { box.innerHTML = '<div style="text-align:center;color:var(--muted);padding:16px;font-size:12.5px">暂无标签文件夹</div>'; return; }
   box.innerHTML = folders.map(f => {
     const jCnt = jobs.filter(j => getJobTagIds(j).includes(f.id)).length;
     const uCnt = ups.filter(u => getUpTagIds(u.mid).includes(f.id)).length;
-    return '<div class="folder-mgr-row">' +
-      '<div class="folder-mgr-left">' +
-        '<span class="folder-dot" style="width:10px;height:10px;background:' + esc(f.color) + '"></span>' +
-        '<div><div class="folder-mgr-name">' + esc(f.name) + '</div><div class="folder-mgr-stat">摘要 ' + jCnt + ' 条 · UP主 ' + uCnt + ' 位</div></div>' +
-      '</div>' +
-      '<div style="display:flex;gap:6px">' +
-        '<button type="button" class="btn btn-sm" onclick="renameFolder(\'' + esc(f.id) + '\')">重命名</button>' +
-        '<button type="button" class="btn btn-sm" style="color:var(--err)" onclick="deleteFolder(\'' + esc(f.id) + '\')">删除</button>' +
-      '</div>' +
-    '</div>';
+    return '<div class="folder-mgr-row"><div class="folder-mgr-left"><span class="folder-dot" style="width:10px;height:10px;background:' + esc(f.color) + '"></span><div><div class="folder-mgr-name">' + esc(f.name) + '</div><div class="folder-mgr-stat">摘要 ' + jCnt + ' 条 · UP主 ' + uCnt + ' 位</div></div></div><div style="display:flex;gap:6px"><button type="button" class="btn btn-sm" onclick="renameFolder(\'' + esc(f.id) + '\')">重命名</button><button type="button" class="btn btn-sm" style="color:var(--err)" onclick="deleteFolder(\'' + esc(f.id) + '\')">删除</button></div></div>';
   }).join('');
 }
-
 function createNewFolder() {
   const inp = document.getElementById('newFolderNameInput');
   const name = (inp.value || '').trim().slice(0, 16);
   if (!name) { toast('请输入文件夹名称', true); return; }
-  if ((libraryState.folders || []).some(f => f.name === name)) { toast('已存在同名标签文件夹', true); return; }
+  if ((libraryState.folders || []).some(f => f.name === name)) { toast('已存在同名文件夹', true); return; }
   const id = 'f_' + Date.now().toString(36) + '_' + Math.random().toString(36).slice(2, 5);
   libraryState.folders.push({ id, name, color: selectedNewFolderColor || FOLDER_COLORS[0] });
   inp.value = '';
   saveLibraryLocalAndCloud();
   renderFolderManagerList();
-  renderWorkspaceFolderBar();
-  renderMonitorFolderBar();
+  refreshAllLibraryViews();
   toast('已创建标签文件夹：' + name);
 }
-
 function renameFolder(id) {
   const f = getFolderById(id);
   if (!f) return;
@@ -3536,22 +3970,17 @@ function renameFolder(id) {
   f.name = clean;
   saveLibraryLocalAndCloud();
   renderFolderManagerList();
-  renderWorkspaceFolderBar();
-  renderMonitorFolderBar();
-  renderList();
-  renderUpSidebar();
-  const job = getJobs().find(j => j.id === selectedJobId);
-  if (job) renderDetailTagBar(job);
+  refreshAllLibraryViews();
   toast('已重命名为：' + clean);
 }
-
 function deleteFolder(id) {
   const f = getFolderById(id);
   if (!f) return;
   if (!confirm('确定删除标签文件夹「' + f.name + '」？（不会删除视频或 UP 主本身）')) return;
   libraryState.folders = (libraryState.folders || []).filter(x => x.id !== id);
-  if (selectedWsFolder === id) selectedWsFolder = '';
   if (selectedMonFolder === id) selectedMonFolder = '';
+  if (favFolderFilter === id) favFolderFilter = '';
+  if (histFolderFilter === id) histFolderFilter = '';
   Object.keys(libraryState.job_tags).forEach(k => {
     libraryState.job_tags[k] = (libraryState.job_tags[k] || []).filter(x => x !== id);
     if (!libraryState.job_tags[k].length) delete libraryState.job_tags[k];
@@ -3562,169 +3991,55 @@ function deleteFolder(id) {
   });
   saveLibraryLocalAndCloud();
   renderFolderManagerList();
-  renderWorkspaceFolderBar();
-  renderMonitorFolderBar();
-  renderList();
-  renderUpSidebar();
-  const job = getJobs().find(j => j.id === selectedJobId);
-  if (job) renderDetailTagBar(job);
+  if (currentRoute === 'folder' && activeFolderId === id) navigate('history');
+  else refreshAllLibraryViews();
   toast('已删除文件夹：' + f.name);
 }
 
-// ── History List & Filters ──
-function setHistoryFilter(f) {
-  historyFilter = f;
-  document.querySelectorAll('#historyFilterTabs .h-ftab').forEach(b => b.classList.toggle('active', b.dataset.hf === f));
-  moveSlider('historyFilterTabs');
-  renderList();
-}
-
-function renderList() {
-  const kw = (document.getElementById('searchInput').value || '').trim().toLowerCase();
-  let jobs = getJobs();
-  if (historyFilter === 'starred') jobs = jobs.filter(j => isJobFavorited(j));
-  else if (historyFilter === 'watchlater') jobs = jobs.filter(j => isWatchLater(j.bvid));
-  else if (historyFilter === 'failed') jobs = jobs.filter(j => normStatus(j.status) === 'failed');
-
-  if (selectedWsFolder) {
-    jobs = jobs.filter(j => getJobTagIds(j).includes(selectedWsFolder));
-  }
-
-  const filtered = kw ? jobs.filter(j =>
-    (j.title || '').toLowerCase().includes(kw) ||
-    (j.bvid || '').toLowerCase().includes(kw) ||
-    (j.owner || '').toLowerCase().includes(kw)
-  ) : jobs;
-
-  // Also include unsummarized saved videos when viewing Watch Later or Favorites (without tag filter)
-  let extraSaved = [];
-  if (!selectedWsFolder && (historyFilter === 'watchlater' || historyFilter === 'starred')) {
-    const existingBvids = new Set(getJobs().map(j => j.bvid));
-    const pool = historyFilter === 'watchlater' ? (libraryState.watch_later || []) : (libraryState.favorites || []);
-    extraSaved = pool.filter(v => !existingBvids.has(v.bvid) && (!kw || (v.title || '').toLowerCase().includes(kw) || (v.author || '').toLowerCase().includes(kw) || (v.bvid || '').toLowerCase().includes(kw)));
-  }
-
-  document.getElementById('countPill').textContent = String(filtered.length + extraSaved.length);
-  const container = document.getElementById('historyList');
-  if (!filtered.length && !extraSaved.length) {
-    const emptyMsg = historyFilter === 'watchlater'
-      ? '暂无「稍后再看」视频，可在详情页或 UP 主动态中一键添加'
-      : (selectedWsFolder ? '该标签文件夹下暂无摘要' : '暂无匹配的历史记录');
-    container.innerHTML = '<div style="text-align:center;padding:28px 12px;color:var(--muted);font-size:12.5px">' + emptyMsg + '</div>';
-    return;
-  }
-
-  let html = filtered.map(j => {
-    const active = j.id === selectedJobId && currentPage === 'workspace' ? ' active' : '';
+// ── PAGE 1: SUMMARY WORKSPACE ──
+function renderRecentStrip() {
+  const strip = document.getElementById('recentStrip');
+  if (!strip) return;
+  const jobs = getJobs().slice(0, 10);
+  if (!jobs.length) { strip.innerHTML = ''; return; }
+  strip.innerHTML = '<span class="recent-strip-label">最近任务</span>' + jobs.map(j => {
     const st = normStatus(j.status);
     const dotCls = st === 'completed' ? 'ok' : (st === 'failed' ? 'err' : 'pending');
-    const metaParts = [];
-    if (j.owner) metaParts.push(j.owner);
-    if (j.duration) metaParts.push(j.duration);
-    else if (j.timings && j.timings.total) metaParts.push(j.timings.total + 's');
-    metaParts.push(j.bvid || '');
-    const chk = batchMode
-      ? '<input type="checkbox" class="h-chk" ' + (selectedIds.includes(j.id) ? 'checked' : '') + ' onclick="event.stopPropagation();toggleSelectId(\'' + esc(j.id) + '\')">'
-      : '';
-    const tagPills = getJobTagIds(j).map(tid => {
-      const f = getFolderById(tid);
-      return f ? '<span class="mini-tag"><span class="folder-dot" style="width:5px;height:5px;background:' + esc(f.color) + '"></span>' + esc(f.name) + '</span>' : '';
-    }).join('');
-    const wlBadge = isWatchLater(j.bvid) ? '<span class="mini-tag wl">稍后再看</span>' : '';
-    const tagsRow = (tagPills || wlBadge) ? '<div class="mini-tags">' + wlBadge + tagPills + '</div>' : '';
-
-    return '<div class="h-card' + active + '" onclick="selectJob(\'' + esc(j.id) + '\')">' +
-      chk +
-      '<div class="h-body">' +
-        '<div class="h-title">' + esc(j.title || j.bvid || '处理中...') + '</div>' +
-        '<div class="h-meta">' + esc(metaParts.join(' · ')) + '</div>' +
-        tagsRow +
-      '</div>' +
-      '<div class="h-right">' +
-        '<div style="display:flex;align-items:center;gap:5px">' +
-          (isJobFavorited(j) ? '<span class="h-star-dot">' + SVG_STAR_SM + '</span>' : '') +
-          '<span class="dot ' + dotCls + '"></span>' +
-        '</div>' +
-        (!batchMode ? '<button class="h-del" title="删除" onclick="event.stopPropagation();deleteOneJob(\'' + esc(j.id) + '\')">' + SVG_CLOSE_SM + '</button>' : '') +
-      '</div>' +
-    '</div>';
+    const active = j.id === selectedJobId ? ' active' : '';
+    return '<button class="rec-pill' + active + '" title="' + esc(j.title || j.bvid) + '" onclick="selectJob(\'' + esc(j.id) + '\',false)"><span class="dot ' + dotCls + '"></span><span>' + esc(j.title || j.bvid) + '</span></button>';
   }).join('');
-
-  if (extraSaved.length) {
-    html += extraSaved.map(v =>
-      '<div class="h-card" onclick="submitVideo(\'' + esc(v.bvid) + '\',{title:' + JSON.stringify(v.title || '') + ',owner:' + JSON.stringify(v.author || '') + ',duration:' + JSON.stringify(v.duration || '') + '})">' +
-        '<div class="h-body">' +
-          '<div class="h-title">' + esc(v.title || v.bvid) + '</div>' +
-          '<div class="h-meta">' + esc([v.author, v.duration, v.bvid].filter(Boolean).join(' · ')) + '</div>' +
-          '<div class="mini-tags"><span class="mini-tag wl">点击立即总结</span></div>' +
-        '</div>' +
-      '</div>'
-    ).join('');
-  }
-  container.innerHTML = html;
 }
 
-function selectJob(id) {
-  if (currentPage !== 'workspace') switchPage('workspace');
+function selectJob(id, goToSummaryRoute) {
   selectedJobId = id;
+  if (goToSummaryRoute && currentRoute !== 'summary') {
+    navigate('summary', id);
+    return;
+  }
   const job = getJobs().find(j => j.id === id);
-  renderList();
+  renderRecentStrip();
   if (!job) return;
-  document.getElementById('topbarTitle').textContent = '单条视频摘要';
-  document.getElementById('dashboardView').classList.add('hidden');
+  document.getElementById('summaryEmptyState').classList.add('hidden');
   document.getElementById('detailView').classList.remove('hidden');
   renderDetail(job);
   if (normStatus(job.status) === 'pending') startPolling(job.id);
 }
 
-function toggleStarCurrent() {
-  const job = getJobs().find(j => j.id === selectedJobId);
-  if (!job) return;
-  toggleFavoriteVideo({ bvid: job.bvid, job_id: job.id, title: job.title, author: job.owner, duration: job.duration, url: job.video_url });
+function renderDetailTagBar(job) {
+  const row = document.getElementById('dTagRow');
+  if (!row || !job) return;
+  const key = jobTagKey(job);
+  const tagIds = getJobTagIds(job);
+  let html = tagIds.map(id => {
+    const f = getFolderById(id);
+    if (!f) return '';
+    return '<span class="tag-pill"><span class="folder-dot" style="background:' + esc(f.color) + '"></span><span>' + esc(f.name) + '</span><button type="button" title="移除标签" onclick="toggleJobTag(\'' + esc(key) + '\',\'' + esc(f.id) + '\')">&times;</button></span>';
+  }).join('');
+  html += '<button type="button" class="tag-add-btn" onclick="openTagPopover(this,\'job\',\'' + esc(key) + '\')">' + SVG_TAG_SM + '<span>添加标签</span></button>';
+  row.innerHTML = html;
 }
 
-function updateStarBtn(job) {
-  const btn = document.getElementById('starBtn');
-  const txt = document.getElementById('starBtnText');
-  const on = isJobFavorited(job);
-  btn.classList.toggle('starred', on);
-  txt.textContent = on ? '已收藏' : '收藏';
-}
-
-function deleteOneJob(id) {
-  const jobs = getJobs().filter(j => j.id !== id);
-  if (selectedJobId === id) {
-    selectedJobId = jobs[0] ? jobs[0].id : null;
-  }
-  saveJobs(jobs);
-  if (selectedJobId) selectJob(selectedJobId);
-  else showDashboard();
-  fetch('/api/jobs/' + encodeURIComponent(id), { method: 'DELETE' }).catch(() => {});
-}
-
-function toggleBatchMode() {
-  batchMode = !batchMode;
-  selectedIds = [];
-  document.getElementById('batchBar').classList.toggle('hidden', !batchMode);
-  document.getElementById('batchToggleBtn').textContent = batchMode ? '完成' : '管理';
-  renderList();
-}
-function toggleSelectId(id) { const i = selectedIds.indexOf(id); if (i >= 0) selectedIds.splice(i, 1); else selectedIds.push(id); }
-function selectAllJobs() { selectedIds = getJobs().map(j => j.id); renderList(); }
-function invertSelectJobs() { const set = new Set(selectedIds); selectedIds = getJobs().map(j => j.id).filter(id => !set.has(id)); renderList(); }
-function deleteSelectedJobs() {
-  if (!selectedIds.length) return;
-  if (!confirm('确定删除已勾选的 ' + selectedIds.length + ' 条记录？')) return;
-  const set = new Set(selectedIds);
-  const jobs = getJobs().filter(j => !set.has(j.id));
-  selectedIds = [];
-  if (set.has(selectedJobId)) selectedJobId = jobs[0] ? jobs[0].id : null;
-  saveJobs(jobs);
-  if (selectedJobId) selectJob(selectedJobId);
-  else showDashboard();
-}
-
-// ── Rich Markdown Parser & Mindmap Builder ──
+// ── Rich Markdown, Mindmap, Re-summarize, Transcript Search, AI Chat, Poster PNG ──
 function inlineMd(text) {
   let s = esc(text);
   s = s.replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>');
@@ -3732,54 +4047,40 @@ function inlineMd(text) {
   s = s.replace(/\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g, '<a href="$2" target="_blank" style="color:var(--brand);text-decoration:none">$1</a>');
   return s;
 }
-
 function detectSectionKind(line) {
   const c = line.replace(/^[#\s\-*•]+/, '').replace(/\*\*/g, '').replace(/[:：]+$/, '').trim();
   if (!c || c.startsWith('（') || c.startsWith('(') || c.includes('失败') || c.includes('无法')) return null;
-  if (c.length <= 16) {
-    if (c.includes('核心主题') || c.includes('核心观点') || c.includes('一句话总结')) return 'theme';
-    if (c.includes('要点提炼') || c.includes('核心要点') || c.includes('关键要点')) return 'points';
-    if (c === '总结' || c === '结语' || c === '总结洞察' || c.endsWith('总结')) return 'conclusion';
-  }
+  if (c.length <= 16 && (c.includes('核心主题') || c.includes('核心概念') || c.includes('主题概括') || c === '主题')) return 'theme';
+  if (c.length <= 16 && (c.includes('要点提炼') || c.includes('核心要点') || c.includes('重点') || c.includes('问答'))) return 'points';
+  if (c.length <= 16 && (c === '总结' || c.includes('总结洞察') || c.includes('结论') || c.includes('实践建议') || c.includes('推荐语') || c.includes('复习'))) return 'conclusion';
   return null;
 }
-
 function parseSummarySections(md) {
-  if (!md || !md.trim()) return [];
-  const lines = md.replace(/\r\n/g, '\n').split('\n');
+  const lines = String(md || '').replace(/\r\n/g, '\n').split('\n');
   const sections = [];
   let cur = { kind: 'body', lines: [] };
-  function pushCur() { if (cur.lines.length) sections.push(cur); }
-  for (const raw of lines) {
-    const line = raw.trim();
-    if (!line || /^[-*_]{3,}$/.test(line)) continue;
-    if (/^#\s+/.test(line) && !line.startsWith('##')) continue;
-    const kind = detectSectionKind(line);
-    if (kind) { pushCur(); cur = { kind, lines: [] }; continue; }
-    const inlineSec = line.match(/^(?:[-*•]\s*)?(?:[^\w\u4e00-\u9fa5]*)\*\*(核心主题|要点提炼|总结|核心观点)\*\*\s*[:：]\s*(.+)$/);
-    if (inlineSec) {
-      pushCur();
-      cur = { kind: detectSectionKind(inlineSec[1]) || 'body', lines: [inlineSec[2].trim()] };
-      continue;
-    }
+  const pushCur = () => { if (cur.lines.length) sections.push(cur); };
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i].trim();
+    if (!line || /^[-_*]{3,}$/.test(line)) continue;
+    if (/^#\s+/.test(line) && i < 3) continue;
+    const secKind = detectSectionKind(line);
+    if (secKind) { pushCur(); cur = { kind: secKind, lines: [] }; continue; }
+    const inlineSec = line.match(/^(?:\*\*)?(核心主题|核心概念|要点提炼|核心要点|总结|结论)(?:\*\*)?[:：]\s*(.+)$/);
+    if (inlineSec) { pushCur(); cur = { kind: detectSectionKind(inlineSec[1]) || 'body', lines: [inlineSec[2].trim()] }; continue; }
     cur.lines.push(line);
   }
   pushCur();
   return sections;
 }
-
 function renderRichSummary(md) {
   const sections = parseSummarySections(md);
   if (!sections.length) return '<div class="pending-banner">暂无 AI 总结内容</div>';
   return sections.map(sec => {
-    if (sec.kind === 'theme') {
-      return '<div class="md-theme-box"><div class="md-theme-label">核心主题</div><div class="md-theme-body">' +
-        sec.lines.map(inlineMd).join('<br>') + '</div></div>';
-    }
+    if (sec.kind === 'theme') return '<div class="md-theme-box"><div class="md-theme-label">核心主题</div><div class="md-theme-body">' + sec.lines.map(inlineMd).join('<br>') + '</div></div>';
     if (sec.kind === 'points') {
       const items = sec.lines.map((l, idx) => {
-        const mNum = l.match(/^(\d+)[.、)]\s*(.+)$/);
-        const mBul = l.match(/^[-*•]\s+(.+)$/);
+        const mNum = l.match(/^(\d+)[.、)]\s*(.+)$/), mBul = l.match(/^[-*•]\s+(.+)$/);
         if (mNum) return '<li><span class="md-num">' + esc(mNum[1]) + '</span><div>' + inlineMd(mNum[2]) + '</div></li>';
         if (mBul) return '<li><span class="md-num">·</span><div>' + inlineMd(mBul[1]) + '</div></li>';
         return '<li><span class="md-num">' + (idx + 1) + '</span><div>' + inlineMd(l) + '</div></li>';
@@ -3788,12 +4089,8 @@ function renderRichSummary(md) {
     }
     if (sec.kind === 'conclusion') {
       const notes = [], body = [];
-      sec.lines.forEach(l => {
-        if (l.includes('字幕可能不完整') || /^(?:\*\*)?注[:：]/.test(l)) notes.push(inlineMd(l));
-        else body.push(inlineMd(l));
-      });
-      return '<div class="md-conclusion"><div class="md-conclusion-label">总结洞察</div><div class="md-conclusion-body">' +
-        body.join('<br>') + '</div>' + (notes.length ? '<div class="md-note">' + notes.join(' ') + '</div>' : '') + '</div>';
+      sec.lines.forEach(l => { if (l.includes('字幕可能不完整') || /^(?:\*\*)?注[:：]/.test(l)) notes.push(inlineMd(l)); else body.push(inlineMd(l)); });
+      return '<div class="md-conclusion"><div class="md-conclusion-label">总结洞察</div><div class="md-conclusion-body">' + body.join('<br>') + '</div>' + (notes.length ? '<div class="md-note">' + notes.join(' ') + '</div>' : '') + '</div>';
     }
     return sec.lines.map(l => {
       if (/^#{2,4}\s+/.test(l)) return '<div class="md-sec-title">' + inlineMd(l.replace(/^#{2,4}\s+/, '')) + '</div>';
@@ -3802,100 +4099,62 @@ function renderRichSummary(md) {
     }).join('');
   }).join('');
 }
-
 function renderMindmap(job) {
   const el = document.getElementById('mindmapContent');
   const sections = parseSummarySections(job.summary || '');
   if (!sections.length || (job.summary || '').startsWith('（AI总结失败')) {
-    el.innerHTML = '<div class="pending-banner">请先生成有效的 AI 总结，系统将自动构建结构化思维导图。</div>';
-    return;
+    el.innerHTML = '<div class="pending-banner">请先生成有效的 AI 总结，系统将自动构建结构化思维导图。</div>'; return;
   }
   const kindNames = { theme: '核心主题', points: '核心要点拆解', conclusion: '总结洞察', body: '内容脉络' };
-  const branches = sections.map((sec, i) => {
-    const label = kindNames[sec.kind] || '要点';
+  const branches = sections.map(sec => {
     const leaves = sec.lines.map(l => '<div class="mm-leaf">' + inlineMd(l.replace(/^\d+[.、)]\s*|^[-*•]\s+/, '')) + '</div>').join('');
-    return '<div class="mm-node">' +
-      '<div class="mm-node-head" onclick="this.nextElementSibling.classList.toggle(\'hidden\')">' +
-        '<span class="mm-node-title">' + esc(label) + '</span>' +
-        '<span class="mm-node-tag">' + sec.lines.length + ' 项</span>' +
-      '</div>' +
-      '<div class="mm-children">' + leaves + '</div>' +
-    '</div>';
+    return '<div class="mm-node"><div class="mm-node-head" onclick="this.nextElementSibling.classList.toggle(\'hidden\')"><span class="mm-node-title">' + esc(kindNames[sec.kind] || '要点') + '</span><span class="mm-node-tag">' + sec.lines.length + ' 项</span></div><div class="mm-children">' + leaves + '</div></div>';
   }).join('');
   el.innerHTML = '<div class="mm-wrap"><div class="mm-root">' + esc(job.title || job.bvid) + '</div><div class="mm-branches">' + branches + '</div></div>';
 }
-
 function copyMindmapOutline() {
   const job = getJobs().find(j => j.id === selectedJobId);
   if (!job) return;
   const sections = parseSummarySections(job.summary || '');
   const kindNames = { theme: '核心主题', points: '要点提炼', conclusion: '总结洞察', body: '内容' };
   let out = '# ' + (job.title || job.bvid) + '\n';
-  sections.forEach(s => {
-    out += '\n## ' + (kindNames[s.kind] || '节点') + '\n';
-    s.lines.forEach(l => { out += '- ' + l.replace(/^\d+[.、)]\s*|^[-*•]\s+/, '') + '\n'; });
-  });
+  sections.forEach(s => { out += '\n## ' + (kindNames[s.kind] || '节点') + '\n'; s.lines.forEach(l => { out += '- ' + l.replace(/^\d+[.、)]\s*|^[-*•]\s+/, '') + '\n'; }); });
   navigator.clipboard.writeText(out).then(() => toast('导图 Markdown 大纲已复制')).catch(() => {});
 }
 
-// ── Fast Edge Re-Summarize (4-8s, zero audio re-download!) ──
 async function resummarizeCurrent(style) {
-  const jobs = getJobs();
-  const idx = jobs.findIndex(j => j.id === selectedJobId);
+  const jobs = getJobs(), idx = jobs.findIndex(j => j.id === selectedJobId);
   if (idx < 0) return;
   const job = jobs[idx];
-  if (!job.transcript || job.transcript.length < 30) {
-    toast('当前任务没有可用的语音转录文本，无法秒速重总结', true);
-    return;
-  }
-
-  document.querySelectorAll('#styleSwitchBar .style-pill').forEach(b => {
-    b.disabled = true;
-    b.classList.toggle('active', b.dataset.rs === style);
-  });
-  document.getElementById('summaryContent').innerHTML = '<div class="pending-banner">正在通过免费 AI 模型秒速重生成（约 4~8 秒，无需重新下载音频）...</div>';
-
+  if (!job.transcript || job.transcript.length < 30) { toast('当前任务没有可用转录文本，无法秒速重总结', true); return; }
+  document.querySelectorAll('#styleSwitchBar .style-pill').forEach(b => { b.disabled = true; b.classList.toggle('active', b.dataset.rs === style); });
+  document.getElementById('summaryContent').innerHTML = '<div class="pending-banner">正在通过免费 AI 模型秒速重生成（约 4~8 秒，无需重下音频）...</div>';
   try {
-    const r = await fetch('/api/resummarize', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+    const r = await apiFetch('/api/resummarize', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ job_id: job.id, bvid: job.bvid, title: job.title, transcript: job.transcript, style }),
     });
     const d = await r.json();
-    if (!r.ok) {
-      toast(d.error || '重生成失败', true);
-      renderDetail(job);
-      return;
-    }
-    jobs[idx].summary = d.summary;
-    jobs[idx].summary_style = style;
-    jobs[idx].error = '';
-    jobs[idx].error_stage = '';
-    jobs[idx].error_hint = '';
-    saveJobs(jobs);
-    renderDetail(jobs[idx]);
-    toast('重生成完成（' + d.model.split('/').pop() + ' · ' + d.elapsed + 's）');
-  } catch (e) {
-    toast('重生成异常：' + e.message, true);
-    renderDetail(job);
-  } finally {
-    document.querySelectorAll('#styleSwitchBar .style-pill').forEach(b => { b.disabled = false; });
-  }
+    if (!r.ok) { toast(d.error || '重生成失败', true); renderDetail(job); return; }
+    jobs[idx].summary = d.summary; jobs[idx].summary_style = style;
+    jobs[idx].error = ''; jobs[idx].error_stage = ''; jobs[idx].error_hint = '';
+    saveJobs(jobs); renderDetail(jobs[idx]);
+    toast('已秒速重生成（' + (d.elapsed || 5) + 's · 免费模型 ' + (d.model || '') + '）');
+  } catch (e) { toast('重生成异常：' + e.message, true); renderDetail(job); }
+  finally { document.querySelectorAll('#styleSwitchBar .style-pill').forEach(b => { b.disabled = false; }); }
 }
 
-// ── In-Transcript Keyword Search & Highlight ──
+function adjustFontSize(delta) {
+  readerFontPx = Math.max(12, Math.min(19, readerFontPx + delta));
+  document.documentElement.style.setProperty('--reader-fs', readerFontPx + 'px');
+}
 function highlightTranscript() {
   const job = getJobs().find(j => j.id === selectedJobId);
-  const box = document.getElementById('transcriptContent');
-  const countEl = document.getElementById('trMatchCount');
+  const box = document.getElementById('transcriptContent'), countEl = document.getElementById('trMatchCount');
   const raw = (job && job.transcript) || '（该任务无语音转录文本）';
   const kw = (document.getElementById('trSearchInput').value || '').trim();
   trMatchIndex = -1;
-  if (!kw) {
-    box.textContent = raw;
-    countEl.textContent = '';
-    return;
-  }
+  if (!kw) { box.textContent = raw; countEl.textContent = ''; return; }
   const safeKw = kw.replace(new RegExp('[.*+?^$' + '{}()|[\\]\\\\]', 'g'), '\\$&');
   const re = new RegExp(safeKw, 'gi');
   let n = 0;
@@ -3903,7 +4162,6 @@ function highlightTranscript() {
   countEl.textContent = n ? ('0 / ' + n) : '0 处匹配';
   if (n > 0) jumpTrMatch(1);
 }
-
 function jumpTrMatch(dir) {
   const marks = document.querySelectorAll('#transcriptContent mark');
   if (!marks.length) return;
@@ -3914,33 +4172,17 @@ function jumpTrMatch(dir) {
   document.getElementById('trMatchCount').textContent = (trMatchIndex + 1) + ' / ' + marks.length;
 }
 
-// ── AI Video Q&A Chat ──
-function getVideoChats(jobId) {
-  try { return (JSON.parse(localStorage.getItem(LS_CHATS) || '{}'))[jobId] || []; }
-  catch { return []; }
-}
+function getVideoChats(jobId) { try { return (JSON.parse(localStorage.getItem(LS_CHATS) || '{}'))[jobId] || []; } catch { return []; } }
 function saveVideoChats(jobId, msgs) {
-  try {
-    const all = JSON.parse(localStorage.getItem(LS_CHATS) || '{}');
-    all[jobId] = msgs.slice(-20);
-    localStorage.setItem(LS_CHATS, JSON.stringify(all));
-  } catch {}
+  try { const all = JSON.parse(localStorage.getItem(LS_CHATS) || '{}'); all[jobId] = msgs.slice(-20); localStorage.setItem(LS_CHATS, JSON.stringify(all)); } catch {}
 }
 function renderVideoChat(jobId) {
-  const msgs = getVideoChats(jobId);
-  const box = document.getElementById('chatMessages');
-  if (!msgs.length) {
-    box.innerHTML = '<div style="text-align:center;color:var(--muted);padding:34px 16px;font-size:13px">点击上方快捷问题，或直接输入任何关于本视频的疑问</div>';
-    return;
-  }
+  const msgs = getVideoChats(jobId), box = document.getElementById('chatMessages');
+  if (!msgs.length) { box.innerHTML = '<div style="text-align:center;color:var(--muted);padding:34px 16px;font-size:13px">点击上方快捷问题，或直接输入任何关于本视频的疑问</div>'; return; }
   box.innerHTML = msgs.map(m => '<div class="chat-msg ' + (m.role === 'user' ? 'user' : 'assistant') + '">' + inlineMd(m.content) + '</div>').join('');
   box.scrollTop = box.scrollHeight;
 }
-function clearVideoChat() {
-  if (!selectedJobId) return;
-  saveVideoChats(selectedJobId, []);
-  renderVideoChat(selectedJobId);
-}
+function clearVideoChat() { if (!selectedJobId) return; saveVideoChats(selectedJobId, []); renderVideoChat(selectedJobId); }
 async function sendVideoChat(presetText) {
   const job = getJobs().find(j => j.id === selectedJobId);
   if (!job) return;
@@ -3948,72 +4190,44 @@ async function sendVideoChat(presetText) {
   const q = (presetText !== undefined ? presetText : inp.value).trim();
   if (!q) return;
   if (presetText === undefined) inp.value = '';
-
   const msgs = [...getVideoChats(job.id), { role: 'user', content: q }];
-  saveVideoChats(job.id, msgs);
-  renderVideoChat(job.id);
-
-  const btn = document.getElementById('chatSendBtn');
-  btn.disabled = true;
-  btn.textContent = '思考中...';
+  saveVideoChats(job.id, msgs); renderVideoChat(job.id);
+  const btn = document.getElementById('chatSendBtn'); btn.disabled = true; btn.textContent = '思考中...';
   const box = document.getElementById('chatMessages');
-  const typing = document.createElement('div');
-  typing.className = 'chat-msg assistant';
-  typing.textContent = '正在结合视频转录内容思考...';
-  box.appendChild(typing);
-  box.scrollTop = box.scrollHeight;
-
+  const typing = document.createElement('div'); typing.className = 'chat-msg assistant'; typing.textContent = '正在结合视频转录内容思考...';
+  box.appendChild(typing); box.scrollTop = box.scrollHeight;
   try {
-    const r = await fetch('/api/chat', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+    const r = await apiFetch('/api/chat', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ title: job.title, transcript: job.transcript || '', summary: job.summary || '', messages: msgs }),
     });
     const d = await r.json();
-    if (!r.ok) {
-      typing.textContent = '追问失败：' + (d.error || '服务异常');
-      return;
-    }
-    const next = [...msgs, { role: 'assistant', content: d.reply }];
-    saveVideoChats(job.id, next);
+    if (!r.ok) { typing.textContent = '追问失败：' + (d.error || '服务异常'); return; }
+    saveVideoChats(job.id, [...msgs, { role: 'assistant', content: d.reply }]);
     renderVideoChat(job.id);
-  } catch (e) {
-    typing.textContent = '网络异常：' + e.message;
-  } finally {
-    btn.disabled = false;
-    btn.textContent = '发送';
-  }
+  } catch (e) { typing.textContent = '网络异常：' + e.message; }
+  finally { btn.disabled = false; btn.textContent = '发送'; }
 }
 
-// ── Export Shareable Editorial Poster PNG (Pure Canvas) ──
 function exportPosterPng() {
   const job = getJobs().find(j => j.id === selectedJobId);
-  if (!job || !job.summary || job.summary.startsWith('（AI总结失败')) {
-    toast('当前没有可导出的有效 AI 总结', true);
-    return;
-  }
+  if (!job || !job.summary || job.summary.startsWith('（AI总结失败')) { toast('当前没有可导出的有效 AI 总结', true); return; }
   const sections = parseSummarySections(job.summary);
   const scale = 2, W = 760, pad = 44;
   const wrapText = (ctx, text, maxW) => {
     const out = [];
     for (const para of String(text || '').split('\n')) {
       let line = '';
-      for (const ch of para) {
-        if (ctx.measureText(line + ch).width > maxW && line) { out.push(line); line = ch; }
-        else line += ch;
-      }
+      for (const ch of para) { if (ctx.measureText(line + ch).width > maxW && line) { out.push(line); line = ch; } else line += ch; }
       if (line) out.push(line);
     }
     return out;
   };
-
-  // Measure height first
   const tmp = document.createElement('canvas').getContext('2d');
   let y = 136;
   tmp.font = 'bold 24px -apple-system,PingFang SC,Microsoft YaHei,sans-serif';
   const titleLines = wrapText(tmp, job.title || job.bvid, W - pad * 2);
   y += titleLines.length * 34 + 34;
-
   const blocks = [];
   sections.forEach(s => {
     const label = s.kind === 'theme' ? '核心主题' : (s.kind === 'points' ? '要点提炼' : (s.kind === 'conclusion' ? '总结洞察' : '内容'));
@@ -4026,139 +4240,62 @@ function exportPosterPng() {
     blocks.push({ kind: s.kind, label, lines: cleanLines });
     y += 38 + cleanLines.length * 25 + 24;
   });
-  const H = Math.max(460, y + 66);
-
+  const H = Math.max(460, y + 64);
   const canvas = document.createElement('canvas');
-  canvas.width = W * scale;
-  canvas.height = H * scale;
-  const ctx = canvas.getContext('2d');
-  ctx.scale(scale, scale);
-
-  ctx.fillStyle = '#F8F9FA';
-  ctx.fillRect(0, 0, W, H);
-  // Header masthead
-  ctx.fillStyle = '#111827';
-  ctx.fillRect(0, 0, W, 108);
-  ctx.fillStyle = '#FB7299';
-  ctx.fillRect(0, 0, W, 5);
-  ctx.fillStyle = '#9CA3AF';
-  ctx.font = '600 12px -apple-system,sans-serif';
-  ctx.fillText('BILIBILI AI SUMMARY · ' + (job.bvid || ''), pad, 42);
-  ctx.fillStyle = '#FFFFFF';
-  ctx.font = 'bold 22px -apple-system,PingFang SC,Microsoft YaHei,sans-serif';
-  ctx.fillText('B站视频 AI 精华卡片', pad, 76);
-
-  let cy = 142;
-  ctx.fillStyle = '#111827';
-  ctx.font = 'bold 24px -apple-system,PingFang SC,Microsoft YaHei,sans-serif';
-  titleLines.forEach(l => { ctx.fillText(l, pad, cy); cy += 34; });
-  ctx.fillStyle = '#6B7280';
-  ctx.font = '13px -apple-system,PingFang SC,sans-serif';
-  ctx.fillText([job.owner ? ('UP主：' + job.owner) : '', job.duration ? ('时长 ' + job.duration) : ''].filter(Boolean).join('   ·   '), pad, cy + 4);
-  cy += 34;
-
+  canvas.width = W * scale; canvas.height = H * scale;
+  const ctx = canvas.getContext('2d'); ctx.scale(scale, scale);
+  ctx.fillStyle = '#F6F7F9'; ctx.fillRect(0, 0, W, H);
+  const grad = ctx.createLinearGradient(0, 0, W, 110); grad.addColorStop(0, '#0F172A'); grad.addColorStop(1, '#1E293B');
+  ctx.fillStyle = grad; ctx.fillRect(0, 0, W, 108);
+  ctx.fillStyle = '#FB7299'; ctx.fillRect(0, 105, W, 3);
+  ctx.fillStyle = '#FB7299'; ctx.font = 'bold 12px -apple-system,sans-serif'; ctx.fillText('BILIBILI AI SUMMARY · 视频精华卡片', pad, 38);
+  ctx.fillStyle = '#FFFFFF'; ctx.font = 'bold 20px -apple-system,PingFang SC,sans-serif'; ctx.fillText('B站AI摘要', pad, 72);
+  ctx.fillStyle = '#94A3B8'; ctx.font = '13px -apple-system,sans-serif';
+  ctx.fillText([job.owner, job.duration, job.bvid].filter(Boolean).join('  ·  '), pad, 92);
+  let cy = 148;
+  ctx.fillStyle = '#111827'; ctx.font = 'bold 24px -apple-system,PingFang SC,Microsoft YaHei,sans-serif';
+  titleLines.forEach(tl => { ctx.fillText(tl, pad, cy); cy += 34; });
+  cy += 12;
   blocks.forEach(b => {
     const bh = 36 + b.lines.length * 25 + 14;
-    ctx.fillStyle = b.kind === 'theme' ? '#FFF1F5' : '#FFFFFF';
-    ctx.fillRect(pad, cy, W - pad * 2, bh);
-    ctx.strokeStyle = b.kind === 'theme' ? '#FECDD3' : '#E5E7EB';
-    ctx.lineWidth = 1;
-    ctx.strokeRect(pad, cy, W - pad * 2, bh);
-    if (b.kind === 'theme') {
-      ctx.fillStyle = '#FB7299';
-      ctx.fillRect(pad, cy, 4, bh);
-    }
-    ctx.fillStyle = b.kind === 'theme' ? '#E11D48' : '#4B5563';
-    ctx.font = 'bold 13px -apple-system,PingFang SC,sans-serif';
-    ctx.fillText(b.label, pad + 16, cy + 24);
-    ctx.fillStyle = '#1F2937';
-    ctx.font = '15px -apple-system,PingFang SC,Microsoft YaHei,sans-serif';
-    let ly = cy + 48;
-    b.lines.forEach(l => { ctx.fillText(l, pad + 16, ly); ly += 25; });
+    ctx.fillStyle = b.kind === 'theme' ? '#FFF1F5' : '#FFFFFF'; ctx.fillRect(pad, cy, W - pad * 2, bh);
+    ctx.strokeStyle = b.kind === 'theme' ? '#FECDD3' : '#E5E7EB'; ctx.lineWidth = 1; ctx.strokeRect(pad, cy, W - pad * 2, bh);
+    if (b.kind === 'theme') { ctx.fillStyle = '#FB7299'; ctx.fillRect(pad, cy, 4, bh); }
+    ctx.fillStyle = b.kind === 'theme' ? '#E11D48' : '#4B5563'; ctx.font = 'bold 13px -apple-system,PingFang SC,sans-serif'; ctx.fillText(b.label, pad + 16, cy + 24);
+    ctx.fillStyle = '#1F2937'; ctx.font = '15px -apple-system,PingFang SC,Microsoft YaHei,sans-serif';
+    let ly = cy + 48; b.lines.forEach(l => { ctx.fillText(l, pad + 16, ly); ly += 25; });
     cy += bh + 16;
   });
-
-  ctx.fillStyle = '#9CA3AF';
-  ctx.font = '12px -apple-system,sans-serif';
+  ctx.fillStyle = '#9CA3AF'; ctx.font = '12px -apple-system,sans-serif';
   ctx.fillText('由 bilisum.cc.cd 自动生成 · 免费语音转录与 AI 总结', pad, H - 24);
-
-  const a = document.createElement('a');
-  a.href = canvas.toDataURL('image/png');
-  a.download = (job.bvid || 'summary') + '-card.png';
-  a.click();
+  const a = document.createElement('a'); a.href = canvas.toDataURL('image/png'); a.download = (job.bvid || 'summary') + '-card.png'; a.click();
   toast('分享长图 PNG 已生成并下载');
 }
 
-// ── Failure Diagnostics ──
-const STAGE_LABELS = {
-  id_parse: '视频 ID 解析', video_info: '获取视频信息', playurl: '解析音频流',
-  cdn_download: '下载 B 站音频', stt: '免费语音转文字', summarize: 'AI 生成总结',
-};
-
+const STAGE_LABELS = { id_parse: '视频 ID 解析', video_info: '获取视频信息', playurl: '解析音频流', cdn_download: '下载 B 站音频', stt: '免费语音转文字', summarize: 'AI 生成总结' };
 function renderFailureDiagnostics(job) {
-  let stage = job.error_stage || '';
-  let errText = job.error || '';
-  let hint = job.error_hint || '';
+  let stage = job.error_stage || '', errText = job.error || '', hint = job.error_hint || '';
   const hasTranscript = Boolean(job.transcript && job.transcript.length > 30);
-
   if (!stage) {
-    const bvid = String(job.bvid || '');
     const totalSec = job.timings && job.timings.total ? Number(job.timings.total) : null;
-    if (/^av\d+$/i.test(bvid) && totalSec !== null && totalSec <= 3) {
-      stage = 'video_info';
-      errText = errText || '旧版后端未兼容 av 号直接查询，或该视频已被删除/不可见（耗时 ' + totalSec + 's）';
-      hint = hint || '当前新版已支持 av 号解析；确认视频公开可访问后可直接点击重试。';
-    } else if (totalSec !== null && totalSec <= 5) {
-      stage = 'playurl';
-      errText = errText || '在获取视频信息或音频流阶段快速中断（耗时 ' + totalSec + 's）';
-      hint = hint || '可能是当时 B 站节点风控 (-412)、大会员/充电专属或稿件下架。';
-    } else {
-      stage = 'stt';
-      errText = errText || '语音识别阶段未能返回有效文本内容';
-      hint = hint || '硅基流动接口临时波动或音频无有效人声，可点击重新处理。';
-    }
+    if (totalSec !== null && totalSec <= 5) { stage = 'playurl'; errText = errText || '获取视频信息或音频流快速中断'; hint = hint || '可能是风控 (-412)、大会员/充电专属或稿件下架。'; }
+    else { stage = 'stt'; errText = errText || '语音识别阶段未能返回有效文本'; hint = hint || '硅基流动免费接口临时波动或无有效人声，可重试。'; }
   }
-
-  const stageLabel = STAGE_LABELS[stage] || stage || '处理链路';
-  return '<div class="diag-card">' +
-    '<div class="diag-head">' +
-      '<div class="diag-title">处理异常 · 故障定位</div>' +
-      '<span class="diag-stage">异常环节：' + esc(stageLabel) + '</span>' +
-    '</div>' +
-    '<div class="diag-rows">' +
-      '<div class="diag-row"><span class="diag-key">报错详情</span><span>' + esc(errText || '未能获取视频文字内容') + '</span></div>' +
-      '<div class="diag-row"><span class="diag-key">可能原因</span><span>' + esc(hint || '请检查视频是否公开可播放，或稍后重试。') + '</span></div>' +
-    '</div>' +
-    '<div class="diag-foot">' +
-      '<span style="font-size:12px;color:var(--soft)">视频 ID：<code>' + esc(job.bvid || '') + '</code></span>' +
-      '<div style="display:flex;gap:8px;flex-wrap:wrap">' +
-        (hasTranscript ? '<button class="btn btn-sm btn-brand" onclick="resummarizeCurrent(\'daily\')">秒速重生成总结（~5秒）</button>' : '') +
-        '<button class="btn btn-sm btn-primary" onclick="submitVideo(\'' + esc(job.bvid || '') + '\')">全流程重新处理</button>' +
-      '</div>' +
-    '</div>' +
-  '</div>';
+  return '<div class="diag-card"><div class="diag-head"><div class="diag-title">处理异常 · 故障定位</div><span class="diag-stage">异常环节：' + esc(STAGE_LABELS[stage] || stage) + '</span></div><div class="diag-rows"><div class="diag-row"><span class="diag-key">报错详情</span><span>' + esc(errText) + '</span></div><div class="diag-row"><span class="diag-key">可能原因</span><span>' + esc(hint) + '</span></div></div><div class="diag-foot"><span style="font-size:12px;color:var(--soft)">视频 ID：<code>' + esc(job.bvid || '') + '</code></span><div style="display:flex;gap:8px;flex-wrap:wrap">' + (hasTranscript ? '<button class="btn btn-sm btn-brand" onclick="resummarizeCurrent(\'daily\')">秒速重生成总结（~5秒）</button>' : '') + '<button class="btn btn-sm btn-primary" onclick="submitVideo(\'' + esc(job.bvid || '') + '\')">全流程重新处理</button></div></div></div>';
 }
 
-// ── Detail View & Stepper ──
 function renderStepper(job) {
   const bar = document.getElementById('stepperBar');
   bar.classList.remove('hidden');
   const st = normStatus(job.status);
-  let steps = job.gh_steps ? job.gh_steps.slice(0, 4) : [
+  const steps = job.gh_steps ? job.gh_steps.slice(0, 4) : [
     { name: '任务创建', done: true, active: false },
     { name: '下载音频', done: st === 'completed', active: st === 'pending' },
     { name: '语音转录', done: st === 'completed', active: false },
     { name: 'AI 总结', done: st === 'completed', active: false },
   ];
-  const badgeHtml = st === 'completed'
-    ? '<span class="st-badge ok">已完成</span>'
-    : (st === 'failed' ? '<span class="st-badge err">处理失败</span>' : '<span class="st-badge pending">处理中</span>');
-  const items = steps.map((s, i) => {
-    const cls = s.done ? 'st-item done' : (s.active ? 'st-item active' : 'st-item');
-    const dot = s.done ? '<span class="st-dot">&#10003;</span>' : '<span class="st-dot">' + (i + 1) + '</span>';
-    return '<span class="' + cls + '">' + dot + '<span>' + esc(s.name) + '</span></span><span class="st-line' + (s.done ? ' done' : '') + '"></span>';
-  }).join('');
-  bar.innerHTML = items + badgeHtml;
+  const badgeHtml = st === 'completed' ? '<span class="st-badge ok">已完成</span>' : (st === 'failed' ? '<span class="st-badge err">处理失败</span>' : '<span class="st-badge pending">处理中</span>');
+  bar.innerHTML = steps.map((s, i) => '<span class="' + (s.done ? 'st-item done' : (s.active ? 'st-item active' : 'st-item')) + '"><span class="st-dot">' + (s.done ? '&#10003;' : (i + 1)) + '</span><span>' + esc(s.name) + '</span></span><span class="st-line' + (s.done ? ' done' : '') + '"></span>').join('') + badgeHtml;
 }
 
 function renderDetail(job) {
@@ -4179,42 +4316,26 @@ function renderDetail(job) {
   if (job.timings && job.timings.total) pills.push('<span class="meta-pill">耗时 ' + esc(job.timings.total) + 's</span>');
   else if (job.created_at) pills.push('<span class="meta-pill">' + esc(fmtShortDate(job.created_at)) + '</span>');
   const durSec = parseDurationSec(job.duration);
-  if (durSec >= 120 && normStatus(job.status) === 'completed') {
-    pills.push('<span class="meta-pill saved">帮你节省约 ' + Math.max(1, Math.round(durSec / 60 * 0.85)) + ' 分钟</span>');
-  }
+  if (durSec >= 120 && normStatus(job.status) === 'completed') pills.push('<span class="meta-pill saved">帮你节省约 ' + Math.max(1, Math.round(durSec / 60 * 0.85)) + ' 分钟</span>');
   document.getElementById('dPills').innerHTML = pills.join('');
 
-  const st = normStatus(job.status);
-  const rawSummary = (job.summary || '').trim();
-  const isSummaryFailed = job.error_stage === 'summarize' || rawSummary.startsWith('（AI总结失败') || rawSummary.startsWith('(AI总结失败');
-  const hasTranscript = Boolean(job.transcript && job.transcript.length > 30);
-  document.getElementById('styleSwitchBar').classList.toggle('hidden', !hasTranscript);
-  const activeStyle = job.summary_style || 'daily';
-  document.querySelectorAll('#styleSwitchBar .style-pill').forEach(b => b.classList.toggle('active', b.dataset.rs === activeStyle));
+  const st = normStatus(job.status), rawSummary = (job.summary || '').trim(), rawTranscript = (job.transcript || '').trim();
+  const isAiFailed = rawSummary.startsWith('（AI总结失败') || rawSummary.startsWith('(AI总结失败');
+  document.getElementById('styleSwitchBar').classList.toggle('hidden', st !== 'completed' || !rawTranscript);
+  document.querySelectorAll('#styleSwitchBar .style-pill').forEach(b => b.classList.toggle('active', b.dataset.rs === (job.summary_style || 'daily')));
 
+  let sumHtml = '';
+  if (st === 'pending') sumHtml = '<div class="pending-banner">GitHub Actions 正在提取音频、免费语音转文字并生成 AI 摘要，页面会自动刷新...</div>';
+  else if (st === 'failed') sumHtml = renderFailureDiagnostics(job);
+  else if (isAiFailed || !rawSummary) sumHtml = renderFailureDiagnostics({ ...job, error_stage: 'summarize', error: rawSummary || 'AI 总结返回为空', error_hint: '可能触发免费模型限流，点击下方即可 5 秒内免费重生成总结（无需重下音频）。' });
+  else sumHtml = renderRichSummary(rawSummary);
+
+  document.getElementById('summaryContent').innerHTML = sumHtml;
+  document.getElementById('splitSummary').innerHTML = sumHtml;
   document.getElementById('trSearchInput').value = '';
   document.getElementById('trMatchCount').textContent = '';
-
-  if (st === 'pending') {
-    document.getElementById('summaryContent').innerHTML = '<div class="pending-banner">GitHub Actions 正在提取音频、免费语音转文字并生成 AI 摘要，页面会自动刷新...</div>';
-    document.getElementById('transcriptContent').textContent = '等待转录完成...';
-  } else if (st === 'failed') {
-    document.getElementById('summaryContent').innerHTML = renderFailureDiagnostics(job);
-    document.getElementById('transcriptContent').textContent = job.transcript || '无转录内容';
-  } else if (isSummaryFailed) {
-    const tLen = (job.transcript || '').length;
-    document.getElementById('summaryContent').innerHTML = renderFailureDiagnostics({
-      ...job,
-      error_stage: 'summarize',
-      error: job.error || 'AI 总结阶段失败（长视频文本量触发硅基流动免费模型 TPM 429 限流）',
-      error_hint: job.error_hint || ('完整语音转录（' + tLen + ' 字符）已保存！直接点击下方「秒速重生成总结（~5秒）」即可立即生成摘要，无需重新下载音频。'),
-    });
-    document.getElementById('transcriptContent').textContent = job.transcript || '（该任务无语音转录文本）';
-  } else {
-    let notice = job.error_hint ? '<div class="sb-toast show info" style="margin:0 0 14px 0">' + esc(job.error_hint) + '</div>' : '';
-    document.getElementById('summaryContent').innerHTML = notice + renderRichSummary(rawSummary);
-    document.getElementById('transcriptContent').textContent = job.transcript || '（该任务无语音转录文本）';
-  }
+  document.getElementById('transcriptContent').textContent = rawTranscript || (st === 'pending' ? '等待语音转录完成...' : '（该任务无语音转录文本）');
+  document.getElementById('splitTranscript').textContent = rawTranscript || '（无转录文本）';
   renderMindmap(job);
   renderVideoChat(job.id);
   applyViewMode();
@@ -4226,121 +4347,40 @@ function setViewMode(mode) {
   document.querySelectorAll('#segTabs .seg-tab').forEach(b => b.classList.toggle('active', b.dataset.mode === mode));
   moveSlider('segTabs');
   applyViewMode();
-  playAnim(document.getElementById('readerGrid'));
 }
-
 function applyViewMode() {
-  const grid = document.getElementById('readerGrid');
-  grid.classList.toggle('split', viewMode === 'split');
-  document.getElementById('summaryPanel').classList.toggle('hidden', viewMode !== 'summary' && viewMode !== 'split');
-  document.getElementById('mindmapPanel').classList.toggle('hidden', viewMode !== 'mindmap');
-  document.getElementById('transcriptPanel').classList.toggle('hidden', viewMode !== 'transcript' && viewMode !== 'split');
-  document.getElementById('chatPanel').classList.toggle('hidden', viewMode !== 'chat');
-  document.getElementById('summaryPanelLabel').classList.toggle('hidden', viewMode !== 'split');
+  document.getElementById('summaryCard').classList.toggle('hidden', viewMode !== 'summary');
+  document.getElementById('mindmapCard').classList.toggle('hidden', viewMode !== 'mindmap');
+  document.getElementById('transcriptCard').classList.toggle('hidden', viewMode !== 'transcript');
+  document.getElementById('splitView').classList.toggle('hidden', viewMode !== 'split');
+  document.getElementById('chatCard').classList.toggle('hidden', viewMode !== 'chat');
 }
-
-function copyCurrent() {
+function getExportText() {
   const job = getJobs().find(j => j.id === selectedJobId);
-  if (!job) return;
-  const txt = viewMode === 'transcript' ? (job.transcript || '') : (job.summary || '');
-  navigator.clipboard.writeText(txt).then(() => toast('内容已复制到剪贴板')).catch(() => {});
+  if (!job) return '';
+  if (viewMode === 'transcript') return job.transcript || '';
+  if (viewMode === 'split') return '# ' + (job.title || job.bvid) + '\n\n## AI 总结\n\n' + (job.summary || '') + '\n\n## 完整转录\n\n' + (job.transcript || '');
+  return job.summary || '';
 }
-
+function copyCurrent() {
+  const text = getExportText();
+  if (!text) return;
+  navigator.clipboard.writeText(text).then(() => toast('内容已复制到剪贴板')).catch(() => {});
+}
 function exportFile(ext) {
   const job = getJobs().find(j => j.id === selectedJobId);
   if (!job) return;
-  const content = ext === 'md'
-    ? ('# ' + (job.title || job.bvid) + '\n\n> 链接: https://www.bilibili.com/video/' + job.bvid + '\n\n' + (job.summary || '') + (job.transcript ? '\n\n---\n\n## 完整转录\n\n' + job.transcript : ''))
-    : ((job.title || job.bvid) + '\nhttps://www.bilibili.com/video/' + job.bvid + '\n\n' + (job.summary || '') + (job.transcript ? '\n\n---\n完整转录：\n' + job.transcript : ''));
-  const blob = new Blob([content], { type: 'text/plain;charset=utf-8' });
+  const text = getExportText();
+  if (!text) return;
+  const blob = new Blob([text], { type: 'text/plain;charset=utf-8' });
   const a = document.createElement('a');
   a.href = URL.createObjectURL(blob);
-  a.download = (job.bvid || 'summary') + '.' + ext;
+  a.download = (job.bvid || 'bilibili-summary') + '.' + ext;
   a.click();
-  URL.revokeObjectURL(a.href);
-  toast('已导出 ' + ext.toUpperCase() + ' 文件');
+  setTimeout(() => URL.revokeObjectURL(a.href), 1000);
 }
 
-// ── Auth ──
-function openModal(id) { document.getElementById(id).classList.remove('hidden'); }
-function closeModal(id) { document.getElementById(id).classList.add('hidden'); }
-function getAuthToken() { return localStorage.getItem(LS_AUTH) || ''; }
-
-async function checkAuth() {
-  const tok = getAuthToken();
-  if (!tok) { updateAuthUi(''); return; }
-  try {
-    const r = await fetch('/api/auth/me', { headers: { 'Authorization': 'Bearer ' + tok } });
-    const d = await r.json();
-    if (d.authenticated) updateAuthUi(d.username);
-    else { localStorage.removeItem(LS_AUTH); updateAuthUi(''); }
-  } catch { updateAuthUi(''); }
-}
-
-function updateAuthUi(user) {
-  authUser = user || '';
-  const btn = document.getElementById('monitorBtn');
-  const ic = document.getElementById('monitorBtnIcon');
-  const tx = document.getElementById('monitorBtnText');
-  if (authUser) {
-    btn.classList.add('authed');
-    ic.innerHTML = SVG_SLIDERS;
-    tx.textContent = authUser + ' · 监控设置';
-  } else {
-    btn.classList.remove('authed');
-    ic.innerHTML = SVG_LOCK;
-    tx.textContent = '登录管理';
-    if (currentPage === 'monitor') switchPage('workspace');
-  }
-}
-
-async function openMonitorEntry() {
-  if (!authUser) { openModal('loginModal'); setTimeout(() => document.getElementById('loginPass').focus(), 60); return; }
-  await openMonitorModal();
-}
-async function openMonitorModal() {
-  openModal('monitorModal');
-  requestAnimationFrame(() => moveSlider('monitorTabs', true));
-  await loadMonitorConfig();
-}
-async function doLogin() {
-  const username = document.getElementById('loginUser').value.trim();
-  const password = document.getElementById('loginPass').value;
-  const btn = document.getElementById('loginSubmitBtn');
-  btn.disabled = true;
-  try {
-    const r = await fetch('/api/auth/login', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ username, password }) });
-    const d = await r.json();
-    if (!r.ok) { showToast('loginToast', d.error || '登录失败', 'err'); return; }
-    localStorage.setItem(LS_AUTH, d.token);
-    localStorage.setItem(LS_USER, d.username);
-    updateAuthUi(d.username);
-    closeModal('loginModal');
-    document.getElementById('loginPass').value = '';
-    toast('登录成功，欢迎回来 ' + d.username);
-    await switchPage('monitor');
-  } catch (e) { showToast('loginToast', '网络错误: ' + e.message, 'err'); }
-  finally { btn.disabled = false; }
-}
-function doLogout() {
-  localStorage.removeItem(LS_AUTH);
-  localStorage.removeItem(LS_USER);
-  monitorPageBooted = false;
-  lastRenderedFeedKey = '';
-  lastRenderedFeedSig = '';
-  updateAuthUi('');
-  closeModal('monitorModal');
-  toast('已退出管理员登录');
-}
-
-// ── Multi-Layer UP Feed Cache + Infinite Scroll + UP Tag Folders + Cover Grid ──
-const SS_FEED_CACHE = 'bilisum_up_feed_cache_v2';
-const FEED_CACHE_TTL_MS = 10 * 60 * 1000;
-const feedMemCache = new Map();
-let prefetchDone = false;
-let feedPagination = { key: 'all', pn: 1, hasMore: false, loading: false, total: 0, mids: '' };
-let feedObserver = null;
-
+// ── PAGE 2: MONITOR UP CREATORS (Infinite Scroll + Multi-Page Cache) ──
 function readFeedCache(key) {
   const k = String(key || 'all');
   if (feedMemCache.has(k)) return feedMemCache.get(k);
@@ -4350,15 +4390,9 @@ function readFeedCache(key) {
   } catch {}
   return null;
 }
-function writeFeedCache(key, entryData) {
+function writeFeedCache(key, data) {
   const k = String(key || 'all');
-  const entry = {
-    videos: entryData.videos || [],
-    pn: entryData.pn || 1,
-    hasMore: Boolean(entryData.hasMore),
-    total: Number(entryData.total) || 0,
-    ts: Date.now(),
-  };
+  const entry = { videos: data.videos || [], pn: data.pn || 1, hasMore: Boolean(data.hasMore), total: Number(data.total) || 0, ts: Date.now() };
   feedMemCache.set(k, entry);
   try {
     const store = JSON.parse(sessionStorage.getItem(SS_FEED_CACHE) || '{}');
@@ -4377,37 +4411,50 @@ function clearFeedCache(key) {
 }
 
 function renderSkeletonGrid() {
-  return Array.from({ length: 8 }).map(() =>
-    '<div class="v-card"><div class="skel" style="width:100%;aspect-ratio:16/9;border-radius:12px"></div><div style="display:flex;gap:10px;padding-top:10px"><div class="skel" style="width:34px;height:34px;border-radius:50%;flex-shrink:0"></div><div style="flex:1"><div class="skel" style="height:14px;width:90%;margin-bottom:7px"></div><div class="skel" style="height:12px;width:55%;margin-bottom:7px"></div><div class="skel" style="height:18px;width:36%;border-radius:999px"></div></div></div></div>'
-  ).join('');
+  return Array.from({ length: 8 }).map(() => '<div class="v-card"><div class="skel" style="width:100%;aspect-ratio:16/9;border-radius:12px"></div><div style="display:flex;gap:10px;padding-top:10px"><div class="skel" style="width:34px;height:34px;border-radius:50%;flex-shrink:0"></div><div style="flex:1"><div class="skel" style="height:14px;width:90%;margin-bottom:7px"></div><div class="skel" style="height:12px;width:55%;margin-bottom:7px"></div><div class="skel" style="height:18px;width:36%;border-radius:999px"></div></div></div></div>').join('');
 }
 
-function initFeedInfiniteObserver() {
-  if (feedObserver || typeof IntersectionObserver === 'undefined') return;
-  const sentinel = document.getElementById('feedSentinel');
-  const root = document.getElementById('contentScroll');
-  if (!sentinel) return;
-  feedObserver = new IntersectionObserver((entries) => {
-    entries.forEach(entry => {
-      if (!entry.isIntersecting) return;
-      if (currentPage !== 'monitor') return;
-      if (selectedUpMid === '__watchlater' || selectedUpMid === '__favorites') return;
-      if (feedPagination.hasMore && !feedPagination.loading) {
-        loadMoreUpFeed();
-      }
-    });
-  }, { root: root || null, rootMargin: '420px 0px' });
-  feedObserver.observe(sentinel);
+function initFeedObservers() {
+  if (typeof IntersectionObserver === 'undefined') return;
+  if (!feedObserver) {
+    const sentinel = document.getElementById('feedSentinel'), root = document.getElementById('monScrollArea');
+    if (sentinel) {
+      feedObserver = new IntersectionObserver(entries => {
+        entries.forEach(e => {
+          if (e.isIntersecting && currentRoute === 'monitor' && feedPagination.hasMore && !feedPagination.loading) loadMoreUpFeed();
+        });
+      }, { root: root || null, rootMargin: '420px 0px' });
+      feedObserver.observe(sentinel);
+    }
+  }
+  if (!folderObserver) {
+    const fSent = document.getElementById('folderFeedSentinel'), fRoot = document.getElementById('view-folder');
+    if (fSent) {
+      folderObserver = new IntersectionObserver(entries => {
+        entries.forEach(e => {
+          if (e.isIntersecting && currentRoute === 'folder' && folderViewTab === 'ups' && folderPagination.hasMore && !folderPagination.loading) loadMoreFolderUpsFeed();
+        });
+      }, { root: fRoot || null, rootMargin: '420px 0px' });
+      folderObserver.observe(fSent);
+    }
+  }
+}
+
+async function loadMonitorConfigQuietly() {
+  try {
+    const r = await apiFetch('/api/monitor-config');
+    if (!r.ok) return;
+    const d = await r.json();
+    if (d.config) { monitorConfig = d.config; hydrateMonitorForm(); updateNavBadges(); renderRailFolders(); }
+  } catch {}
 }
 
 async function loadMonitorPage() {
-  initFeedInfiniteObserver();
+  initFeedObservers();
   if (monitorPageBooted && (monitorConfig.up_list || []).length > 0) {
     renderMonitorFolderBar();
     updateMonitorHeaderSummary();
-    if (selectedUpMid === '__watchlater') renderSavedGrid('watchlater');
-    else if (selectedUpMid === '__favorites') renderSavedGrid('favorites');
-    else if (!lastRenderedFeedKey) await fetchUpFeed(selectedUpMid || 'all');
+    if (!lastRenderedFeedKey) await fetchUpFeed(selectedUpMid || 'all');
     return;
   }
   await loadMonitorConfig();
@@ -4430,55 +4477,33 @@ function setMonFolder(fid) {
   selectedMonFolder = selectedMonFolder === fid ? '' : fid;
   renderMonitorFolderBar();
   renderUpSidebar();
-  if (selectedMonFolder) {
-    selectMonitorUp('folder:' + selectedMonFolder);
-  } else if (String(selectedUpMid).startsWith('folder:')) {
-    selectMonitorUp('all');
-  }
+  if (selectedMonFolder) selectMonitorUp('folder:' + selectedMonFolder);
+  else if (String(selectedUpMid).startsWith('folder:')) selectMonitorUp('all');
 }
 
 function renderMonitorFolderBar() {
   const bar = document.getElementById('monFolderBar');
   if (!bar) return;
-  const ups = monitorConfig.up_list || [];
-  const folders = libraryState.folders || [];
-  const wlCnt = (libraryState.watch_later || []).length;
-  const favCnt = (libraryState.favorites || []).length;
-
-  let html = '<button class="folder-chip' + (!selectedMonFolder && selectedUpMid !== '__watchlater' && selectedUpMid !== '__favorites' ? ' active' : '') + '" onclick="selectedMonFolder=\'\';renderMonitorFolderBar();renderUpSidebar();selectMonitorUp(\'all\')">全部</button>';
-  html += '<button class="folder-chip' + (selectedUpMid === '__watchlater' ? ' active' : '') + '" onclick="selectMonitorUp(\'__watchlater\')">' +
-    '<span class="folder-dot" style="background:#2563EB"></span><span>稍后再看</span>' + (wlCnt ? '<span class="folder-cnt">' + wlCnt + '</span>' : '') + '</button>';
-  html += '<button class="folder-chip' + (selectedUpMid === '__favorites' ? ' active' : '') + '" onclick="selectMonitorUp(\'__favorites\')">' +
-    '<span class="folder-dot" style="background:#D97706"></span><span>收藏</span>' + (favCnt ? '<span class="folder-cnt">' + favCnt + '</span>' : '') + '</button>';
-
+  const ups = monitorConfig.up_list || [], folders = libraryState.folders || [];
+  let html = '<button class="folder-chip' + (!selectedMonFolder ? ' active' : '') + '" onclick="selectedMonFolder=\'\';renderMonitorFolderBar();renderUpSidebar();selectMonitorUp(\'all\')">全部</button>';
   folders.forEach(f => {
     const cnt = ups.filter(u => getUpTagIds(u.mid).includes(f.id)).length;
-    const act = selectedMonFolder === f.id ? ' active' : '';
-    html += '<button class="folder-chip' + act + '" onclick="setMonFolder(\'' + esc(f.id) + '\')">' +
-      '<span class="folder-dot" style="background:' + esc(f.color) + '"></span>' +
-      '<span>' + esc(f.name) + '</span>' +
-      (cnt ? '<span class="folder-cnt">' + cnt + '</span>' : '') +
-    '</button>';
+    html += '<button class="folder-chip' + (selectedMonFolder === f.id ? ' active' : '') + '" onclick="setMonFolder(\'' + esc(f.id) + '\')"><span class="folder-dot" style="background:' + esc(f.color) + '"></span><span>' + esc(f.name) + '</span>' + (cnt ? '<span class="folder-cnt">' + cnt + '</span>' : '') + '</button>';
   });
-  html += '<button class="folder-add-btn" onclick="openTagManagerModal()" title="管理标签文件夹">+ 标签</button>';
   bar.innerHTML = html;
 }
 
 function renderUpSidebar() {
   const kw = (document.getElementById('upSearchInput').value || '').trim().toLowerCase();
   const allUps = monitorConfig.up_list || [];
-  let ups = selectedMonFolder ? allUps.filter(u => getUpTagIds(u.mid).includes(selectedMonFolder)) : allUps;
-  document.getElementById('upSideCount').textContent = String(ups.length);
+  const ups = selectedMonFolder ? allUps.filter(u => getUpTagIds(u.mid).includes(selectedMonFolder)) : allUps;
   const filtered = kw ? ups.filter(u => String(u.name || '').toLowerCase().includes(kw) || String(u.mid || '').includes(kw)) : ups;
   const listEl = document.getElementById('upSideList');
   let html = '';
   if (!kw) {
     if (selectedMonFolder) {
-      const f = getFolderById(selectedMonFolder);
-      const fKey = 'folder:' + selectedMonFolder;
-      html += '<div class="up-side-card' + (selectedUpMid === fKey ? ' active' : '') + '" onclick="selectMonitorUp(\'' + esc(fKey) + '\')">' +
-        '<div class="up-ava-fb" style="background:' + esc((f && f.color) || '#2563EB') + ';color:#fff;border-color:transparent">' + esc(((f && f.name) || '类').slice(0, 1)) + '</div>' +
-        '<div class="up-side-info"><div class="up-side-name">「' + esc((f && f.name) || '分类') + '」全部动态</div><div class="up-side-uid">聚合该标签下 ' + ups.length + ' 位 UP 主</div></div></div>';
+      const f = getFolderById(selectedMonFolder), fKey = 'folder:' + selectedMonFolder;
+      html += '<div class="up-side-card' + (selectedUpMid === fKey ? ' active' : '') + '" onclick="selectMonitorUp(\'' + esc(fKey) + '\')"><div class="up-ava-fb" style="background:' + esc((f && f.color) || '#2563EB') + ';color:#fff;border-color:transparent">' + esc(((f && f.name) || '类').slice(0, 1)) + '</div><div class="up-side-info"><div class="up-side-name">「' + esc((f && f.name) || '分类') + '」全部动态</div><div class="up-side-uid">聚合 ' + ups.length + ' 位 UP 主</div></div></div>';
     } else {
       html += '<div class="up-side-card' + (selectedUpMid === 'all' ? ' active' : '') + '" onclick="selectMonitorUp(\'all\')"><div class="up-ava-fb">全</div><div class="up-side-info"><div class="up-side-name">全部监控 UP 主</div><div class="up-side-uid">聚合最新动态 · ' + allUps.length + ' 位</div></div></div>';
     }
@@ -4487,68 +4512,26 @@ function renderUpSidebar() {
     const active = String(selectedUpMid) === String(u.mid) ? ' active' : '';
     const faceUrl = u.face ? (u.face.replace(/^http:\/\//, 'https://') + '@96w_96h_1c.webp') : '';
     const ava = faceUrl ? '<img class="up-ava" src="' + esc(faceUrl) + '" referrerpolicy="no-referrer" alt="">' : '<div class="up-ava-fb">' + esc((u.name || String(u.mid)).slice(0, 1)) + '</div>';
-    const upTagsHtml = getUpTagIds(u.mid).map(tid => {
-      const f = getFolderById(tid);
-      return f ? '<span class="mini-tag"><span class="folder-dot" style="width:5px;height:5px;background:' + esc(f.color) + '"></span>' + esc(f.name) + '</span>' : '';
-    }).join('');
-    return '<div class="up-side-card' + active + '" onclick="selectMonitorUp(' + Number(u.mid) + ')">' +
-      ava +
-      '<div class="up-side-info">' +
-        '<div class="up-side-name">' + esc(u.name || u.mid) + '</div>' +
-        '<div class="up-side-uid">UID ' + esc(u.mid) + '</div>' +
-        (upTagsHtml ? '<div class="mini-tags">' + upTagsHtml + '</div>' : '') +
-      '</div>' +
-      '<div class="up-side-acts">' +
-        '<button class="up-tag-btn" title="设置标签分类" onclick="event.stopPropagation();openTagPopover(this,\'up\',\'' + Number(u.mid) + '\')">' + SVG_TAG_SM + '</button>' +
-        '<button class="h-del" title="取消监控" onclick="event.stopPropagation();quickRemoveMonitorUp(' + Number(u.mid) + ')">' + SVG_CLOSE_SM + '</button>' +
-      '</div>' +
-    '</div>';
-  }).join('') : '<div style="text-align:center;padding:24px 12px;color:var(--muted);font-size:12.5px">' + (selectedMonFolder ? '该标签下暂无 UP 主，点击任意 UP 主右侧标签图标即可加入' : '暂无匹配的 UP 主') + '</div>';
+    const tagsHtml = getUpTagIds(u.mid).map(tid => { const f = getFolderById(tid); return f ? '<span class="mini-tag"><span class="folder-dot" style="width:5px;height:5px;background:' + esc(f.color) + '"></span>' + esc(f.name) + '</span>' : ''; }).join('');
+    return '<div class="up-side-card' + active + '" onclick="selectMonitorUp(' + Number(u.mid) + ')">' + ava + '<div class="up-side-info"><div class="up-side-name">' + esc(u.name || u.mid) + '</div><div class="up-side-uid">UID ' + esc(u.mid) + '</div>' + (tagsHtml ? '<div class="mini-tags">' + tagsHtml + '</div>' : '') + '</div><div class="up-side-acts"><button class="up-act-ic" title="设置标签分类" onclick="event.stopPropagation();openTagPopover(this,\'up\',\'' + Number(u.mid) + '\')">' + SVG_TAG_SM + '</button><button class="up-act-ic del" title="取消监控" onclick="event.stopPropagation();quickRemoveMonitorUp(' + Number(u.mid) + ')">' + SVG_CLOSE_SM + '</button></div></div>';
+  }).join('') : '<div style="text-align:center;padding:24px 10px;color:var(--muted);font-size:12px">' + (selectedMonFolder ? '该标签下暂无 UP 主' : '暂无匹配的 UP 主') + '</div>';
   listEl.innerHTML = html;
-}
-
-function renderSavedGrid(kind) {
-  const isWl = kind === 'watchlater';
-  const vids = isWl ? (libraryState.watch_later || []) : (libraryState.favorites || []);
-  document.getElementById('monFeedHeading').textContent = isWl ? '稍后再看视频列表' : '已收藏视频列表';
-  document.getElementById('topbarSub').textContent = (isWl ? '稍后再看' : '收藏夹') + ' · ' + vids.length + ' 条';
-  const grid = document.getElementById('upFeedGrid');
-  const footer = document.getElementById('feedFooter');
-  currentFeedVideos = vids.slice();
-  lastRenderedFeedKey = isWl ? '__watchlater' : '__favorites';
-  lastRenderedFeedSig = vids.map(v => v.bvid).join(',');
-  feedPagination = { key: lastRenderedFeedKey, pn: 1, hasMore: false, loading: false, total: vids.length, mids: '' };
-
-  if (!vids.length) {
-    grid.innerHTML = '<div class="reader-card" style="grid-column:1/-1;text-align:center;color:var(--muted);padding:38px">' +
-      (isWl ? '暂无「稍后再看」视频，悬停任意视频封面右上角即可一键加入' : '暂无「收藏」视频，悬停视频封面或摘要详情页即可一键收藏') + '</div>';
-    if (footer) footer.innerHTML = '';
-    return;
-  }
-  grid.innerHTML = vids.map((v, idx) => buildFeedCardHtml(v, idx)).join('');
-  if (footer) footer.innerHTML = '<div class="feed-meta-note">共 ' + vids.length + ' 条视频</div>';
 }
 
 async function selectMonitorUp(mid) {
   selectedUpMid = mid;
   renderMonitorFolderBar();
   renderUpSidebar();
-  const scrollEl = document.getElementById('contentScroll');
-  if (scrollEl) { scrollEl.scrollTop = 0; pageScrollPos.monitor = 0; }
-
-  if (mid === '__watchlater') { renderSavedGrid('watchlater'); return; }
-  if (mid === '__favorites') { renderSavedGrid('favorites'); return; }
-
+  const sc = document.getElementById('monScrollArea');
+  if (sc) { sc.scrollTop = 0; routeScrollPos.monitor = 0; }
   const ups = monitorConfig.up_list || [];
   if (mid === 'all') {
     document.getElementById('monFeedHeading').textContent = '全部监控 UP 主动态';
     document.getElementById('topbarSub').textContent = '全部 UP 主';
   } else if (String(mid).startsWith('folder:')) {
-    const fid = String(mid).slice(7);
-    const f = getFolderById(fid);
-    const label = (f && f.name) || '标签分类';
-    document.getElementById('monFeedHeading').textContent = '「' + label + '」聚合动态';
-    document.getElementById('topbarSub').textContent = '标签文件夹 · ' + label;
+    const f = getFolderById(String(mid).slice(7));
+    document.getElementById('monFeedHeading').textContent = '「' + ((f && f.name) || '分类') + '」聚合动态';
+    document.getElementById('topbarSub').textContent = '标签文件夹';
   } else {
     const found = ups.find(u => Number(u.mid) === Number(mid));
     const label = found ? found.name : ('UID ' + mid);
@@ -4559,19 +4542,17 @@ async function selectMonitorUp(mid) {
 }
 
 async function quickAddMonitorUp() {
-  const inp = document.getElementById('sideAddUpInput');
-  const q = inp.value.trim();
+  const inp = document.getElementById('sideAddUpInput'), q = inp.value.trim();
   if (!q) return;
-  const btn = document.getElementById('sideAddUpBtn');
-  btn.disabled = true; btn.textContent = '添加中...';
+  const btn = document.getElementById('sideAddUpBtn'); btn.disabled = true; btn.textContent = '添加中';
   try {
-    const r = await fetch('/api/up-lookup?q=' + encodeURIComponent(q), { headers: { 'Authorization': 'Bearer ' + getAuthToken() } });
+    const r = await apiFetch('/api/up-lookup?q=' + encodeURIComponent(q));
     const d = await r.json();
     if (!r.ok) { showToast('sideUpToast', d.error || '解析失败', 'err'); return; }
     if (!monitorConfig.up_list) monitorConfig.up_list = [];
     if (!monitorConfig.up_list.some(x => Number(x.mid) === Number(d.mid))) {
       monitorConfig.up_list.push({ mid: Number(d.mid), name: d.name || String(d.mid), face: d.face || '' });
-      const sr = await fetch('/api/monitor-config', { method: 'POST', headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + getAuthToken() }, body: JSON.stringify(monitorConfig) });
+      const sr = await apiFetch('/api/monitor-config', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(monitorConfig) });
       const sd = await sr.json();
       if (sr.ok && sd.config) monitorConfig = sd.config;
       if (selectedMonFolder) {
@@ -4581,7 +4562,7 @@ async function quickAddMonitorUp() {
       }
     }
     inp.value = ''; clearFeedCache('all');
-    updateMonitorHeaderSummary(); renderMonitorFolderBar(); renderUpSidebar();
+    updateNavBadges(); renderRailFolders(); updateMonitorHeaderSummary(); renderMonitorFolderBar(); renderUpSidebar();
     toast('已添加监控：' + (d.name || d.mid));
     await selectMonitorUp(Number(d.mid));
   } catch (e) { showToast('sideUpToast', '添加异常：' + e.message, 'err'); }
@@ -4593,48 +4574,60 @@ async function quickRemoveMonitorUp(mid) {
   if (!confirm('确定取消监控「' + (found ? found.name : mid) + '」？')) return;
   monitorConfig.up_list = (monitorConfig.up_list || []).filter(u => Number(u.mid) !== Number(mid));
   try {
-    const sr = await fetch('/api/monitor-config', { method: 'POST', headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + getAuthToken() }, body: JSON.stringify(monitorConfig) });
+    const sr = await apiFetch('/api/monitor-config', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(monitorConfig) });
     const sd = await sr.json();
     if (sr.ok && sd.config) monitorConfig = sd.config;
     if (String(selectedUpMid) === String(mid)) selectedUpMid = 'all';
     clearFeedCache('all'); clearFeedCache(mid);
-    updateMonitorHeaderSummary(); renderMonitorFolderBar(); renderUpSidebar();
+    updateNavBadges(); renderRailFolders(); updateMonitorHeaderSummary(); renderMonitorFolderBar(); renderUpSidebar();
     await selectMonitorUp(selectedUpMid);
     toast('已取消监控');
   } catch (e) { toast('移除失败：' + e.message, true); }
 }
 
-function buildFeedCardHtml(v, idx) {
+function buildVideoCardHtml(v, idx, opts) {
+  const o = opts || {};
+  const poolName = o.pool || 'feed';
+  const jobs = getJobs();
+  const matchedJob = jobs.find(j => j.bvid === v.bvid && normStatus(j.status) === 'completed');
+  const hasSum = Boolean(v.summary || (matchedJob && matchedJob.summary));
   const coverUrl = v.pic ? (v.pic.replace(/^http:\/\//, 'https://') + '@672w_378h_1c.webp') : '';
   const faceUrl = v.face ? (v.face.replace(/^http:\/\//, 'https://') + '@96w_96h_1c.webp') : '';
-  const hasSum = Boolean(v.summary);
-  const statsStr = [fmtCount(v.play), fmtDanmaku(v.danmaku)].join(' · ');
-  const relTime = fmtRelativeTime(v.created);
+  const statsStr = (v.play || v.danmaku) ? [fmtCount(v.play), fmtDanmaku(v.danmaku)].join(' · ') : (v.bvid || '');
+  const relTime = v.created ? fmtRelativeTime(v.created) : (v.added_at ? fmtShortDate(v.added_at) : '');
   const avaHtml = faceUrl ? '<img class="v-ava" src="' + esc(faceUrl) + '" referrerpolicy="no-referrer" alt="">' : '<div class="v-ava-fb">' + esc((v.author || 'UP').slice(0, 1)) + '</div>';
-  const wlOn = isWatchLater(v.bvid);
-  const favOn = isFavBvid(v.bvid);
+  const wlOn = isWatchLater(v.bvid), favOn = isFavBvid(v.bvid) || Boolean(matchedJob && matchedJob.starred);
+
+  const chkHtml = o.showCheck
+    ? '<label class="v-chk-wrap" onclick="event.stopPropagation()"><input type="checkbox" ' + (wlSelectedBvids.has(v.bvid) ? 'checked' : '') + ' onchange="toggleWlCheck(\'' + esc(v.bvid) + '\',this.checked)"><span>选择</span></label>'
+    : '';
+  const sumAction = matchedJob
+    ? '<button class="v-act-btn" onclick="selectJob(\'' + esc(matchedJob.id) + '\',true)">打开摘要</button>'
+    : (v.summary ? '<button class="v-act-btn" onclick="openFeedSummaryModal(\'' + poolName + '\',' + idx + ')">查看摘要</button>' : '');
+
   return '<article class="v-card" data-bvid="' + esc(v.bvid) + '">' +
     '<div class="v-thumb-wrap">' +
-      '<a class="v-thumb-link" href="' + esc(v.url) + '" target="_blank" rel="noopener">' +
-        (coverUrl ? '<img src="' + esc(coverUrl) + '" referrerpolicy="no-referrer" loading="lazy" alt="">' : '') +
+      '<a class="v-thumb-link" href="' + esc(v.url || ('https://www.bilibili.com/video/' + v.bvid)) + '" target="_blank" rel="noopener">' +
+        (coverUrl ? '<img src="' + esc(coverUrl) + '" referrerpolicy="no-referrer" loading="lazy" alt="">' : '<div class="v-thumb-fallback">' + esc(v.title || v.bvid) + '</div>') +
         (hasSum ? '<span class="v-sum-badge">已有摘要</span>' : '') +
         (v.duration ? '<span class="v-dur">' + esc(v.duration) + '</span>' : '') +
       '</a>' +
+      chkHtml +
       '<div class="v-quick-acts' + ((wlOn || favOn) ? ' has-active' : '') + '">' +
-        '<button type="button" class="v-qbtn v-qbtn-wl' + (wlOn ? ' wl-on' : '') + '" title="' + (wlOn ? '移出稍后再看' : '加入稍后再看') + '" onclick="event.preventDefault();event.stopPropagation();toggleFeedVideoWl(' + idx + ')">' + SVG_CLOCK_SM + '</button>' +
-        '<button type="button" class="v-qbtn v-qbtn-fav' + (favOn ? ' fav-on' : '') + '" title="' + (favOn ? '取消收藏' : '加入收藏') + '" onclick="event.preventDefault();event.stopPropagation();toggleFeedVideoFav(' + idx + ')">' + SVG_STAR_LINE + '</button>' +
+        '<button type="button" class="v-qbtn v-qbtn-wl' + (wlOn ? ' wl-on' : '') + '" title="' + (wlOn ? '移出稍后再看' : '加入稍后再看') + '" onclick="event.preventDefault();event.stopPropagation();togglePoolVideoWl(\'' + poolName + '\',' + idx + ')">' + SVG_CLOCK_SM + '</button>' +
+        '<button type="button" class="v-qbtn v-qbtn-fav' + (favOn ? ' fav-on' : '') + '" title="' + (favOn ? '取消收藏' : '加入收藏') + '" onclick="event.preventDefault();event.stopPropagation();togglePoolVideoFav(\'' + poolName + '\',' + idx + ')">' + SVG_STAR_LINE + '</button>' +
       '</div>' +
     '</div>' +
     '<div class="v-body">' + avaHtml +
       '<div class="v-meta-col">' +
-        '<a class="v-title" href="' + esc(v.url) + '" target="_blank" rel="noopener" title="' + esc(v.title) + '">' + esc(v.title) + '</a>' +
+        '<a class="v-title" href="' + esc(v.url || ('https://www.bilibili.com/video/' + v.bvid)) + '" target="_blank" rel="noopener" title="' + esc(v.title) + '">' + esc(v.title) + '</a>' +
         '<div class="v-author">' + esc(v.author || '') + '</div>' +
         '<div class="v-stats">' + esc(statsStr) + '</div>' +
         '<div class="v-foot">' +
           (relTime ? '<span class="v-time-pill">' + esc(relTime) + '</span>' : '<span></span>') +
           '<div class="v-act-row">' +
-            (hasSum ? '<button class="v-act-btn" onclick="openFeedSummaryModal(' + idx + ')">查看摘要</button>' : '') +
-            '<button class="v-act-btn primary" onclick="submitVideoFromFeed(' + idx + ')">' + (hasSum ? '重算' : '一键总结') + '</button>' +
+            sumAction +
+            '<button class="v-act-btn primary" onclick="submitPoolVideo(\'' + poolName + '\',' + idx + ')">' + (hasSum ? '重算' : '一键总结') + '</button>' +
           '</div>' +
         '</div>' +
       '</div>' +
@@ -4642,26 +4635,52 @@ function buildFeedCardHtml(v, idx) {
   '</article>';
 }
 
-function toggleFeedVideoWl(idx) {
-  const v = currentFeedVideos[idx];
-  if (v) toggleWatchLaterVideo(v);
+let wlRenderPool = [];
+let favRenderPool = [];
+function getPoolByName(name) {
+  if (name === 'folder') return folderFeedVideos;
+  if (name === 'wl') return wlRenderPool;
+  if (name === 'fav') return favRenderPool;
+  return currentFeedVideos;
 }
-function toggleFeedVideoFav(idx) {
-  const v = currentFeedVideos[idx];
-  if (v) toggleFavoriteVideo(v);
+function togglePoolVideoWl(poolName, idx) { const v = getPoolByName(poolName)[idx]; if (v) toggleWatchLaterVideo(v); }
+function togglePoolVideoFav(poolName, idx) { const v = getPoolByName(poolName)[idx]; if (v) toggleFavoriteVideo(v); }
+function submitPoolVideo(poolName, idx) {
+  const v = getPoolByName(poolName)[idx];
+  if (v) submitVideo(v.bvid, { title: v.title || '', owner: v.author || '', duration: v.duration || '' });
 }
+function openFeedSummaryModal(poolName, idx) {
+  const v = getPoolByName(poolName)[idx];
+  if (!v) return;
+  modalSummaryRaw = v.summary || '';
+  document.getElementById('smTitle').textContent = v.title || v.bvid;
+  document.getElementById('smWatchLink').href = v.url || ('https://www.bilibili.com/video/' + v.bvid);
+  document.getElementById('smBody').innerHTML = renderRichSummary(modalSummaryRaw);
+  openModal('summaryModal');
+}
+function copyModalSummary() { navigator.clipboard.writeText(modalSummaryRaw || '').then(() => toast('摘要已复制')).catch(() => {}); }
+
 function syncFeedCardQuickStates(bvid) {
   if (!bvid) return;
-  const wlOn = isWatchLater(bvid);
-  const favOn = isFavBvid(bvid);
-  document.querySelectorAll('#upFeedGrid .v-card[data-bvid="' + bvid.replace(/"/g, '') + '"]').forEach(card => {
-    const acts = card.querySelector('.v-quick-acts');
-    const wlB = card.querySelector('.v-qbtn-wl');
-    const favB = card.querySelector('.v-qbtn-fav');
+  const wlOn = isWatchLater(bvid), favOn = isFavBvid(bvid);
+  document.querySelectorAll('.v-card[data-bvid="' + bvid.replace(/"/g, '') + '"]').forEach(card => {
+    const acts = card.querySelector('.v-quick-acts'), wlB = card.querySelector('.v-qbtn-wl'), favB = card.querySelector('.v-qbtn-fav');
     if (acts) acts.classList.toggle('has-active', wlOn || favOn);
     if (wlB) { wlB.classList.toggle('wl-on', wlOn); wlB.title = wlOn ? '移出稍后再看' : '加入稍后再看'; }
     if (favB) { favB.classList.toggle('fav-on', favOn); favB.title = favOn ? '取消收藏' : '加入收藏'; }
   });
+}
+
+function buildUpFeedApiUrl(key, pn, forceRefresh) {
+  const qs = [];
+  if (String(key).startsWith('folder:')) {
+    const fid = String(key).slice(7);
+    const mids = (monitorConfig.up_list || []).filter(u => getUpTagIds(u.mid).includes(fid)).map(u => u.mid).join(',');
+    qs.push('mid=group'); qs.push('mids=' + encodeURIComponent(mids));
+  } else qs.push('mid=' + encodeURIComponent(key));
+  qs.push('pn=' + pn); qs.push('ps=20');
+  if (forceRefresh) qs.push('refresh=1');
+  return '/api/up-videos?' + qs.join('&');
 }
 
 function renderFeedFooter() {
@@ -4670,71 +4689,40 @@ function renderFeedFooter() {
   const count = currentFeedVideos.length;
   if (!count) { footer.innerHTML = ''; return; }
   const totalStr = feedPagination.total > count ? (' / 共约 ' + feedPagination.total + ' 条') : '';
-  if (feedPagination.loading) {
-    footer.innerHTML = '<button class="feed-load-btn" disabled>正在加载更早的视频...</button><div class="feed-meta-note">已加载 ' + count + ' 条' + totalStr + '</div>';
-  } else if (feedPagination.hasMore) {
-    footer.innerHTML = '<button class="feed-load-btn" onclick="loadMoreUpFeed()">加载更多历史视频</button><div class="feed-meta-note">向下滚动自动翻页 · 已加载 ' + count + ' 条' + totalStr + '</div>';
-  } else {
-    footer.innerHTML = '<div class="feed-meta-note">已加载全部 ' + count + ' 条公开视频</div>';
-  }
+  if (feedPagination.loading) footer.innerHTML = '<button class="feed-load-btn" disabled>正在加载更早的视频...</button><div class="feed-meta-note">已加载 ' + count + ' 条' + totalStr + '</div>';
+  else if (feedPagination.hasMore) footer.innerHTML = '<button class="feed-load-btn" onclick="loadMoreUpFeed()">加载更多历史视频</button><div class="feed-meta-note">向下滚动自动翻页 · 已加载 ' + count + ' 条' + totalStr + '</div>';
+  else footer.innerHTML = '<div class="feed-meta-note">已加载全部 ' + count + ' 条公开视频</div>';
 }
 
 function renderFeedCards(vids, key) {
   const grid = document.getElementById('upFeedGrid');
   const sig = vids.length + ':' + (vids[0] ? vids[0].bvid : '') + ':' + (vids[vids.length - 1] ? vids[vids.length - 1].bvid : '');
   currentFeedVideos = vids.slice();
-  if (key && lastRenderedFeedKey === key && lastRenderedFeedSig === sig && grid.children.length > 0) {
-    renderFeedFooter();
-    return;
-  }
-  lastRenderedFeedKey = key || '';
-  lastRenderedFeedSig = sig;
-  if (!vids.length) {
-    grid.innerHTML = '<div class="reader-card" style="grid-column:1/-1;text-align:center;color:var(--muted);padding:36px">暂未获取到公开视频</div>';
-    renderFeedFooter();
-    return;
-  }
-  grid.innerHTML = vids.map((v, idx) => buildFeedCardHtml(v, idx)).join('');
+  if (key && lastRenderedFeedKey === key && lastRenderedFeedSig === sig && grid.children.length > 0) { renderFeedFooter(); return; }
+  lastRenderedFeedKey = key || ''; lastRenderedFeedSig = sig;
+  if (!vids.length) { grid.innerHTML = '<div class="reader-card" style="grid-column:1/-1;text-align:center;color:var(--muted);padding:36px">暂未获取到公开视频</div>'; renderFeedFooter(); return; }
+  grid.innerHTML = vids.map((v, idx) => buildVideoCardHtml(v, idx, { pool: 'feed' })).join('');
   renderFeedFooter();
 }
-
 function appendFeedCards(newVids) {
   const grid = document.getElementById('upFeedGrid');
   if (!grid || !newVids.length) { renderFeedFooter(); return; }
   const startIdx = currentFeedVideos.length;
   currentFeedVideos.push(...newVids);
-  const html = newVids.map((v, i) => buildFeedCardHtml(v, startIdx + i)).join('');
-  grid.insertAdjacentHTML('beforeend', html);
+  grid.insertAdjacentHTML('beforeend', newVids.map((v, i) => buildVideoCardHtml(v, startIdx + i, { pool: 'feed' })).join(''));
   lastRenderedFeedSig = currentFeedVideos.length + ':' + (currentFeedVideos[0] ? currentFeedVideos[0].bvid : '') + ':' + (currentFeedVideos[currentFeedVideos.length - 1] ? currentFeedVideos[currentFeedVideos.length - 1].bvid : '');
   renderFeedFooter();
-}
-
-function buildUpFeedApiUrl(key, pn, forceRefresh) {
-  const qs = [];
-  if (String(key).startsWith('folder:')) {
-    const fid = String(key).slice(7);
-    const mids = (monitorConfig.up_list || []).filter(u => getUpTagIds(u.mid).includes(fid)).map(u => u.mid).join(',');
-    qs.push('mid=group');
-    qs.push('mids=' + encodeURIComponent(mids));
-  } else {
-    qs.push('mid=' + encodeURIComponent(key));
-  }
-  qs.push('pn=' + pn);
-  qs.push('ps=20');
-  if (forceRefresh) qs.push('refresh=1');
-  return '/api/up-videos?' + qs.join('&');
 }
 
 function prefetchTopUpsQuietly() {
   if (prefetchDone || !authUser) return;
   prefetchDone = true;
   (monitorConfig.up_list || []).slice(0, 5).forEach((u, i) => {
-    const k = String(u.mid);
-    const ex = readFeedCache(k);
+    const k = String(u.mid), ex = readFeedCache(k);
     if (ex && (Date.now() - ex.ts) < FEED_CACHE_TTL_MS) return;
     setTimeout(() => {
       if (!authUser) return;
-      fetch('/api/up-videos?mid=' + encodeURIComponent(k) + '&pn=1&ps=20', { headers: { 'Authorization': 'Bearer ' + getAuthToken() } })
+      apiFetch('/api/up-videos?mid=' + encodeURIComponent(k) + '&pn=1&ps=20')
         .then(r => r.ok ? r.json() : null)
         .then(d => { if (d && Array.isArray(d.videos)) writeFeedCache(k, { videos: d.videos, pn: 1, hasMore: Boolean(d.has_more), total: d.total || 0 }); })
         .catch(() => {});
@@ -4744,72 +4732,43 @@ function prefetchTopUpsQuietly() {
 
 async function fetchUpFeed(mid, forceRefresh) {
   const key = String(mid || 'all');
-  if (key === '__watchlater') { renderSavedGrid('watchlater'); return; }
-  if (key === '__favorites') { renderSavedGrid('favorites'); return; }
-
-  const grid = document.getElementById('upFeedGrid');
-  const refBtn = document.getElementById('refreshFeedBtn');
+  const grid = document.getElementById('upFeedGrid'), refBtn = document.getElementById('refreshFeedBtn');
   const cached = !forceRefresh ? readFeedCache(key) : null;
   const isFresh = cached && (Date.now() - cached.ts) < FEED_CACHE_TTL_MS;
-
   if (cached) {
     feedPagination = { key, pn: cached.pn || 1, hasMore: Boolean(cached.hasMore), loading: false, total: cached.total || 0 };
     renderFeedCards(cached.videos, key);
     if (isFresh) { prefetchTopUpsQuietly(); return; }
   } else {
-    lastRenderedFeedKey = '';
-    lastRenderedFeedSig = '';
+    lastRenderedFeedKey = ''; lastRenderedFeedSig = '';
     feedPagination = { key, pn: 1, hasMore: false, loading: true, total: 0 };
     grid.innerHTML = renderSkeletonGrid();
-    const footer = document.getElementById('feedFooter');
-    if (footer) footer.innerHTML = '';
+    const f = document.getElementById('feedFooter'); if (f) f.innerHTML = '';
   }
-
   if (refBtn && forceRefresh) { refBtn.disabled = true; refBtn.textContent = '刷新中...'; }
   try {
-    const r = await fetch(buildUpFeedApiUrl(key, 1, forceRefresh), { headers: { 'Authorization': 'Bearer ' + getAuthToken() } });
+    const r = await apiFetch(buildUpFeedApiUrl(key, 1, forceRefresh));
     const d = await r.json();
-    if (!r.ok) {
-      feedPagination.loading = false;
-      if (!cached) grid.innerHTML = '<div class="reader-card" style="grid-column:1/-1;color:var(--err-text)">拉取失败：' + esc(d.error || ('HTTP ' + r.status)) + '</div>';
-      return;
-    }
-    const vids = d.videos || [];
-    const entry = { videos: vids, pn: 1, hasMore: Boolean(d.has_more), total: Number(d.total) || 0 };
+    if (!r.ok) { feedPagination.loading = false; if (!cached) grid.innerHTML = '<div class="reader-card" style="grid-column:1/-1;color:var(--err-text)">拉取失败：' + esc(d.error || ('HTTP ' + r.status)) + '</div>'; return; }
+    const vids = d.videos || [], entry = { videos: vids, pn: 1, hasMore: Boolean(d.has_more), total: Number(d.total) || 0 };
     writeFeedCache(key, entry);
-    if (String(selectedUpMid || 'all') === key) {
-      feedPagination = { key, pn: 1, hasMore: entry.hasMore, loading: false, total: entry.total };
-      renderFeedCards(vids, key);
-    }
+    if (String(selectedUpMid || 'all') === key) { feedPagination = { key, pn: 1, hasMore: entry.hasMore, loading: false, total: entry.total }; renderFeedCards(vids, key); }
     if (forceRefresh) toast('动态已刷新（第 1 页共 ' + vids.length + ' 条）');
     prefetchTopUpsQuietly();
-  } catch (e) {
-    feedPagination.loading = false;
-    if (!cached) grid.innerHTML = '<div class="reader-card" style="grid-column:1/-1;color:var(--err-text)">网络异常：' + esc(e.message) + '</div>';
-  } finally {
-    if (refBtn) { refBtn.disabled = false; refBtn.textContent = '刷新动态'; }
-  }
+  } catch (e) { feedPagination.loading = false; if (!cached) grid.innerHTML = '<div class="reader-card" style="grid-column:1/-1;color:var(--err-text)">网络异常：' + esc(e.message) + '</div>'; }
+  finally { if (refBtn) { refBtn.disabled = false; refBtn.textContent = '刷新动态'; } }
 }
 
 async function loadMoreUpFeed() {
   const key = String(selectedUpMid || 'all');
-  if (key === '__watchlater' || key === '__favorites') return;
   if (feedPagination.loading || !feedPagination.hasMore || feedPagination.key !== key) return;
-
   const nextPn = (feedPagination.pn || 1) + 1;
-  feedPagination.loading = true;
-  renderFeedFooter();
-
+  feedPagination.loading = true; renderFeedFooter();
   try {
-    const r = await fetch(buildUpFeedApiUrl(key, nextPn, false), { headers: { 'Authorization': 'Bearer ' + getAuthToken() } });
+    const r = await apiFetch(buildUpFeedApiUrl(key, nextPn, false));
     const d = await r.json();
     if (String(selectedUpMid || 'all') !== key) return;
-    if (!r.ok) {
-      feedPagination.loading = false;
-      renderFeedFooter();
-      toast('翻页加载失败：' + (d.error || ('HTTP ' + r.status)), true);
-      return;
-    }
+    if (!r.ok) { feedPagination.loading = false; renderFeedFooter(); toast('翻页加载失败', true); return; }
     const seen = new Set(currentFeedVideos.map(v => v.bvid));
     const incoming = (d.videos || []).filter(v => v && v.bvid && !seen.has(v.bvid));
     feedPagination.pn = nextPn;
@@ -4817,50 +4776,381 @@ async function loadMoreUpFeed() {
     feedPagination.loading = false;
     if (d.total) feedPagination.total = Number(d.total);
     appendFeedCards(incoming);
-    writeFeedCache(key, {
-      videos: currentFeedVideos.slice(),
-      pn: feedPagination.pn,
-      hasMore: feedPagination.hasMore,
-      total: feedPagination.total,
-    });
-  } catch (e) {
-    feedPagination.loading = false;
-    renderFeedFooter();
-    toast('加载更多失败：' + e.message, true);
+    writeFeedCache(key, { videos: currentFeedVideos.slice(), pn: feedPagination.pn, hasMore: feedPagination.hasMore, total: feedPagination.total });
+  } catch (e) { feedPagination.loading = false; renderFeedFooter(); toast('加载更多失败：' + e.message, true); }
+}
+
+// ── PAGE 3: WATCH LATER QUEUE ──
+function setWlFilter(f) {
+  wlFilter = f;
+  document.querySelectorAll('#wlFilterTabs .seg-tab').forEach(b => b.classList.toggle('active', b.dataset.wlf === f));
+  moveSlider('wlFilterTabs');
+  renderWatchLaterPage();
+}
+function toggleWlCheck(bvid, checked) {
+  if (checked) wlSelectedBvids.add(bvid); else wlSelectedBvids.delete(bvid);
+  updateWlBatchBtn();
+}
+function updateWlBatchBtn() {
+  const btn = document.getElementById('wlBatchSumBtn');
+  if (!btn) return;
+  const n = wlSelectedBvids.size;
+  btn.textContent = n > 0 ? ('批量 AI 总结 (' + n + ')') : '批量 AI 总结';
+}
+function toggleWlSelectAll() {
+  const jobs = getJobs(), doneSet = new Set(jobs.filter(j => normStatus(j.status) === 'completed').map(j => j.bvid));
+  const todos = (libraryState.watch_later || []).filter(v => !doneSet.has(v.bvid));
+  if (wlSelectedBvids.size >= todos.length && todos.length > 0) wlSelectedBvids.clear();
+  else { wlSelectedBvids.clear(); todos.slice(0, 5).forEach(v => wlSelectedBvids.add(v.bvid)); }
+  renderWatchLaterPage();
+}
+async function batchSummarizeWatchLater() {
+  const bvids = Array.from(wlSelectedBvids).slice(0, 5);
+  if (!bvids.length) { toast('请先勾选需要总结的稍后再看视频（单次最多 5 条）', true); return; }
+  const btn = document.getElementById('wlBatchSumBtn'); btn.disabled = true; btn.textContent = '提交中...';
+  let ok = 0;
+  for (const bvid of bvids) {
+    const v = (libraryState.watch_later || []).find(x => x.bvid === bvid);
+    const res = await submitVideo(bvid, v ? { title: v.title, owner: v.author, duration: v.duration } : null, true);
+    if (res) { ok++; wlSelectedBvids.delete(bvid); }
   }
+  btn.disabled = false;
+  renderWatchLaterPage();
+  toast('已批量提交 ' + ok + ' 条稍后再看视频至后台总结队列');
+}
+function clearDoneWatchLater() {
+  const doneSet = new Set(getJobs().filter(j => normStatus(j.status) === 'completed').map(j => j.bvid));
+  const before = (libraryState.watch_later || []).length;
+  libraryState.watch_later = (libraryState.watch_later || []).filter(v => !doneSet.has(v.bvid));
+  const removed = before - libraryState.watch_later.length;
+  if (!removed) { toast('没有可清理的已总结视频'); return; }
+  saveLibraryLocalAndCloud();
+  renderWatchLaterPage();
+  toast('已清理 ' + removed + ' 条已总结视频');
+}
+function renderWatchLaterPage() {
+  const all = libraryState.watch_later || [];
+  const doneSet = new Set(getJobs().filter(j => normStatus(j.status) === 'completed').map(j => j.bvid));
+  const vids = all.filter(v => wlFilter === 'all' ? true : (wlFilter === 'done' ? doneSet.has(v.bvid) : !doneSet.has(v.bvid)));
+  wlRenderPool = vids;
+  document.getElementById('wlPageSub').textContent = '共 ' + all.length + ' 条待看视频（其中 ' + all.filter(v => !doneSet.has(v.bvid)).length + ' 条待总结）· 勾选可批量一键 AI 总结';
+  updateWlBatchBtn();
+  const grid = document.getElementById('wlGrid');
+  if (!vids.length) {
+    grid.innerHTML = '<div class="reader-card" style="grid-column:1/-1;text-align:center;color:var(--muted);padding:44px">当前队列为空。在「监控 UP 主」封面右上角或「摘要工作台」标题栏点击时钟图标即可加入稍后再看。</div>';
+    return;
+  }
+  grid.innerHTML = vids.map((v, idx) => buildVideoCardHtml(v, idx, { pool: 'wl', showCheck: true })).join('');
 }
 
-function openFeedSummaryModal(idx) {
-  const v = currentFeedVideos[idx];
-  if (!v) return;
-  modalSummaryRaw = v.summary || '';
-  document.getElementById('smTitle').textContent = v.title || v.bvid;
-  document.getElementById('smWatchLink').href = v.url || ('https://www.bilibili.com/video/' + v.bvid);
-  document.getElementById('smBody').innerHTML = renderRichSummary(modalSummaryRaw);
-  openModal('summaryModal');
+// ── PAGE 4: FAVORITES COLLECTION ──
+function setFavType(t) {
+  favType = t;
+  document.querySelectorAll('#favTypeTabs .seg-tab').forEach(b => b.classList.toggle('active', b.dataset.ft === t));
+  moveSlider('favTypeTabs');
+  renderFavoritesPage();
 }
-function copyModalSummary() {
-  navigator.clipboard.writeText(modalSummaryRaw || '').then(() => toast('摘要已复制')).catch(() => {});
+function setFavFolder(fid) {
+  favFolderFilter = favFolderFilter === fid ? '' : fid;
+  renderFavoritesPage();
+}
+function renderFavoritesPage() {
+  const kw = (document.getElementById('favSearchInput').value || '').trim().toLowerCase();
+  const jobs = getJobs();
+  const jobByBvid = new Map(jobs.map(j => [j.bvid, j]));
+
+  // Merge favorited videos + starred jobs deduplicated by bvid
+  const mergedMap = new Map();
+  (libraryState.favorites || []).forEach(v => { if (v && v.bvid) mergedMap.set(v.bvid, { ...v }); });
+  jobs.forEach(j => {
+    if (j.starred && j.bvid && !mergedMap.has(j.bvid)) {
+      mergedMap.set(j.bvid, { bvid: j.bvid, job_id: j.id, title: j.title, author: j.owner, duration: j.duration, url: j.video_url, added_at: j.created_at });
+    }
+  });
+  let items = Array.from(mergedMap.values());
+
+  // Folder filter chips
+  const bar = document.getElementById('favFolderBar');
+  const folders = libraryState.folders || [];
+  let barHtml = '<button class="folder-chip' + (!favFolderFilter ? ' active' : '') + '" onclick="setFavFolder(\'\')">全部标签</button>';
+  folders.forEach(f => {
+    const cnt = items.filter(v => (libraryState.job_tags[v.bvid] || []).includes(f.id)).length;
+    barHtml += '<button class="folder-chip' + (favFolderFilter === f.id ? ' active' : '') + '" onclick="setFavFolder(\'' + esc(f.id) + '\')"><span class="folder-dot" style="background:' + esc(f.color) + '"></span><span>' + esc(f.name) + '</span>' + (cnt ? '<span class="folder-cnt">' + cnt + '</span>' : '') + '</button>';
+  });
+  bar.innerHTML = barHtml;
+
+  if (favType === 'summary') items = items.filter(v => { const j = jobByBvid.get(v.bvid); return Boolean(j && normStatus(j.status) === 'completed'); });
+  else if (favType === 'video') items = items.filter(v => { const j = jobByBvid.get(v.bvid); return !j || normStatus(j.status) !== 'completed'; });
+  if (favFolderFilter) items = items.filter(v => (libraryState.job_tags[v.bvid] || []).includes(favFolderFilter));
+  if (kw) items = items.filter(v => (v.title || '').toLowerCase().includes(kw) || (v.author || '').toLowerCase().includes(kw) || (v.bvid || '').toLowerCase().includes(kw));
+
+  favRenderPool = items;
+  document.getElementById('favPageSub').textContent = '共收藏 ' + mergedMap.size + ' 条高价值内容（当前筛选 ' + items.length + ' 条）';
+  const grid = document.getElementById('favGrid');
+  if (!items.length) {
+    grid.innerHTML = '<div class="reader-card" style="grid-column:1/-1;text-align:center;color:var(--muted);padding:44px">暂无匹配的收藏内容。点击摘要页或视频封面上的星标图标即可收入收藏夹。</div>';
+    return;
+  }
+  grid.innerHTML = items.map((v, idx) => buildVideoCardHtml(v, idx, { pool: 'fav' })).join('');
 }
 
-// ── Monitor Settings Modal ──
+// ── PAGE 5: HISTORY ARCHIVE + KPI STATS ──
+function setHistStatus(s) {
+  histStatus = s;
+  document.querySelectorAll('#histStatusTabs .seg-tab').forEach(b => b.classList.toggle('active', b.dataset.hf === s));
+  moveSlider('histStatusTabs');
+  renderHistoryPage();
+}
+function setHistFolder(fid) {
+  histFolderFilter = histFolderFilter === fid ? '' : fid;
+  renderHistoryPage();
+}
+function toggleHistBatchMode() {
+  histBatchMode = !histBatchMode;
+  histSelectedIds.clear();
+  document.getElementById('histBatchBtn').textContent = histBatchMode ? '退出管理' : '批量管理';
+  document.getElementById('histBatchActions').classList.toggle('hidden', !histBatchMode);
+  renderHistoryPage();
+}
+function toggleHistSelect(id, checked) { if (checked) histSelectedIds.add(id); else histSelectedIds.delete(id); }
+function histSelectAll() { getJobs().forEach(j => histSelectedIds.add(j.id)); renderHistoryPage(); }
+function histInvertSelect() {
+  const next = new Set();
+  getJobs().forEach(j => { if (!histSelectedIds.has(j.id)) next.add(j.id); });
+  histSelectedIds = next;
+  renderHistoryPage();
+}
+function histDeleteSelected() {
+  if (!histSelectedIds.size) return;
+  if (!confirm('确定删除已选中的 ' + histSelectedIds.size + ' 条历史记录？')) return;
+  const delSet = new Set(histSelectedIds);
+  const jobs = getJobs().filter(j => !delSet.has(j.id));
+  delSet.forEach(id => apiFetch('/api/jobs/' + encodeURIComponent(id), { method: 'DELETE' }).catch(() => {}));
+  histSelectedIds.clear();
+  if (delSet.has(selectedJobId)) selectedJobId = jobs[0] ? jobs[0].id : null;
+  saveJobs(jobs);
+  renderHistoryPage();
+  toast('已批量删除');
+}
+function deleteOneJob(id) {
+  if (!confirm('确定删除这条摘要记录？')) return;
+  const jobs = getJobs().filter(j => j.id !== id);
+  if (selectedJobId === id) selectedJobId = jobs[0] ? jobs[0].id : null;
+  saveJobs(jobs);
+  apiFetch('/api/jobs/' + encodeURIComponent(id), { method: 'DELETE' }).catch(() => {});
+  renderHistoryPage();
+  toast('已删除记录');
+}
+
+function buildArchiveCardHtml(j, showBatchChk) {
+  const st = normStatus(j.status);
+  const dotCls = st === 'completed' ? 'ok' : (st === 'failed' ? 'err' : 'pending');
+  const stLabel = st === 'completed' ? '已完成' : (st === 'failed' ? '失败' : '处理中');
+  const durSec = parseDurationSec(j.duration);
+  const savedMin = (durSec >= 120 && st === 'completed') ? Math.max(1, Math.round(durSec / 60 * 0.85)) : 0;
+  const excerpt = String(j.summary || '').replace(/[#*\x60>]/g, '').replace(/\s+/g, ' ').trim().slice(0, 110);
+  const tagPills = getJobTagIds(j).map(tid => {
+    const f = getFolderById(tid);
+    return f ? '<span class="mini-tag"><span class="folder-dot" style="width:5px;height:5px;background:' + esc(f.color) + '"></span>' + esc(f.name) + '</span>' : '';
+  }).join('');
+  const wlOn = isWatchLater(j.bvid), favOn = isJobFavorited(j);
+
+  return '<div class="arch-card" onclick="selectJob(\'' + esc(j.id) + '\',true)">' +
+    '<div class="arch-top">' +
+      '<div style="display:flex;align-items:flex-start;gap:8px;min-width:0;flex:1">' +
+        (showBatchChk ? '<input type="checkbox" style="margin-top:4px;accent-color:var(--brand)" ' + (histSelectedIds.has(j.id) ? 'checked' : '') + ' onclick="event.stopPropagation()" onchange="toggleHistSelect(\'' + esc(j.id) + '\',this.checked)">' : '') +
+        '<div class="arch-title">' + esc(j.title || j.bvid) + '</div>' +
+      '</div>' +
+      '<span class="st-badge ' + dotCls + '" style="flex-shrink:0">' + stLabel + '</span>' +
+    '</div>' +
+    '<div class="arch-meta">' +
+      (j.owner ? '<span>' + esc(j.owner) + '</span>' : '') +
+      (j.duration ? '<span>· ' + esc(j.duration) + '</span>' : '') +
+      (savedMin ? '<span style="color:var(--ok-text);font-weight:600">· 省约 ' + savedMin + ' 分钟</span>' : '') +
+      '<span>· ' + esc(j.bvid || '') + '</span>' +
+    '</div>' +
+    (excerpt ? '<div class="arch-excerpt">' + esc(excerpt) + '</div>' : '') +
+    (tagPills ? '<div class="mini-tags" style="margin-top:0">' + tagPills + '</div>' : '') +
+    '<div class="arch-foot" onclick="event.stopPropagation()">' +
+      '<span style="font-size:11.5px;color:var(--muted)">' + esc(fmtShortDate(j.created_at)) + '</span>' +
+      '<div class="arch-acts">' +
+        '<button type="button" class="arch-ic-btn" title="添加标签" onclick="openTagPopover(this,\'job\',\'' + esc(jobTagKey(j)) + '\')">' + SVG_TAG_SM + '</button>' +
+        '<button type="button" class="arch-ic-btn' + (wlOn ? ' wl-on' : '') + '" title="稍后再看" onclick="toggleWatchLaterVideo({bvid:\'' + esc(j.bvid) + '\',job_id:\'' + esc(j.id) + '\',title:' + JSON.stringify(j.title || '') + ',author:' + JSON.stringify(j.owner || '') + ',duration:' + JSON.stringify(j.duration || '') + '})">' + SVG_CLOCK_SM + '</button>' +
+        '<button type="button" class="arch-ic-btn' + (favOn ? ' fav-on' : '') + '" title="收藏" onclick="toggleFavoriteVideo({bvid:\'' + esc(j.bvid) + '\',job_id:\'' + esc(j.id) + '\',title:' + JSON.stringify(j.title || '') + ',author:' + JSON.stringify(j.owner || '') + ',duration:' + JSON.stringify(j.duration || '') + '})">' + SVG_STAR_LINE + '</button>' +
+        '<button type="button" class="arch-ic-btn del" title="删除" onclick="deleteOneJob(\'' + esc(j.id) + '\')">' + SVG_TRASH_SM + '</button>' +
+      '</div>' +
+    '</div>' +
+  '</div>';
+}
+
+function renderHistoryPage() {
+  const jobs = getJobs();
+  const completed = jobs.filter(j => normStatus(j.status) === 'completed');
+  const totalSec = completed.reduce((acc, j) => acc + parseDurationSec(j.duration), 0);
+  const savedMin = Math.max(0, Math.round(totalSec / 60 * 0.85));
+  const totalChars = completed.reduce((acc, j) => acc + (j.transcript || '').length, 0);
+  const favCnt = (libraryState.favorites || []).length + jobs.filter(j => j.starred && !isFavBvid(j.bvid)).length;
+  const wlCnt = (libraryState.watch_later || []).length;
+
+  document.getElementById('kpiGrid').innerHTML =
+    '<div class="kpi-card"><div class="kpi-label">已归档摘要</div><div class="kpi-val">' + completed.length + '</div><div class="kpi-sub">全部历史任务 ' + jobs.length + ' 条</div></div>' +
+    '<div class="kpi-card"><div class="kpi-label">累计节省时长</div><div class="kpi-val">' + savedMin + ' 分钟</div><div class="kpi-sub">约 ' + (savedMin / 60).toFixed(1) + ' 小时高效精读</div></div>' +
+    '<div class="kpi-card"><div class="kpi-label">收藏与稍后再看</div><div class="kpi-val">' + favCnt + ' / ' + wlCnt + '</div><div class="kpi-sub">云端 R2 实时同步</div></div>' +
+    '<div class="kpi-card"><div class="kpi-label">累计免费转录</div><div class="kpi-val">' + (totalChars >= 10000 ? (totalChars / 10000).toFixed(1) + ' 万字' : totalChars + ' 字') + '</div><div class="kpi-sub">100% 免费模型驱动</div></div>';
+
+  // Folder filter bar
+  const folders = libraryState.folders || [];
+  let fHtml = '<button class="folder-chip' + (!histFolderFilter ? ' active' : '') + '" onclick="setHistFolder(\'\')">全部标签</button>';
+  folders.forEach(f => {
+    const cnt = jobs.filter(j => getJobTagIds(j).includes(f.id)).length;
+    fHtml += '<button class="folder-chip' + (histFolderFilter === f.id ? ' active' : '') + '" onclick="setHistFolder(\'' + esc(f.id) + '\')"><span class="folder-dot" style="background:' + esc(f.color) + '"></span><span>' + esc(f.name) + '</span>' + (cnt ? '<span class="folder-cnt">' + cnt + '</span>' : '') + '</button>';
+  });
+  document.getElementById('histFolderBar').innerHTML = fHtml;
+
+  const kw = (document.getElementById('histSearchInput').value || '').trim().toLowerCase();
+  let filtered = jobs;
+  if (histStatus !== 'all') filtered = filtered.filter(j => normStatus(j.status) === histStatus);
+  if (histFolderFilter) filtered = filtered.filter(j => getJobTagIds(j).includes(histFolderFilter));
+  if (kw) filtered = filtered.filter(j => (j.title || '').toLowerCase().includes(kw) || (j.owner || '').toLowerCase().includes(kw) || (j.bvid || '').toLowerCase().includes(kw));
+
+  document.getElementById('histPageSub').textContent = '共 ' + filtered.length + ' 条匹配记录 · 点击卡片直接进入摘要工作台精读';
+  const grid = document.getElementById('histArchiveGrid');
+  if (!filtered.length) {
+    grid.innerHTML = '<div class="reader-card" style="grid-column:1/-1;text-align:center;color:var(--muted);padding:42px">暂无匹配的历史归档记录</div>';
+    return;
+  }
+  grid.innerHTML = filtered.map(j => buildArchiveCardHtml(j, histBatchMode)).join('');
+}
+
+// ── PAGE 6: GLOBAL TAG FOLDER AGGREGATION PAGE ──
+function setFolderViewTab(tab) {
+  folderViewTab = tab;
+  document.querySelectorAll('#folderViewTabs .seg-tab').forEach(b => b.classList.toggle('active', b.dataset.fvt === tab));
+  moveSlider('folderViewTabs');
+  document.getElementById('folderSummariesPane').classList.toggle('hidden', tab !== 'summaries');
+  document.getElementById('folderUpsPane').classList.toggle('hidden', tab !== 'ups');
+  if (tab === 'ups' && activeFolderId) loadFolderUpsFeed(activeFolderId, false);
+}
+
+function renderFolderSummaries(fid) {
+  const jobs = getJobs().filter(j => getJobTagIds(j).includes(fid));
+  const grid = document.getElementById('folderSummariesGrid');
+  if (!jobs.length) {
+    grid.innerHTML = '<div class="reader-card" style="grid-column:1/-1;text-align:center;color:var(--muted);padding:40px">该标签文件夹下暂无摘要。在任意摘要详情页或历史记录中点击标签图标即可归入本文件夹。</div>';
+    return;
+  }
+  grid.innerHTML = jobs.map(j => buildArchiveCardHtml(j, false)).join('');
+}
+
+function renderFolderPage(fid, resetTab) {
+  initFeedObservers();
+  const f = getFolderById(fid);
+  if (!f) { navigate('history'); return; }
+  const sumCnt = getJobs().filter(j => getJobTagIds(j).includes(fid)).length;
+  const upCnt = (monitorConfig.up_list || []).filter(u => getUpTagIds(u.mid).includes(fid)).length;
+
+  document.getElementById('topbarTitle').textContent = '文件夹 · ' + f.name;
+  document.getElementById('folderPageDot').style.background = f.color;
+  document.getElementById('folderPageName').textContent = f.name;
+  document.getElementById('folderPageSub').textContent = '已收录 ' + sumCnt + ' 篇摘要 · 关联 ' + upCnt + ' 位监控 UP 主';
+  renderFolderSummaries(fid);
+
+  if (resetTab) {
+    folderViewTab = (sumCnt === 0 && upCnt > 0) ? 'ups' : 'summaries';
+    document.querySelectorAll('#folderViewTabs .seg-tab').forEach(b => b.classList.toggle('active', b.dataset.fvt === folderViewTab));
+    document.getElementById('folderSummariesPane').classList.toggle('hidden', folderViewTab !== 'summaries');
+    document.getElementById('folderUpsPane').classList.toggle('hidden', folderViewTab !== 'ups');
+  }
+  if (folderViewTab === 'ups') loadFolderUpsFeed(fid, false);
+}
+
+function renderFolderFeedFooter() {
+  const footer = document.getElementById('folderFeedFooter');
+  if (!footer) return;
+  const count = folderFeedVideos.length;
+  if (!count) { footer.innerHTML = ''; return; }
+  if (folderPagination.loading) footer.innerHTML = '<button class="feed-load-btn" disabled>正在加载更早的视频...</button>';
+  else if (folderPagination.hasMore) footer.innerHTML = '<button class="feed-load-btn" onclick="loadMoreFolderUpsFeed()">加载更多分类视频</button><div class="feed-meta-note">已加载 ' + count + ' 条</div>';
+  else footer.innerHTML = '<div class="feed-meta-note">已加载全部 ' + count + ' 条分类视频</div>';
+}
+
+async function loadFolderUpsFeed(fid, forceRefresh) {
+  const key = 'folder:' + fid;
+  const grid = document.getElementById('folderUpsGrid');
+  const ups = (monitorConfig.up_list || []).filter(u => getUpTagIds(u.mid).includes(fid));
+  if (!ups.length) {
+    folderFeedVideos = [];
+    folderPagination = { key, pn: 1, hasMore: false, loading: false, total: 0 };
+    grid.innerHTML = '<div class="reader-card" style="grid-column:1/-1;text-align:center;color:var(--muted);padding:40px">该标签下暂无监控 UP 主。前往「监控 UP 主」点击 UP 主右侧标签图标即可归入本文件夹。</div>';
+    renderFolderFeedFooter();
+    return;
+  }
+  const cached = !forceRefresh ? readFeedCache(key) : null;
+  if (cached && (Date.now() - cached.ts) < FEED_CACHE_TTL_MS) {
+    folderFeedVideos = cached.videos.slice();
+    folderPagination = { key, pn: cached.pn || 1, hasMore: Boolean(cached.hasMore), loading: false, total: cached.total || 0 };
+    grid.innerHTML = folderFeedVideos.map((v, idx) => buildVideoCardHtml(v, idx, { pool: 'folder' })).join('');
+    renderFolderFeedFooter();
+    return;
+  }
+  folderPagination = { key, pn: 1, hasMore: false, loading: true, total: 0 };
+  grid.innerHTML = renderSkeletonGrid();
+  try {
+    const r = await apiFetch(buildUpFeedApiUrl(key, 1, forceRefresh));
+    const d = await r.json();
+    const vids = (r.ok && d.videos) ? d.videos : [];
+    folderFeedVideos = vids.slice();
+    folderPagination = { key, pn: 1, hasMore: Boolean(d.has_more), loading: false, total: Number(d.total) || 0 };
+    writeFeedCache(key, { videos: vids, pn: 1, hasMore: folderPagination.hasMore, total: folderPagination.total });
+    grid.innerHTML = vids.length ? vids.map((v, idx) => buildVideoCardHtml(v, idx, { pool: 'folder' })).join('') : '<div class="reader-card" style="grid-column:1/-1;text-align:center;color:var(--muted);padding:36px">暂无公开视频</div>';
+    renderFolderFeedFooter();
+  } catch { folderPagination.loading = false; grid.innerHTML = '<div class="reader-card" style="grid-column:1/-1;color:var(--err-text)">动态拉取失败</div>'; }
+}
+
+async function loadMoreFolderUpsFeed() {
+  const key = 'folder:' + activeFolderId;
+  if (folderPagination.loading || !folderPagination.hasMore || folderPagination.key !== key) return;
+  const nextPn = (folderPagination.pn || 1) + 1;
+  folderPagination.loading = true; renderFolderFeedFooter();
+  try {
+    const r = await apiFetch(buildUpFeedApiUrl(key, nextPn, false));
+    const d = await r.json();
+    if (!r.ok || activeFolderId !== key.slice(7)) { folderPagination.loading = false; renderFolderFeedFooter(); return; }
+    const seen = new Set(folderFeedVideos.map(v => v.bvid));
+    const incoming = (d.videos || []).filter(v => v && v.bvid && !seen.has(v.bvid));
+    const startIdx = folderFeedVideos.length;
+    folderFeedVideos.push(...incoming);
+    folderPagination.pn = nextPn;
+    folderPagination.hasMore = Boolean(d.has_more) && incoming.length > 0;
+    folderPagination.loading = false;
+    if (incoming.length) document.getElementById('folderUpsGrid').insertAdjacentHTML('beforeend', incoming.map((v, i) => buildVideoCardHtml(v, startIdx + i, { pool: 'folder' })).join(''));
+    writeFeedCache(key, { videos: folderFeedVideos.slice(), pn: folderPagination.pn, hasMore: folderPagination.hasMore, total: folderPagination.total });
+    renderFolderFeedFooter();
+  } catch { folderPagination.loading = false; renderFolderFeedFooter(); }
+}
+
+// ── Monitor Settings Modal (Schedule + Email Styles + Shy Cron) ──
+async function openMonitorModal() {
+  openModal('monitorModal');
+  requestAnimationFrame(() => moveSlider('monitorTabs', true));
+  await loadMonitorConfig();
+}
 function switchMonitorTab(tab) {
-  document.querySelectorAll('#monitorTabs .m-tab').forEach(b => b.classList.toggle('active', b.dataset.mtab === tab));
+  document.querySelectorAll('#monitorTabs .seg-tab').forEach(b => b.classList.toggle('active', b.dataset.mtab === tab));
   moveSlider('monitorTabs');
-  const sEl = document.getElementById('mTabSchedule');
-  const eEl = document.getElementById('mTabEmail');
-  sEl.classList.toggle('hidden', tab !== 'schedule');
-  eEl.classList.toggle('hidden', tab !== 'email');
-  playAnim(tab === 'schedule' ? sEl : eEl);
+  document.getElementById('mTabSchedule').classList.toggle('hidden', tab !== 'schedule');
+  document.getElementById('mTabEmail').classList.toggle('hidden', tab !== 'email');
   if (tab === 'email') renderEmailPreview();
 }
 async function loadMonitorConfig() {
   try {
-    const r = await fetch('/api/monitor-config', { headers: { 'Authorization': 'Bearer ' + getAuthToken() } });
-    if (r.status === 401) { doLogout(); openModal('loginModal'); return; }
+    const r = await apiFetch('/api/monitor-config');
+    if (!r.ok) return;
     const d = await r.json();
     if (d.config) monitorConfig = d.config;
     hydrateMonitorForm();
+    updateNavBadges();
+    renderRailFolders();
   } catch (e) { showToast('monitorToast', '加载配置失败: ' + e.message, 'err'); }
 }
 function hydrateMonitorForm() {
@@ -4872,120 +5162,112 @@ function hydrateMonitorForm() {
   document.getElementById('cfgMergeEmails').checked = monitorConfig.merge_emails !== false;
   document.getElementById('cfgSmtpTo').value = monitorConfig.smtp_to || '';
   syncAllCustomSelects();
-  onScheduleModeChange();
-  renderTimeChips();
-  renderUpChips();
-  selectEmailStyle(monitorConfig.email_style || 'editorial');
-  requestAnimationFrame(() => moveSlider('monitorTabs', true));
-  const syncEl = document.getElementById('cronSyncStatus');
+  onScheduleModeChange(); renderTimeChips(); renderUpChips();
+  selectEmailStyle(monitorConfig.email_style || 'editorial', true);
+  const note = document.getElementById('cronSyncNote');
   if (monitorConfig.last_cron_sync) {
     const s = monitorConfig.last_cron_sync;
-    syncEl.innerHTML = s.ok ? ('已同步至 Shy Cron（任务 ID: <code>' + esc(s.task_id) + '</code> · 下次运行: ' + esc(s.next_run_at || '已调度') + '）') : ('上次同步提示：' + esc(s.error || s.reason || '未同步'));
-  } else syncEl.textContent = '保存后将自动同步至 Shy Cron（cron.shyapi.de5.net）';
+    note.textContent = s.ok ? ('已同步至 Shy Cron（任务 ID: ' + (s.task_id || 'bilisum-daily-monitor') + (s.next_run_at ? (' · 下次运行: ' + s.next_run_at) : '') + '）') : ('Shy Cron 同步提示：' + (s.error || s.reason || '未同步'));
+  } else note.textContent = '保存后将自动同步至 Shy Cron (cron.shyapi.de5.net)';
 }
 function onScheduleModeChange() {
   const mode = document.getElementById('cfgScheduleMode').value;
-  document.getElementById('customCronWrap').style.display = mode === 'custom' ? 'flex' : 'none';
-  document.getElementById('timeAddWrap').style.display = mode === 'times' ? 'flex' : 'none';
-  document.getElementById('timeChips').style.display = mode === 'times' ? 'flex' : 'none';
-  updateCronPreview();
+  document.getElementById('timesInputWrap').classList.toggle('hidden', mode !== 'times');
+  document.getElementById('timeChipList').classList.toggle('hidden', mode !== 'times');
+  document.getElementById('customCronWrap').classList.toggle('hidden', mode !== 'custom');
+  updateCronBadge();
 }
-function computeClientUtcCron() {
+function computeClientCron() {
   const mode = document.getElementById('cfgScheduleMode').value;
   if (mode === 'every_6h') return '0 */6 * * *';
   if (mode === 'every_12h') return '0 0,12 * * *';
-  if (mode === 'custom') return document.getElementById('cfgCustomCron').value.trim() || '0 0,12 * * *';
+  if (mode === 'custom') return (document.getElementById('cfgCustomCron').value || '').trim() || '0 0,12 * * *';
   const times = monitorConfig.times_cst || ['08:00', '20:00'];
-  if (!times.length) return '0 0,12 * * *';
-  const min = parseInt(times[0].split(':')[1], 10) || 0;
-  const hrs = [];
-  times.forEach(t => { const h = (parseInt(t.split(':')[0], 10) - 8 + 24) % 24; if (!hrs.includes(h)) hrs.push(h); });
-  hrs.sort((a, b) => a - b);
-  return min + ' ' + hrs.join(',') + ' * * *';
+  const parsed = times.map(t => { const m = /^(\d{1,2}):(\d{2})$/.exec(t); return m ? { h: (parseInt(m[1], 10) - 8 + 24) % 24, min: parseInt(m[2], 10) } : null; }).filter(Boolean);
+  if (!parsed.length) return '0 0,12 * * *';
+  const mins = parsed[0].min, hrs = [...new Set(parsed.map(p => p.h))].sort((a, b) => a - b);
+  return mins + ' ' + hrs.join(',') + ' * * *';
 }
-function updateCronPreview() { document.getElementById('cronUtcPreview').textContent = 'UTC Cron: ' + computeClientUtcCron(); }
+function updateCronBadge() { document.getElementById('cronPreviewBadge').textContent = 'UTC Cron: ' + computeClientCron(); }
 function renderTimeChips() {
-  document.getElementById('timeChips').innerHTML = (monitorConfig.times_cst || []).map((t, i) => '<span class="chip"><b>北京时间 ' + esc(t) + '</b><button type="button" onclick="removeTimeSlot(' + i + ')">×</button></span>').join('');
-  updateCronPreview();
+  const times = monitorConfig.times_cst || [];
+  document.getElementById('timeChipList').innerHTML = times.map((t, i) => '<span class="chip"><span>北京时间 ' + esc(t) + '</span><button type="button" onclick="removeTimeSlot(' + i + ')">&times;</button></span>').join('');
+  updateCronBadge();
 }
 function addTimeSlot() {
-  const val = document.getElementById('newTimeInput').value;
-  if (!val) return;
+  const val = (document.getElementById('newTimeInput').value || '').trim();
+  if (!/^\d{2}:\d{2}$/.test(val)) return;
   if (!monitorConfig.times_cst) monitorConfig.times_cst = [];
   if (!monitorConfig.times_cst.includes(val)) { monitorConfig.times_cst.push(val); monitorConfig.times_cst.sort(); }
   renderTimeChips();
 }
 function removeTimeSlot(idx) {
-  monitorConfig.times_cst.splice(idx, 1);
+  monitorConfig.times_cst = (monitorConfig.times_cst || []).filter((_, i) => i !== idx);
   if (!monitorConfig.times_cst.length) monitorConfig.times_cst = ['08:00'];
   renderTimeChips();
 }
 function renderUpChips() {
   const ups = monitorConfig.up_list || [];
-  document.getElementById('upCountLabel').textContent = String(ups.length);
-  document.getElementById('upChips').innerHTML = ups.map((u, i) => '<span class="chip"><b>' + esc(u.name || u.mid) + '</b><small>' + esc(u.mid) + '</small><button type="button" onclick="removeUp(' + i + ')">×</button></span>').join('');
+  document.getElementById('upCountSpan').textContent = String(ups.length);
+  document.getElementById('upChipList').innerHTML = ups.map((u, i) => '<span class="chip"><span>' + esc(u.name || u.mid) + '</span><span class="chip-sub">' + esc(u.mid) + '</span><button type="button" onclick="removeUpCreator(' + i + ')">&times;</button></span>').join('');
 }
+function removeUpCreator(idx) { monitorConfig.up_list = (monitorConfig.up_list || []).filter((_, i) => i !== idx); renderUpChips(); }
 async function addUpCreator() {
-  const inp = document.getElementById('newUpInput');
-  const q = inp.value.trim();
+  const inp = document.getElementById('upAddInput'), q = inp.value.trim();
   if (!q) return;
-  const btn = document.getElementById('addUpBtn');
-  btn.disabled = true; btn.textContent = '解析中...';
+  const btn = document.getElementById('upAddBtn'); btn.disabled = true; btn.textContent = '解析中...';
   try {
-    const r = await fetch('/api/up-lookup?q=' + encodeURIComponent(q), { headers: { 'Authorization': 'Bearer ' + getAuthToken() } });
+    const r = await apiFetch('/api/up-lookup?q=' + encodeURIComponent(q));
     const d = await r.json();
     if (!r.ok) { showToast('monitorToast', d.error || '解析失败', 'err'); return; }
     if (!monitorConfig.up_list) monitorConfig.up_list = [];
     if (!monitorConfig.up_list.some(x => Number(x.mid) === Number(d.mid))) monitorConfig.up_list.push({ mid: Number(d.mid), name: d.name || String(d.mid), face: d.face || '' });
     inp.value = ''; renderUpChips();
-    showToast('monitorToast', '已添加 UP 主：' + (d.name || d.mid), 'ok');
+    showToast('monitorToast', '已添加 UP 主：' + (d.name || d.mid) + '（保存后生效）', 'ok');
   } catch (e) { showToast('monitorToast', '解析异常: ' + e.message, 'err'); }
   finally { btn.disabled = false; btn.textContent = '解析并添加'; }
 }
-function removeUp(idx) { monitorConfig.up_list.splice(idx, 1); renderUpChips(); }
-
-const PREVIEW_THEMES = {
-  editorial: { name:'编辑部日报', pageBg:'#f3f4f6', bodyBg:'#f8fafc', hdBg:'#111827', hdTop:'4px solid #fb7299', hdTitle:'#ffffff', hdMeta:'#9ca3af', p1Bg:'rgba(251,114,153,.16)', p1C:'#fda4af', p1B:'rgba(251,114,153,.35)', p2Bg:'rgba(255,255,255,.08)', p2C:'#e5e7eb', p2B:'rgba(255,255,255,.14)', accent:'#fb7299', accentDark:'#e11d48', thBg:'#fff5f7', thB:'#fb7299', bgBadge:'#fff1f5', cBadge:'#e11d48', bBadge:'#fecdd3', btnBg:'#111827', compact:false },
-  minimal: { name:'极简纸刊', pageBg:'#ffffff', bodyBg:'#ffffff', hdBg:'#ffffff', hdTop:'3px solid #111827', hdTitle:'#111827', hdMeta:'#6b7280', p1Bg:'#f3f4f6', p1C:'#111827', p1B:'#e5e7eb', p2Bg:'#f9fafb', p2C:'#4b5563', p2B:'#e5e7eb', accent:'#111827', accentDark:'#111827', thBg:'#f9fafb', thB:'#111827', bgBadge:'#f3f4f6', cBadge:'#374151', bBadge:'#e5e7eb', btnBg:'#111827', compact:false },
-  bilibili: { name:'B站元气粉', pageBg:'#fff7f9', bodyBg:'#fffbfc', hdBg:'linear-gradient(135deg,#fb7299,#ff8fab)', hdTop:'none', hdTitle:'#ffffff', hdMeta:'rgba(255,255,255,.9)', p1Bg:'rgba(255,255,255,.22)', p1C:'#ffffff', p1B:'rgba(255,255,255,.35)', p2Bg:'rgba(255,255,255,.16)', p2C:'#ffffff', p2B:'rgba(255,255,255,.28)', accent:'#fb7299', accentDark:'#ec4899', thBg:'#fff1f5', thB:'#fb7299', bgBadge:'#ffe4ec', cBadge:'#db2777', bBadge:'#fbcfe8', btnBg:'#fb7299', compact:false },
-  compact: { name:'极速速览', pageBg:'#f1f5f9', bodyBg:'#ffffff', hdBg:'#0f172a', hdTop:'3px solid #38bdf8', hdTitle:'#f8fafc', hdMeta:'#94a3b8', p1Bg:'rgba(56,189,248,.16)', p1C:'#7dd3fc', p1B:'rgba(56,189,248,.3)', p2Bg:'rgba(255,255,255,.08)', p2C:'#cbd5e1', p2B:'rgba(255,255,255,.14)', accent:'#0284c7', accentDark:'#0369a1', thBg:'#f0f9ff', thB:'#0284c7', bgBadge:'#e0f2fe', cBadge:'#0369a1', bBadge:'#bae6fd', btnBg:'#0f172a', compact:true },
-};
-function selectEmailStyle(style) {
-  monitorConfig.email_style = PREVIEW_THEMES[style] ? style : 'editorial';
-  document.querySelectorAll('.style-card').forEach(c => c.classList.toggle('selected', c.dataset.style === monitorConfig.email_style));
+function selectEmailStyle(style, skipAnim) {
+  monitorConfig.email_style = style || 'editorial';
+  document.querySelectorAll('#emailStyleGrid .style-card').forEach(el => el.classList.toggle('selected', el.dataset.style === monitorConfig.email_style));
+  const names = { editorial: '编辑部日报', minimal: '极简纸刊', bilibili: 'B站元气粉', compact: '极速速览' };
+  document.getElementById('previewStyleName').textContent = names[monitorConfig.email_style] || '编辑部日报';
   renderEmailPreview();
 }
 function renderEmailPreview() {
-  const st = monitorConfig.email_style || 'editorial';
-  const th = PREVIEW_THEMES[st] || PREVIEW_THEMES.editorial;
-  const merge = document.getElementById('cfgMergeEmails').checked;
-  const pad = th.compact ? '12px 14px' : '18px 20px';
-  const fs = th.compact ? '12px' : '13px';
-  const hb = st === 'minimal' ? 'border-bottom:1px solid #e5e7eb;' : '';
-  const url1 = 'https://www.bilibili.com/video/BV149ypz6Ehs', url2 = 'https://www.bilibili.com/video/BV19Vsq6xEW9';
-  document.getElementById('emailPreviewFrame').srcdoc = '<!doctype html><html><body style="margin:0;padding:14px;background:' + th.pageBg + ';font-family:-apple-system,PingFang SC,sans-serif;color:#111827"><div style="max-width:600px;margin:0 auto"><div style="background:' + th.hdBg + ';border-top:' + th.hdTop + ';border-left:1px solid #e5e7eb;border-right:1px solid #e5e7eb;' + hb + 'border-radius:12px 12px 0 0;padding:18px 20px"><div style="font-size:10px;letter-spacing:1.2px;color:' + th.hdMeta + ';margin-bottom:5px">BILIBILI AI DAILY BRIEFING · 2026年11月21日</div><div style="font-size:19px;font-weight:800;color:' + th.hdTitle + ';margin-bottom:9px">B站视频 AI 日报</div><span style="display:inline-block;background:' + th.p1Bg + ';color:' + th.p1C + ';border:1px solid ' + th.p1B + ';border-radius:999px;padding:2px 9px;font-size:11px;font-weight:600;margin-right:6px">' + (merge ? '覆盖 2 位 UP 主' : '按 UP 主分封推送') + '</span><span style="display:inline-block;background:' + th.p2Bg + ';color:' + th.p2C + ';border:1px solid ' + th.p2B + ';border-radius:999px;padding:2px 9px;font-size:11px">共 ' + (merge ? '2' : '1') + ' 支新视频</span></div><div style="background:' + th.bodyBg + ';border:1px solid #e5e7eb;border-top:none;border-radius:0 0 12px 12px;padding:16px">' + (merge ? '<div style="background:#f9fafb;border:1px solid #e5e7eb;border-radius:8px;padding:10px 12px;margin-bottom:14px;font-size:12px;line-height:1.8"><div style="font-size:10px;font-weight:700;color:#6b7280;margin-bottom:4px">本期速览 · TABLE OF CONTENTS</div><div><b style="color:' + th.accent + ';margin-right:5px">01</b><a href="' + url1 + '" target="_blank" style="color:#1f2937;text-decoration:none;border-bottom:1px solid #e5e7eb"><b style="color:' + th.accentDark + '">[波士顿圆脸]</b> 前所未见：巴西亚马逊原始部落拖家带口现身求救</a></div><div><b style="color:' + th.accent + ';margin-right:5px">02</b><a href="' + url2 + '" target="_blank" style="color:#1f2937;text-decoration:none;border-bottom:1px solid #e5e7eb"><b style="color:' + th.accentDark + '">[刺客边风]</b> 开源本地光猫配置解析工具实测</a></div></div>' : '') + '<div style="background:#fff;border:1px solid #e5e7eb;border-radius:10px;padding:' + pad + '"><div style="margin-bottom:7px"><span style="font-family:Consolas,monospace;font-size:11px;color:#9ca3af;margin-right:6px">#01</span><span style="display:inline-block;background:' + th.bgBadge + ';color:' + th.cBadge + ';border:1px solid ' + th.bBadge + ';border-radius:999px;padding:1px 8px;font-size:11px;font-weight:600;margin-right:6px">波士顿圆脸</span><span style="font-size:11px;color:#9ca3af">时长 11:16 · 11-20 10:49</span></div><div style="font-size:15px;font-weight:700;margin-bottom:10px"><a href="' + url1 + '" target="_blank" style="color:#111827;text-decoration:none">前所未见：巴西亚马逊原始部落拖家带口现身求救</a></div><div style="background:' + th.thBg + ';border-left:3px solid ' + th.thB + ';border-radius:0 6px 6px 0;padding:9px 12px;margin-bottom:10px"><div style="font-size:10px;font-weight:700;color:' + th.accentDark + ';margin-bottom:3px">核心主题</div><div style="font-size:' + fs + ';line-height:1.6">记录巴西亚马逊与世隔绝原始部落携家带口现身求救事件，剖析雨林生态与现代疾病风险。</div></div><div style="font-size:' + fs + ';line-height:1.65;color:#374151;margin-bottom:10px"><div><b style="color:' + th.accent + '">1.</b> <b>罕见接触</b>：二三十名阿瓦人主动接触原住民哨所索要食物。</div><div><b style="color:' + th.accent + '">2.</b> <b>生存威胁</b>：非法淘金与盗伐加剧，挤压原住民生存空间。</div></div><div style="display:flex;justify-content:space-between;align-items:center;border-top:1px dashed #e5e7eb;padding-top:9px"><a href="' + url1 + '" target="_blank" style="background:' + th.btnBg + ';color:#fff;padding:5px 11px;border-radius:6px;font-size:11.5px;font-weight:600;text-decoration:none">前往 B 站观看 ↗</a><span style="font-size:11px;color:#9ca3af;font-family:Consolas,monospace">BV149ypz6Ehs</span></div></div></div></div></body></html>';
+  const st = monitorConfig.email_style || 'editorial', stage = document.getElementById('emailPreviewStage');
+  const v1 = 'https://www.bilibili.com/video/BV149ypz6Ehs', v2 = 'https://www.bilibili.com/video/BV1ZssS6iEB9';
+  if (st === 'minimal') {
+    stage.innerHTML = '<div style="max-width:560px;margin:0 auto;background:#fff;border:1px solid #e5e7eb;border-radius:10px;padding:20px;color:#111827"><div style="border-bottom:2px solid #18181b;padding-bottom:10px;margin-bottom:14px"><div style="font-size:11px;color:#6b7280">BILIBILI DAILY · 2026-11-21</div><div style="font-size:17px;font-weight:800;margin-top:2px">B站视频监控日报 · 共 2 支新视频</div></div><div style="margin-bottom:14px;padding:10px 12px;background:#f9fafb;border-radius:8px;font-size:12px"><div style="font-weight:700;margin-bottom:5px;color:#6b7280">本期速览</div><div>01 <a href="' + v1 + '" target="_blank" style="color:#111827;text-decoration:none"><strong>[波士顿圆脸]</strong> 前所未见：巴西亚马逊原始部落拖家带口现身求救</a></div><div>02 <a href="' + v2 + '" target="_blank" style="color:#111827;text-decoration:none"><strong>[刺客边风]</strong> 开源本地光猫配置解析工具实测</a></div></div><div style="border-top:1px solid #e5e7eb;padding-top:12px"><div style="font-size:14px;font-weight:700;margin-bottom:4px"><a href="' + v1 + '" target="_blank" style="color:#111827;text-decoration:none">前所未见：巴西亚马逊原始部落拖家带口现身求救</a></div><div style="font-size:11.5px;color:#6b7280;margin-bottom:8px">波士顿圆脸 · 11:16</div><div style="font-size:12.5px;color:#374151;line-height:1.65"><strong>核心主题：</strong>巴西亚马逊阿瓦原始部落罕见主动接触现代社会，折射雨林治理与文化保护难题。</div></div></div>';
+  } else if (st === 'bilibili') {
+    stage.innerHTML = '<div style="max-width:560px;margin:0 auto;background:#fff;border-radius:12px;overflow:hidden;border:1px solid #fecdd3;color:#1f2937"><div style="background:linear-gradient(135deg,#fb7299,#ff85a7);padding:18px 20px;color:#fff"><div style="font-size:11px;opacity:.9">BILIBILI MONITOR · 2026-11-21</div><div style="font-size:18px;font-weight:800;margin-top:3px">B站今日新更精炼日报</div></div><div style="padding:16px 20px;background:#fff5f7"><div style="background:#fff;border:1px solid #fecdd3;border-radius:10px;padding:12px 14px;margin-bottom:12px;font-size:12px"><div style="font-weight:700;color:#e11d48;margin-bottom:5px">本期速览</div><div>01 <a href="' + v1 + '" target="_blank" style="color:#1f2937;text-decoration:none">[波士顿圆脸] 前所未见：巴西亚马逊原始部落现身求救</a></div><div>02 <a href="' + v2 + '" target="_blank" style="color:#1f2937;text-decoration:none">[刺客边风] 开源本地光猫配置解析工具实测</a></div></div><div style="background:#fff;border-radius:10px;padding:14px;border:1px solid #ffe4e6"><div style="font-size:14px;font-weight:700;margin-bottom:6px"><a href="' + v1 + '" target="_blank" style="color:#111827;text-decoration:none">前所未见：巴西亚马逊原始部落拖家带口现身求救</a></div><div style="background:#fff1f5;border-left:3px solid #fb7299;padding:8px 10px;font-size:12px;line-height:1.6"><strong>核心主题：</strong>阿瓦部落因生态恶化与外部侵扰现身求救，引发疾病免疫与保护区治理讨论。</div></div></div></div>';
+  } else if (st === 'compact') {
+    stage.innerHTML = '<div style="max-width:560px;margin:0 auto;background:#fff;border:1px solid #e2e8f0;border-radius:10px;overflow:hidden;color:#0f172a"><div style="background:#2563eb;color:#fff;padding:12px 16px;display:flex;justify-content:space-between;align-items:center"><strong style="font-size:14px">B站视频速览 · 2026-11-21</strong><span style="font-size:11px;opacity:.9">2 支更新</span></div><div style="padding:12px 16px;font-size:12.5px"><div style="padding:8px 0;border-bottom:1px solid #f1f5f9"><div><span style="background:#eff6ff;color:#1d4ed8;padding:1px 6px;border-radius:4px;font-size:11px;font-weight:700">波士顿圆脸</span> <a href="' + v1 + '" target="_blank" style="color:#0f172a;font-weight:700;text-decoration:none">前所未见：巴西亚马逊原始部落拖家带口现身求救</a></div><div style="color:#475569;margin-top:4px;font-size:12px">阿瓦原始部落罕见接触现代社会，折射传染病与治理困境。</div></div><div style="padding:8px 0"><div><span style="background:#eff6ff;color:#1d4ed8;padding:1px 6px;border-radius:4px;font-size:11px;font-weight:700">刺客边风</span> <a href="' + v2 + '" target="_blank" style="color:#0f172a;font-weight:700;text-decoration:none">开源本地光猫配置解析工具实测</a></div><div style="color:#475569;margin-top:4px;font-size:12px">纯本地开源提取光猫超管密码，免联网零隐私风险。</div></div></div></div>';
+  } else {
+    stage.innerHTML = '<div style="max-width:560px;margin:0 auto;background:#fff;border-radius:12px;overflow:hidden;border:1px solid #e2e8f0;color:#1e293b"><div style="background:linear-gradient(135deg,#0f172a,#1e293b);padding:18px 20px;border-bottom:3px solid #fb7299"><div style="font-size:10px;color:#fb7299;font-weight:700;letter-spacing:1.2px">BILIBILI DAILY BRIEFING</div><div style="font-size:18px;font-weight:800;color:#fff;margin-top:3px">B站视频监控日报</div><div style="font-size:11.5px;color:#94a3b8;margin-top:4px">2026-11-21 · 2 位 UP 主 · 2 支新视频</div></div><div style="padding:16px 18px;background:#f8fafc"><div style="background:#fff;border:1px solid #e2e8f0;border-radius:10px;padding:11px 14px;margin-bottom:12px;font-size:12px"><div style="font-size:11px;font-weight:700;color:#64748b;margin-bottom:6px">本期速览 · TABLE OF CONTENTS</div><div style="margin-bottom:4px"><strong style="color:#fb7299">01</strong> <a href="' + v1 + '" target="_blank" style="color:#0f172a;text-decoration:none">[波士顿圆脸] 前所未见：巴西亚马逊原始部落拖家带口现身求救</a></div><div><strong style="color:#fb7299">02</strong> <a href="' + v2 + '" target="_blank" style="color:#0f172a;text-decoration:none">[刺客边风] 开源本地光猫配置解析工具实测</a></div></div><div style="background:#fff;border:1px solid #e2e8f0;border-radius:10px;padding:14px"><div style="font-size:14px;font-weight:700;color:#0f172a;margin-bottom:8px"><a href="' + v1 + '" target="_blank" style="color:#0f172a;text-decoration:none">前所未见：巴西亚马逊原始部落拖家带口现身求救</a></div><div style="background:#fff1f5;border-left:3px solid #fb7299;padding:9px 12px;font-size:12px;line-height:1.6"><strong>核心主题：</strong>讲述亚马逊阿瓦原始部落主动接触现代文明的罕见事件及其引发的治理挑战。</div></div></div></div>';
+  }
 }
 async function saveMonitorConfig() {
-  const btn = document.getElementById('saveMonitorBtn');
-  btn.disabled = true; btn.textContent = '保存并同步中...';
+  const btn = document.getElementById('saveMonitorBtn'); btn.disabled = true; btn.textContent = '保存并同步中...';
   const payload = {
     enabled: document.getElementById('cfgEnabled').checked,
     schedule_mode: document.getElementById('cfgScheduleMode').value,
-    times_cst: monitorConfig.times_cst,
-    cron_utc: document.getElementById('cfgCustomCron').value.trim(),
-    up_list: monitorConfig.up_list,
-    email_style: monitorConfig.email_style,
+    times_cst: monitorConfig.times_cst || ['08:00', '20:00'],
+    cron_utc: computeClientCron(),
+    up_list: monitorConfig.up_list || [],
+    email_style: monitorConfig.email_style || 'editorial',
     merge_emails: document.getElementById('cfgMergeEmails').checked,
     smtp_to: document.getElementById('cfgSmtpTo').value.trim(),
     check_window_hours: parseInt(document.getElementById('cfgWindowHours').value, 10) || 72,
     max_videos_per_run: parseInt(document.getElementById('cfgMaxVideos').value, 10) || 5,
   };
   try {
-    const r = await fetch('/api/monitor-config', { method: 'POST', headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + getAuthToken() }, body: JSON.stringify(payload) });
+    const r = await apiFetch('/api/monitor-config', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
     const d = await r.json();
     if (!r.ok) { showToast('monitorToast', d.error || '保存失败', 'err'); return; }
     monitorConfig = d.config; hydrateMonitorForm();
-    if (currentPage === 'monitor') { updateMonitorHeaderSummary(); renderUpSidebar(); }
+    updateNavBadges(); renderRailFolders();
+    if (currentRoute === 'monitor') { updateMonitorHeaderSummary(); renderUpSidebar(); }
     if (d.cron_sync && d.cron_sync.ok) showToast('monitorToast', '配置已保存并同步至 Shy Cron（' + d.cron_sync.cron_utc + '）', 'ok');
     else showToast('monitorToast', '已保存到 R2，Cron 同步提示：' + (d.cron_sync?.error || d.cron_sync?.reason || '未知'), 'err');
   } catch (e) { showToast('monitorToast', '保存异常: ' + e.message, 'err'); }
@@ -4993,29 +5275,19 @@ async function saveMonitorConfig() {
 }
 async function triggerMonitorNow(toastId) {
   try {
-    const r = await fetch('/api/monitor-run', { method: 'POST', headers: { 'Authorization': 'Bearer ' + getAuthToken() } });
+    const r = await apiFetch('/api/monitor-run', { method: 'POST' });
     const d = await r.json();
     if (!r.ok) showToast(toastId || 'monitorToast', d.error || '触发失败', 'err');
     else toast(d.message || '已触发后台监控任务');
   } catch (e) { toast('触发异常: ' + e.message, true); }
 }
 
-// ── Init ──
+// ── Boot ──
 initTheme();
 initCustomSelects();
 applyUserPrefsToUi();
 initSliderObservers();
-initFeedInfiniteObserver();
-checkAuth();
-renderWorkspaceFolderBar();
-renderList();
-renderDashboard();
-const initJobs = getJobs();
-if (initJobs.length > 0) selectJob(initJobs[0].id);
-initJobs.forEach(j => { if (normStatus(j.status) === 'pending') startPolling(j.id); });
-syncFromR2();
-syncLibraryFromR2();
-requestAnimationFrame(() => updateAllSliders(true));
+bootstrapAuth();
 </script>
 </body>
 </html>`;
@@ -5034,17 +5306,28 @@ export default {
     try {
       if (path === '/api/auth/login' && request.method === 'POST') return await handleLogin(request, env);
       if (path === '/api/auth/me' && request.method === 'GET') return await handleAuthMe(request, env);
+      if (path === '/api/auth/logout' && request.method === 'POST') return await handleLogout(request);
       if (path === '/api/monitor-config' && request.method === 'GET') return await handleGetMonitorConfig(request, env);
       if (path === '/api/monitor-config' && request.method === 'POST') return await handleSaveMonitorConfig(request, env);
       if (path === '/api/up-lookup' && request.method === 'GET') return await handleUpLookup(request, env);
       if (path === '/api/up-videos' && request.method === 'GET') return await handleGetUpVideos(request, env, ctx);
-      if (path === '/api/library' && request.method === 'GET') return await handleGetLibrary(request, env);
-      if (path === '/api/library' && request.method === 'POST') return await handleSaveLibrary(request, env);
       if (path === '/api/monitor-archive' && request.method === 'GET') return await handleGetMonitorArchive(request, env);
       if (path === '/api/monitor-archive' && request.method === 'POST') return await handlePostMonitorArchive(request, env);
       if (path === '/api/cron-trigger' && (request.method === 'POST' || request.method === 'GET')) return await handleCronTrigger(request, env);
       if (path === '/api/monitor-run' && request.method === 'POST') return await handleManualMonitorRun(request, env);
+      if (path === '/api/stats' && request.method === 'GET') return await handleStats(request, env);
+      if (path === '/api/callback' && request.method === 'POST') return await handleCallback(request, env);
+      if (path === '/' || path === '/index.html') return htmlResponse(generateFrontendPage());
 
+      // Protected personal workspace APIs (require single-device persistent cookie or Bearer token)
+      const authedPaths = ['/api/library', '/api/submit', '/api/history', '/api/jobs', '/api/resummarize', '/api/chat'];
+      if (authedPaths.some(p => path === p || path.startsWith('/api/jobs/'))) {
+        const sess = await verifySessionToken(request, env);
+        if (!sess) return errorResponse('请先登录账号', 401);
+      }
+
+      if (path === '/api/library' && request.method === 'GET') return await handleGetLibrary(request, env);
+      if (path === '/api/library' && request.method === 'POST') return await handleSaveLibrary(request, env);
       if (path === '/api/submit' && request.method === 'POST') return await handleSubmit(request, env, ctx);
       if (path === '/api/history' && request.method === 'GET') return await handleGetHistory(request, env);
       if (path === '/api/history' && request.method === 'POST') return await handlePostHistory(request, env);
@@ -5052,11 +5335,8 @@ export default {
       if (path === '/api/jobs' && request.method === 'GET') return await handleListJobs(request, env);
       if (path.startsWith('/api/jobs/') && request.method === 'GET') return await handleGetJob(request, env, path.replace('/api/jobs/', ''));
       if (path.startsWith('/api/jobs/') && request.method === 'DELETE') return await handleDeleteJob(request, env, path.replace('/api/jobs/', ''));
-      if (path === '/api/stats' && request.method === 'GET') return await handleStats(request, env);
-      if (path === '/api/callback' && request.method === 'POST') return await handleCallback(request, env);
       if (path === '/api/resummarize' && request.method === 'POST') return await handleResummarize(request, env);
       if (path === '/api/chat' && request.method === 'POST') return await handleVideoChat(request, env);
-      if (path === '/' || path === '/index.html') return htmlResponse(generateFrontendPage());
 
       return errorResponse('Not Found', 404);
     } catch (err) {
