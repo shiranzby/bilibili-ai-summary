@@ -2423,9 +2423,9 @@ select.c-select-native{position:absolute!important;opacity:0!important;pointer-e
   .monitor-split{flex-direction:column}
   .mon-aside{width:100%;min-width:0;max-height:336px;border-right:none;border-bottom:1px solid var(--border);padding:10px 12px}
   #wsSideList.mon-aside-scroll{max-height:172px}
-  #upSideList.mon-aside-scroll{display:grid!important;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px;max-height:146px;align-content:start}
+  #upSideList.mon-aside-scroll{display:grid!important;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px;max-height:108px;align-content:start}
   #upSideList .up-all-card{display:none!important}
-  #upSideList .up-side-card{padding:7px 9px;gap:8px;min-width:0}
+  #upSideList .up-side-card{height:50px;padding:7px 9px;gap:8px;min-width:0;overflow:hidden}
   #upSideList .up-ava,#upSideList .up-ava-fb{width:30px;height:30px;font-size:12px}
   #upSideList .up-side-acts{display:none}
   .mon-main{padding:14px 14px 36px}
