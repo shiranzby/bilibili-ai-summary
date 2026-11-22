@@ -1,201 +1,139 @@
-# 🎬 Bilibili AI Summary - B站视频 AI 摘要 & 邮件推送
+# 📺 B站 AI 摘要工作台（Bilibili AI Summary）
 
-📋 **概述**
-
-自动监控指定B站UP主的新视频 → 下载音频 → 语音转录 → AI总结 → 发送邮件通知。
-支持 **Web UI 手动提交**（实时轮询进度、跨设备历史同步）和 **定时自动监控** 两种模式。
-
-💰 **全程免费** | 🔄 **全自动** | ☁️ **零服务器** | 🔌 **一键部署**
+> 全程免费、零服务器运维的 **B 站视频知识工作台 & UP 主自动监控推送系统**。  
+> 基于 **Cloudflare Workers + Cloudflare R2 + GitHub Actions + Vercel Bilibili Proxy** 构建。
 
 ---
 
-## 💸 费用清单
+## ✨ 核心功能一览
 
-| 项目 | 方案 | 费用 |
+### 1. 摘要工作台（Summary Workspace）
+- **实时任务进度条**：精确追踪 `任务创建 → 下载音频 → 语音转录 → AI 总结` 真实执行阶段。
+- **4 种 AI 摘要风格 & 独立缓存**：支持 **精炼日报 / 深度笔记 / 金句观点 / 学习闪卡** 一键切换，已生成风格自动缓存到 R2（再次切换秒开），并提供单独「重新生成」按钮。
+- **多视图知识消费**：
+  - **AI 总结 / 思维导图 / 完整转录 / 分栏对照 / AI 追问**：围绕当前视频随时提问。
+  - **时间轴 `[mm:ss]` 直达**：摘要与转录中的时间戳自动转为可点击链接，直接跳转到 B 站对应播放秒数。
+  - **多格式导出**：一键复制、导出 `.md` / `.txt`，以及绘制带视频封面的 **高颜值分享长图 PNG**（自动适配深色 / 浅色主题）。
+
+### 2. 监控 UP 主 & 关键词雷达
+- **UP 主动态聚合**：支持按 UP 主分类标签聚合浏览，支持动态标题筛选、`隐藏 <2 分钟`、`仅看未总结` 快捷过滤。
+- **封面悬停预览 & 中号弹窗播放器**：
+  - 光标悬停视频封面约 `350ms` 自动静音加载并播放预览视频。
+  - 点击封面或悬停时按 `Enter` 打开居中的 16:9 中号播放器弹窗（不遮挡全屏），支持 `Space` 播放/暂停、`Esc` 关闭。
+- **关键词雷达**：订阅感兴趣的技术或主题关键词，实时搜索 B 站最新投稿并一键总结或加入「稍后再看」。
+
+### 3. 稍后再看 & 我的收藏（Stacked Fan-Deck）
+- **稍后再看队列**：支持勾选多条视频批量派发 AI 总结，并支持 **导入 B 站公开收藏夹**（输入 `fid` 或空间收藏夹链接即可导入）。
+- **扇形叠层收藏夹**：集成自研开源组件 [Stacked Fan-Deck](https://github.com/shiranzby/stacked-fan-deck)，支持封面扇形洗牌交互、零闪烁手风琴展开、多收藏夹归类。
+- **AI 跨视频主题综述**：在「我的收藏」或「历史记录」中勾选 2–6 条已完成摘要，一键生成跨视频核心共识、观点对比与学习路线。
+- **批量导出 Markdown**：一键将收藏或勾选的多条摘要合并导出为标准 `.md` 文档。
+
+### 4. 全局效率工具 & 个性化设置
+- **全局 `Ctrl+K` Spotlight 命令面板**（顶栏同步提供快捷入口）：实时全文检索历史摘要、语音转录与 UP 主，或直接粘贴 B 站链接 / BV 号秒速提交（自动识别多 P 视频并支持选择分 P）。
+- **独立二级设置中心**：包含账号登录鉴权、默认模板与偏好设置、4 套邮件日报视觉主题（`editorial` / `minimal` / `bilibili` / `compact`）实时预览、分类库与 R2 存储状态管理。
+- **深浅色丝滑切换**：支持日夜主题切换与 View-Transition 动画，并针对移动端窄屏做了双列 UP 主卡片与两行历史摘要适配。
+
+---
+
+## 🏗️ 系统架构与免费技术栈
+
+| 模块 | 职责 | 技术方案 / 免费额度 |
 |------|------|------|
-| 📡 B站 API | 公开接口 | 免费 |
-| 🎙️ 语音识别 | 硅基流动 SenseVoiceSmall | 完全免费 |
-| 🤖 AI 总结 | 硅基流动 Qwen/Qwen3-8B | 完全免费 |
-| 🕐 定时运行 | GitHub Actions (2000分钟/月) | 免费 |
-| 📧 邮件发送 | QQ邮箱 SMTP | 免费 |
-| **总计** | **一个 API Key 搞定全部** | **完全免费 🏆** |
+| **前端 & API 网关** | Web 工作台托管、R2 读写、鉴权、边缘 AI 追问/重生成/综述、媒体流代理 | **Cloudflare Workers + R2**（免费层） |
+| **B 站接口中继** | 解析视频详情/分 P、公开字幕、预览 MP4、收藏夹、搜索与音频分片 | **Vercel Serverless**（`vercel-bili-proxy/`） |
+| **异步音视频处理** | 字幕优先直取 → 无字幕自动下载音频 → STT → AI 总结 → 邮件推送 | **GitHub Actions**（2000 分钟/月免费） |
+| **免费语音识别** | 将视频人声转为文字（`.m4s` 直接改名 `.m4a` 上传，无需 `ffmpeg`） | **硅基流动 `SenseVoiceSmall`**（可选 `GROQ_API_KEY` 免费 `whisper-large-v3-turbo` 优先） |
+| **免费 AI 总结** | 日报/笔记/金句/闪卡生成、追问对话、跨视频主题综述 | **硅基流动免费模型池**（`Qwen/Qwen3-8B` 等） |
+| **邮件日报推送** | 定时巡检与单条任务结果推送 | **QQ 邮箱 / 任意 SMTP** |
+
+> **处理链路优化**：提交任务时，工作流优先尝试快速拉取 B 站公开 CC/AI 字幕（4 秒超时无阻断回退），有字幕时直接跳过音频下载与 STT；无字幕时自动下载音频并调用免费 STT 模型，兼顾速度与覆盖率。
 
 ---
 
-## 🔄 工作流程
+## 🚀 快速部署指南
 
-<div align="center">
-  <table>
-    <tr>
-      <td align="center"><b>手动提交模式（Web UI）</b></td>
-      <td align="center"><b>定时监控模式</b></td>
-    </tr>
-    <tr>
-      <td><img src="images/workflow1.png" alt="手动提交工作流" width="300" /></td>
-      <td><img src="images/workflow2.png" alt="定时监控工作流" width="300" /></td>
-    </tr>
-  </table>
-</div>
+### 1. 部署 B 站中继服务（Vercel）
 
-> **关键优化**: .m4s 本身是 AAC 音频容器，直接改名 .m4a 上传，**无需 ffmpeg 转码**。
-> 依赖仅 2 个 pip 包 (requests + openai)，安装只需 12 秒。
-
----
-
-## 🚀 一键部署
-
-[![Deploy to Cloudflare Workers](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/shiranzby/bilibili-ai-summary)
-
-> 点击上方按钮直接 Fork 仓库并部署到你自己的 Cloudflare Workers 账号。
-> 也可以手动部署：
+进入 `vercel-bili-proxy/` 目录并部署到 Vercel：
 
 ```bash
-git clone https://github.com/shiranzby/bilibili-ai-summary.git
-cd bilibili-ai-summary/cloudflare
-# 配置 wrangler.toml 中的 account_id 和 R2 bucket 名
-npx wrangler deploy
+cd vercel-bili-proxy
+npx vercel --prod
 ```
 
----
+部署完成后记录你的域名（例如 `https://your-bili-proxy.vercel.app`）。
 
-### 第1步: 获取 API Key
+### 2. 配置 GitHub Secrets
 
-**只需一个 Key：硅基流动 (SiliconFlow)**
-
-一个 Key 同时搞定语音识别和 AI 总结，完全免费，无需额外注册。
-
-1. 打开 https://cloud.siliconflow.cn/ 注册
-2. 创建 API Key 并复制
-
-### 第2步: 配置 GitHub Secrets
+在你的 GitHub 仓库 `Settings → Secrets and variables → Actions` 中添加以下 Secrets：
 
 | Secret 名称 | 说明 | 必填 |
 |-------------|------|------|
-| `SILICONFLOW_API_KEY` | 硅基流动 Key (语音识别 + AI总结) | ✅ |
-| `SMTP_USER` | 发件邮箱 (如 `123456@qq.com`) | ✅ |
-| `SMTP_PASS` | QQ邮箱SMTP授权码 (16位字母) | ✅ |
-| `SMTP_TO` | 收件邮箱 | ✅ |
-| `SILICONFLOW_STT_MODEL` | 语音转文字模型 (默认 FunAudioLLM/SenseVoiceSmall) | 可选 |
-| `SILICONFLOW_SUMMARY_MODEL` | AI总结模型 (默认 Qwen/Qwen3-8B) | 可选 |
+| `SILICONFLOW_API_KEY` | 硅基流动 API Key（用于免费语音识别与 AI 总结） | ✅ |
+| `SMTP_USER` | 发件邮箱（如 `your_account@qq.com`） | ✅ |
+| `SMTP_PASS` | 邮箱 SMTP 授权码 | ✅ |
+| `SMTP_TO` | 默认收件邮箱 | ✅ |
+| `BILI_PROXY_URL` | 第 1 步部署的 Vercel 中继地址 | 建议 |
+| `WORKER_URL` | 第 3 步部署的 Cloudflare Worker 地址 | 建议 |
+| `GROQ_API_KEY` | Groq Cloud API Key（可选，用于免费 Whisper 优先转录） | 可选 |
+| `SILICONFLOW_STT_MODEL` | 语音识别模型（默认 `FunAudioLLM/SenseVoiceSmall`） | 可选 |
+| `SILICONFLOW_SUMMARY_MODEL` | 总结模型（默认 `Qwen/Qwen3-8B`） | 可选 |
 
-### 第3步: 部署 Cloudflare Worker
+### 3. 部署 Cloudflare Worker & R2
 
-需要 Cloudflare 账号 + R2 Bucket（用于存储任务数据和跨设备历史记录同步）。
+1. 创建名为 `bilibili-summary` 的 Cloudflare R2 存储桶，并核对 `cloudflare/wrangler.toml` 中的绑定名称。
+2. 部署 Worker：
 
-Worker 环境变量需设置:
-- `GH_TOKEN`: GitHub Personal Access Token（用于 dispatch Actions）
-- `GH_OWNER`: GitHub 用户名（默认 shiranzby）
-- `GH_REPO`: GitHub 仓库名（默认 bilibili-ai-summary）
-
-### 第4步: 修改配置
-
-编辑 `bilibili_summary/config.py`：
-
-```python
-UP_MIDS = [12345678, 23456789]  # UP主UID列表
+```bash
+cd cloudflare
+npx wrangler deploy
 ```
 
-UP主UID获取：打开UP主主页，URL末尾的数字。
+3. 在 Cloudflare Dashboard → Workers → `Settings → Variables and Secrets` 中配置以下环境变量（均为敏感凭据，请勿硬编码到仓库）：
 
-#### 配置定时监控时间
-
-编辑 `.github/workflows/summary.yml` 中的 cron 表达式：
-
-```yaml
-on:
-  schedule:
-    # UTC 时间，北京时间 = UTC + 8
-    # 每天 08:00 和 20:00 (北京时间 16:00 和 04:00)
-    - cron: '0 0 * * *'
-    - cron: '0 8 * * *'
-    - cron: '0 16 * * *'
-```
-
-`cron` 格式为 `分钟 小时 日 月 星期`，使用 UTC 时间。示例：
-
-| 北京时间 | UTC 时间 | cron 表达式 |
-|---------|---------|------------|
-| 每天 08:00 | 0:00 | `0 0 * * *` |
-| 每天 12:00 | 4:00 | `0 4 * * *` |
-| 每天 16:00 | 8:00 | `0 8 * * *` |
-| 每天 20:00 | 12:00 | `0 12 * * *` |
-| 每天 08:00 + 20:00 | 0:00 + 12:00 | `0 0,12 * * *` |
-
-可以写多个 `- cron:` 行来实现一天多次监控，例如 `[0 0,6,12,18 * * *]` 表示每 6 小时一次。
-
-### 第5步: 完成！
-
-- **手动测试**: 打开 Worker URL → 输入BV号 → 点击「开始处理」
-- **自动监控**: 按配置的 cron 时间自动运行
+| 变量名 | 说明 |
+|--------|------|
+| `GH_TOKEN` | GitHub Personal Access Token（需具备 `repo` 与 `workflow` 权限） |
+| `GH_OWNER` | GitHub 用户名 |
+| `GH_REPO` | 仓库名（如 `bilibili-ai-summary`） |
+| `SILICONFLOW_API_KEY` | 硅基流动 Key（供边缘 AI 追问、风格切换、跨视频综述使用） |
+| `BILI_PROXY_URL` | Vercel 中继地址 |
+| `ADMIN_USER` / `ADMIN_PASS` | Web 控制台登录账号与密码 |
+| `AUTH_SECRET` | Cookie/Token 签名随机密钥 |
+| `CRON_TRIGGER_SECRET` | 定时巡检触发鉴权密钥（可选） |
 
 ---
 
-## 🌐 Web UI 功能
+## 📁 目录结构
 
-部署 Worker 后访问其 URL 即可打开 Web UI：
-
-- 🚀 输入BV/av号或直接粘贴链接（含标题），系统自动提取
-- 📊 **实时进度** — 轮询 GitHub Actions 运行状态，显示 6 步进度箭头流程图
-- 📝 **转录文本** — 手风琴展开查看，支持 TXT / MD 下载和复制
-- 🤖 **AI 总结** — 支持 TXT / MD 下载和复制
-- 🎨 **排版布局** — 垂直 / 水平（可拖拽分列）双模式切换
-- 🔍 **历史搜索** — 按标题、BV号、UP主名、日期搜索
-- 🔄 **跨设备同步** — 历史记录通过 R2 同步，多设备共享
-- 🗑 **批量管理** — 全选/反选/批量删除
-- 🌓 **深色模式** — 切换深色/浅色主题
-- 📐 **拖拽分隔** — Sidebar 宽度可自由拖拽调整
-- 📋 **粘贴板支持** — 一键粘贴 B站链接（自动提取 av/BV 号）
-
----
-
-## 📁 项目结构
-
-```
-bilibili-ai-summary/
-├── images/
-│   ├── workflow1.png          # 手动提交工作流示意图
-│   └── workflow2.png          # 定时监控工作流示意图
-├── bilibili_summary/
-│   ├── config.py              # 🔑 配置文件
-│   ├── bili_api.py            # B站API封装
-│   ├── audio_transcriber.py   # 音频下载 (playurl CDN) + 语音识别
-│   ├── summarizer.py          # AI总结 (硅基流动)
-│   ├── emailer.py             # 邮件发送
-│   ├── monitor.py             # 每日监控主流程
-│   ├── process_single.py      # 单条视频处理 (Web UI 触发)
-│   ├── callback_worker.py     # CI 回调 Worker (写回 R2)
-│   ├── send_result_email.py   # 单条结果邮件发送
-│   ├── inject_config.py       # Secrets 注入
-│   └── requirements.txt       # 仅 requests + openai
-├── cloudflare/
-│   ├── worker.js              # Worker (API + 前端UI内嵌)
-│   └── wrangler.toml          # Worker 部署配置
+```text
 ├── .github/workflows/
-│   └── summary.yml            # GitHub Actions 工作流
-└── README.md
+│   └── summary.yml            # GitHub Actions 工作流（单条处理 + 定时 UP 主监控）
+├── bilibili_summary/          # Python 处理核心
+│   ├── audio_transcriber.py   # 字幕优先直取 + CDN/中继音频下载 + Groq/硅基流动 STT
+│   ├── bili_api.py            # B 站视频信息与 UP 主动态拉取
+│   ├── summarizer.py          # AI 总结生成
+│   ├── process_single.py      # 单条视频处理入口（支持 --p 分P参数）
+│   ├── monitor.py             # 多 UP 主定时监控与日报聚合推送
+│   └── send_result_email.py   # 4 套样式 HTML 邮件渲染与发送
+├── cloudflare/
+│   ├── worker.js              # Cloudflare Worker 后端 API + 单页 Web 工作台
+│   └── wrangler.toml          # Wrangler 部署与 R2 绑定配置
+└── vercel-bili-proxy/
+    └── api/                   # B 站无风控 Serverless 中继接口
+        ├── bili-info.js       # 视频元信息与分 P 列表
+        ├── bili-preview.js    # 悬停预览 & 弹窗播放 MP4 直链解析
+        ├── bili-subtitle.js   # CC/AI 公开字幕快速提取
+        ├── bili-audio.js      # HTTP Range 音频流分片代理
+        ├── bili-fav.js        # 公开收藏夹视频列表拉取
+        ├── bili-search.js     # 关键词搜索（关键词雷达）
+        ├── bili-up.js         # UP 主信息与投稿列表
+        └── bili-card.js       # 视频卡片信息
 ```
 
 ---
 
-## ❓ 常见问题
+## 🔒 安全与隐私说明
 
-**Q: 需要多个 API Key 吗？**
-A: 不需要。一个 **硅基流动 API Key** 同时覆盖语音识别和 AI 总结。
-
-**Q: 需要 ffmpeg 吗？**
-A: **不需要。** .m4s 本身就是 AAC 音频容器，直接改名 .m4a 上传即可。
-
-**Q: 视频没有字幕怎么办？**
-A: 我们的方案不依赖B站字幕。自动下载音频 → 硅基流动语音识别 → 转文字。
-
-**Q: 需要B站Cookie吗？**
-A: 不需要。全部通过B站公开API + 音频CDN下载。
-
-**Q: 整个链路跑完要多久？**
-A: 约 **3-6 分钟**：下载音频 (~30秒) → 语音识别 (~2-4分钟) → AI 总结 (~30秒) → 回调汇总 (~5秒)
-
-**Q: 不同设备的历史记录同步吗？**
-A: 是的。通过 Cloudflare R2 存储，多设备共用同一 Worker 时历史记录自动同步。
-
-**Q: 支持从链接自动提取视频号吗？**
-A: 支持。粘贴含标题的完整 URL（如 `【标题-哔哩哔哩】 https://www.bilibili.com/video/BVxxx`），系统会自动提取 BV 或 av 号。
+- 所有 API Key、SMTP 授权码、GitHub PAT 及管理员密码均通过 **GitHub Secrets** 与 **Cloudflare Worker Secrets** 注入，**仓库代码不包含任何真实凭据**。
+- 媒体流代理 `/api/bili-media` 仅放行 B 站官方 CDN 域名（`*.bilivideo.com` / `*.bilivideo.cn` / `*.hdslb.com` / `*.akamaized.net`），防止 SSRF 滥用。

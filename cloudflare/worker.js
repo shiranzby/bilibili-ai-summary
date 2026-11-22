@@ -2421,7 +2421,13 @@ select.c-select-native{position:absolute!important;opacity:0!important;pointer-e
   .topbar-sub{display:none}
   .route-view{padding:14px 14px 36px}
   .monitor-split{flex-direction:column}
-  .mon-aside{width:100%;min-width:0;max-height:230px;border-right:none;border-bottom:1px solid var(--border);padding:10px 12px}
+  .mon-aside{width:100%;min-width:0;max-height:336px;border-right:none;border-bottom:1px solid var(--border);padding:10px 12px}
+  #wsSideList.mon-aside-scroll{max-height:172px}
+  #upSideList.mon-aside-scroll{display:grid!important;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px;max-height:146px;align-content:start}
+  #upSideList .up-all-card{display:none!important}
+  #upSideList .up-side-card{padding:7px 9px;gap:8px;min-width:0}
+  #upSideList .up-ava,#upSideList .up-ava-fb{width:30px;height:30px;font-size:12px}
+  #upSideList .up-side-acts{display:none}
   .mon-main{padding:14px 14px 36px}
   .reader-card{padding:16px}
   .form-grid,.style-grid{grid-template-columns:1fr 1fr}
@@ -2762,6 +2768,10 @@ theme-button{flex-shrink:0}
         <span class="topbar-sub" id="topbarSub"></span>
       </div>
       <div class="topbar-actions">
+        <button class="pill-btn" onclick="openCmdPalette()" title="全局搜索与快速提交 (Ctrl+K)">
+          <svg class="ic" viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4.3-4.3"/></svg>
+          <span class="tb-hide-sm">搜索 / Ctrl+K</span>
+        </button>
         <theme-button id="topThemeBtn" size="1.05" aria-label="切换日夜主题"></theme-button>
         <button class="pill-btn tb-hide-sm" onclick="navigate('settings','monitor')">
           <svg class="ic" viewBox="0 0 24 24"><line x1="4" y1="21" x2="4" y2="14"/><line x1="4" y1="10" x2="4" y2="3"/><line x1="12" y1="21" x2="12" y2="12"/><line x1="12" y1="8" x2="12" y2="3"/><line x1="20" y1="21" x2="20" y2="16"/><line x1="20" y1="12" x2="20" y2="3"/><line x1="1" y1="14" x2="7" y2="14"/><line x1="9" y1="8" x2="15" y2="8"/><line x1="17" y1="16" x2="23" y2="16"/></svg>
@@ -6592,7 +6602,7 @@ function renderUpSidebar() {
       const f = getFolderById(selectedMonFolder), fKey = 'folder:' + selectedMonFolder;
       html += '<div class="up-side-card' + (selectedUpMid === fKey ? ' active' : '') + '" onclick="selectMonitorUp(\'' + esc(fKey) + '\')"><div class="up-ava-fb" style="background:' + esc((f && f.color) || '#2563EB') + ';color:#fff;border-color:transparent">' + esc(((f && f.name) || '类').slice(0, 1)) + '</div><div class="up-side-info"><div class="up-side-name">「' + esc((f && f.name) || '分类') + '」全部动态</div><div class="up-side-uid">聚合 ' + ups.length + ' 位 UP 主</div></div></div>';
     } else {
-      html += '<div class="up-side-card' + (selectedUpMid === 'all' ? ' active' : '') + '" onclick="selectMonitorUp(\'all\')"><div class="up-ava-fb">全</div><div class="up-side-info"><div class="up-side-name">全部监控 UP 主</div><div class="up-side-uid">聚合最新动态 · ' + allUps.length + ' 位</div></div></div>';
+      html += '<div class="up-side-card up-all-card' + (selectedUpMid === 'all' ? ' active' : '') + '" onclick="selectMonitorUp(\'all\')"><div class="up-ava-fb">全</div><div class="up-side-info"><div class="up-side-name">全部监控 UP 主</div><div class="up-side-uid">聚合最新动态 · ' + allUps.length + ' 位</div></div></div>';
     }
   }
   html += filtered.length ? filtered.map(u => {
@@ -7710,8 +7720,16 @@ document.addEventListener('mouseover', (e) => {
   clearTimeout(hoverPreviewTimer);
   hoverPreviewTimer = setTimeout(async () => {
     if (hoveredPreviewThumb !== thumb || hoveredPreviewBvid !== bvid) return;
+    cleanupInlinePreview(thumb);
+    const loadHint = document.createElement('span');
+    loadHint.className = 'v-preview-hint';
+    loadHint.textContent = '加载预览中...';
+    thumb.appendChild(loadHint);
     const mediaUrl = await resolvePlayablePreviewUrl(bvid);
-    if (!mediaUrl || hoveredPreviewThumb !== thumb) return;
+    if (!mediaUrl || hoveredPreviewThumb !== thumb) {
+      cleanupInlinePreview(thumb);
+      return;
+    }
     cleanupInlinePreview(thumb);
     const vid = document.createElement('video');
     vid.className = 'v-preview-vid';
