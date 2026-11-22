@@ -2420,15 +2420,16 @@ select.c-select-native{position:absolute!important;opacity:0!important;pointer-e
   .topbar{padding:0 14px}
   .topbar-sub{display:none}
   .route-view{padding:14px 14px 36px}
-  .monitor-split{flex-direction:column}
-  .mon-aside{width:100%;min-width:0;max-height:336px;border-right:none;border-bottom:1px solid var(--border);padding:10px 12px}
+  .route-view.no-pad{padding:0;overflow-y:auto;display:block}
+  .monitor-split{flex-direction:column;height:auto;overflow:visible}
+  .mon-aside{width:100%;min-width:0;max-height:none;border-right:none;border-bottom:1px solid var(--border);padding:10px 12px}
   #wsSideList.mon-aside-scroll{max-height:172px}
   #upSideList.mon-aside-scroll{display:grid!important;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px;max-height:108px;align-content:start}
   #upSideList .up-all-card{display:none!important}
   #upSideList .up-side-card{height:50px;padding:7px 9px;gap:8px;min-width:0;overflow:hidden}
   #upSideList .up-ava,#upSideList .up-ava-fb{width:30px;height:30px;font-size:12px}
   #upSideList .up-side-acts{display:none}
-  .mon-main{padding:14px 14px 36px}
+  .mon-main{padding:14px 14px 36px;overflow:visible}
   .reader-card{padding:16px}
   .form-grid,.style-grid{grid-template-columns:1fr 1fr}
   .archive-grid{grid-template-columns:1fr}
@@ -2475,6 +2476,20 @@ theme-button{flex-shrink:0}
   .topbar-actions .pill-btn{height:30px;padding:0 8px;font-size:11.5px;gap:4px}
   .topbar-actions .tb-hide-sm{display:none}
   .topbar-title{font-size:14px}
+  .video-grid{grid-template-columns:repeat(2,minmax(0,1fr));gap:14px 10px}
+  .v-thumb-link{border-radius:9px}
+  .v-body{gap:7px;padding-top:7px}
+  .v-ava,.v-ava-fb{width:24px;height:24px;font-size:10px}
+  .v-title{font-size:12.5px;line-height:1.35}
+  .v-author,.v-stats{font-size:11px}
+  .v-time-pill{font-size:10.5px;padding:1px 6px}
+  .v-act-btn{height:24px;padding:0 7px;font-size:10.5px;border-radius:6px}
+  .v-dur{font-size:10px;padding:1px 5px;right:5px;bottom:5px}
+  .v-quick-acts{top:5px;right:5px;gap:3px}
+  .v-qbtn{height:22px;padding:0 6px;font-size:10px}
+}
+@media(max-width:540px){
+  .topbar-title{display:none!important}
 }
 
 /* Stacked Fan-Deck 扇形卡组 & 手风琴收藏夹组件 (with Portal Float Layer) */
@@ -6514,7 +6529,8 @@ function renderSkeletonGrid() {
 function initFeedObservers() {
   if (typeof IntersectionObserver === 'undefined') return;
   if (!feedObserver) {
-    const sentinel = document.getElementById('feedSentinel'), root = document.getElementById('monScrollArea');
+    const sentinel = document.getElementById('feedSentinel');
+    const root = window.innerWidth <= 960 ? document.getElementById('view-monitor') : document.getElementById('monScrollArea');
     if (sentinel) {
       feedObserver = new IntersectionObserver(entries => {
         entries.forEach(e => {
