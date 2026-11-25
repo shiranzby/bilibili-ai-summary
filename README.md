@@ -3,6 +3,46 @@
 > 全程免费、零服务器运维的 **B 站视频知识工作台 & UP 主自动监控推送系统**。  
 > 基于 **Cloudflare Workers + Cloudflare R2 + GitHub Actions + Vercel Bilibili Proxy** 构建。
 
+🔗 **在线交互演示（GitHub Pages）**：**[https://shiranzby.github.io/bilibili-ai-summary/](https://shiranzby.github.io/bilibili-ai-summary/)**  
+> 演示站内置多条模拟视频、4 风格摘要与模拟提交流程（纯前端本地模拟，不消耗任何真实 API 额度）。
+
+---
+
+## 🖼️ 界面与邮件预览
+
+<table>
+  <tr>
+    <td align="center" width="50%">
+      <b>摘要工作台（浅色模式 · AI 总结与进度追踪）</b><br/><br/>
+      <img src="images/screenshots/workspace-light.png" alt="摘要工作台浅色模式" width="100%" />
+    </td>
+    <td align="center" width="50%">
+      <b>摘要工作台（深色模式 · 分栏对照与时间轴）</b><br/><br/>
+      <img src="images/screenshots/workspace-dark.png" alt="摘要工作台深色模式" width="100%" />
+    </td>
+  </tr>
+  <tr>
+    <td align="center" width="50%">
+      <b>监控 UP 主动态流 & 快捷筛选</b><br/><br/>
+      <img src="images/screenshots/monitor-feed.png" alt="监控UP主动态流" width="100%" />
+    </td>
+    <td align="center" width="50%">
+      <b>我的收藏（Stacked Fan-Deck 扇形叠层卡组）</b><br/><br/>
+      <img src="images/screenshots/favorites-fandeck.png" alt="我的收藏扇形卡组" width="100%" />
+    </td>
+  </tr>
+  <tr>
+    <td align="center" width="50%">
+      <b>设置中心 & 4 套邮件日报实时预览</b><br/><br/>
+      <img src="images/screenshots/settings-email.png" alt="邮件日报样式预览" width="100%" />
+    </td>
+    <td align="center" width="50%">
+      <b>历史归档 & KPI 效率统计</b><br/><br/>
+      <img src="images/screenshots/history-kpi.png" alt="历史归档KPI面板" width="100%" />
+    </td>
+  </tr>
+</table>
+
 ---
 
 ## ✨ 核心功能一览
